@@ -17,7 +17,6 @@
 #include "MappedInputManager.h"
 #include "OpdsServerStore.h"
 #include "RecentBooksStore.h"
-#include "activities/companion/CompanionModeActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
@@ -120,8 +119,6 @@ void HomeActivity::onEnter() {
   const auto base = static_cast<int>(recentBooks.size());
   selectorIndex = initialMenuItem == HomeMenuItem::NONE ? 0 : base + menuItemToIndex(initialMenuItem, hasOpdsServers);
 
-  debugAutoCompanionDeadlineMs = millis() + 3000;  // TEMPORARY DEBUG AID, see header comment
-
   // Trigger first update
   requestUpdate();
 }
@@ -170,17 +167,6 @@ void HomeActivity::freeCoverBuffer() {
 }
 
 void HomeActivity::loop() {
-  // TEMPORARY DEBUG AID, see header comment.
-  if (debugAutoCompanionDeadlineMs != 0) {
-    if (mappedInput.wasAnyPressed()) {
-      debugAutoCompanionDeadlineMs = 0;
-    } else if (millis() >= debugAutoCompanionDeadlineMs) {
-      debugAutoCompanionDeadlineMs = 0;
-      startActivityForResult(std::make_unique<CompanionModeActivity>(renderer, mappedInput), [](const ActivityResult&) {});
-      return;
-    }
-  }
-
   const int menuCount = getMenuItemCount();
   const auto& metrics = UITheme::getInstance().getMetrics();
 

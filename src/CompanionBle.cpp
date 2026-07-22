@@ -19,12 +19,25 @@ constexpr const char* kServiceUuid = "7c9c0000-3e4a-4b1a-9c1e-6d8a1f2b0001";
 constexpr const char* kContentCharUuid = "7c9c0001-3e4a-4b1a-9c1e-6d8a1f2b0001";
 constexpr const char* kButtonCharUuid = "7c9c0002-3e4a-4b1a-9c1e-6d8a1f2b0001";
 constexpr const char* kCapabilityCharUuid = "7c9c0003-3e4a-4b1a-9c1e-6d8a1f2b0001";
+constexpr const char* kStatusCharUuid = "7c9c0004-3e4a-4b1a-9c1e-6d8a1f2b0001";
 
 constexpr uint8_t kOpStart = 0x01;
 constexpr uint8_t kOpChunk = 0x02;
 constexpr uint8_t kOpEnd = 0x03;
 
 constexpr uint32_t kTeardownDisconnectWaitMs = 600;
+
+// Full advertised name buffer: kDeviceNamePrefix + " " + 4 hex chars (2 bytes
+// of the eFuse MAC tail) + NUL. Built once in ensureStarted() from
+// ESP.getEfuseMac() so two devices running this firmware advertise distinct
+// names (see kDeviceNamePrefix's doc comment in CompanionBle.h).
+char g_deviceName[48] = {0};
+
+void buildDeviceName() {
+  const uint64_t mac = ESP.getEfuseMac();
+  snprintf(g_deviceName, sizeof(g_deviceName), "%s %04X", kDeviceNamePrefix,
+           static_cast<unsigned>(mac & 0xFFFF));
+}
 
 volatile bool g_startInProgress = false;
 bool g_begun = false;
@@ -47,8 +60,10 @@ NimBLEServer* g_server = nullptr;
 NimBLECharacteristic* g_contentChar = nullptr;
 NimBLECharacteristic* g_buttonChar = nullptr;
 NimBLECharacteristic* g_capabilityChar = nullptr;
+NimBLECharacteristic* g_statusChar = nullptr;
 
 ContentFieldCallback g_contentCb = nullptr;
+StatusCallback g_statusCb = nullptr;
 
 // Reassembly state for the field currently being received (title xor body —
 // the protocol doc guarantees "each field is internally ordered" but does not
@@ -75,7 +90,7 @@ void computeCapabilityValue(const GfxRenderer& renderer, int fontId) {
   const int screenWidthChars = advanceWidth > 0 ? renderer.getScreenWidth() / advanceWidth : 0;
   const int screenHeightChars = lineHeight > 0 ? renderer.getScreenHeight() / lineHeight : 0;
 
-  g_capabilityValue[0] = 1;  // protocol version
+  g_capabilityValue[0] = 2;  // protocol version — v2 adds the Status characteristic + new button codes
   g_capabilityValue[1] = static_cast<uint8_t>(screenWidthChars > 255 ? 255 : screenWidthChars);
   g_capabilityValue[2] = static_cast<uint8_t>(screenHeightChars > 255 ? 255 : screenHeightChars);
   g_capabilityValue[3] = static_cast<uint8_t>(kMaxFieldLen & 0xFF);
@@ -147,6 +162,14 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
+class StatusCharCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo& /*connInfo*/) override {
+    const NimBLEAttValue& value = characteristic->getValue();
+    if (value.size() == 0) return;
+    if (g_statusCb) g_statusCb(value.data()[0]);
+  }
+};
+
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* /*server*/, NimBLEConnInfo& /*connInfo*/) override {
     LOG_DBG("CBLE", "central connected");
@@ -161,6 +184,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 };
 
 ContentCharCallbacks g_contentCharCallbacks;
+StatusCharCallbacks g_statusCharCallbacks;
 ServerCallbacks g_serverCallbacks;
 
 }  // namespace
@@ -194,7 +218,9 @@ bool ensureStarted(const GfxRenderer& renderer, int fontId) {
 
   const uint32_t heapBeforeInit = ESP.getFreeHeap();
 
-  if (!NimBLEDevice::init(kDeviceName)) {
+  buildDeviceName();
+
+  if (!NimBLEDevice::init(g_deviceName)) {
     LOG_ERR("CBLE", "ensureStarted: NimBLEDevice::init() failed");
     g_powerLock.reset();
     g_startInProgress = false;
@@ -230,18 +256,22 @@ bool ensureStarted(const GfxRenderer& renderer, int fontId) {
   g_capabilityChar = service->createCharacteristic(kCapabilityCharUuid, NIMBLE_PROPERTY::READ);
   g_capabilityChar->setValue(g_capabilityValue, sizeof(g_capabilityValue));
 
+  g_statusChar = service->createCharacteristic(kStatusCharUuid, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+  g_statusChar->setCallbacks(&g_statusCharCallbacks);
+
   g_server->start();  // starts all of the server's services (NimBLEService::start() is a no-op now)
 
   // A 128-bit service UUID (18 bytes) + flags (3 bytes) + the device name
-  // (16 bytes for "SpokenFeeds X3") overflows the 31-byte legacy advertising
-  // PDU (37 bytes total) — build the primary advertisement with just the
-  // service UUID (what iOS's scanForPeripherals(withServices:) filters on)
-  // and put the name in the separate scan-response packet instead.
+  // (kDeviceNamePrefix + " " + 4 hex digits, e.g. "CrossPoint Companion A1B2",
+  // 26 bytes) overflows the 31-byte legacy advertising PDU (47 bytes total) —
+  // build the primary advertisement with just the service UUID (what iOS's
+  // scanForPeripherals(withServices:) filters on) and put the name in the
+  // separate scan-response packet instead.
   NimBLEAdvertisementData advData;
   advData.addServiceUUID(kServiceUuid);
 
   NimBLEAdvertisementData scanResponseData;
-  scanResponseData.setName(kDeviceName);
+  scanResponseData.setName(g_deviceName);
 
   NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
   advertising->setAdvertisementData(advData);
@@ -294,6 +324,7 @@ void stop() {
   g_contentChar = nullptr;
   g_buttonChar = nullptr;
   g_capabilityChar = nullptr;
+  g_statusChar = nullptr;
   g_server = nullptr;
   resetReassembly();
 
@@ -316,5 +347,7 @@ bool notifyButtonEvent(ButtonEvent event) {
 }
 
 void setContentFieldCallback(ContentFieldCallback cb) { g_contentCb = cb; }
+
+void setStatusCallback(StatusCallback cb) { g_statusCb = cb; }
 
 }  // namespace companionble

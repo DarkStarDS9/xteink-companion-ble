@@ -33,12 +33,6 @@ class HomeActivity final : public Activity {
   std::vector<RecentBook> recentBooks;
   const HomeMenuItem initialMenuItem;
 
-  // TEMPORARY DEBUG AID (Companion Mode bring-up) — remove before merging to
-  // master. Auto-enters Companion Mode 3s after Home renders if no button was
-  // pressed, so testing doesn't require navigating Settings by hand each
-  // reboot. 0 = disarmed (already fired, or a button was pressed).
-  uint32_t debugAutoCompanionDeadlineMs = 0;
-
   // Convert HomeMenuItem to menu index (used in onEnter)
   static int menuItemToIndex(HomeMenuItem item, bool hasOpdsUrl) {
     int i = 0;
