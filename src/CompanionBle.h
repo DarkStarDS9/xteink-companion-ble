@@ -22,23 +22,37 @@
 #include <cstddef>
 #include <cstdint>
 
+class GfxRenderer;
+
 namespace companionble {
 
 // Advertised local name while in Companion Mode.
 inline constexpr const char* kDeviceName = "SpokenFeeds X3";
 
-// NimBLE's own heap cost is ~52-70 KB measured on this same MCU by BleInput.h's
-// kStartMinFreeHeap/kStartMinFreeHeapExplicit (HID-host role) — treat that as the
-// starting estimate for the peripheral role too (same underlying NimBLE stack),
-// re-measure with ESP.getFreeHeap() before/after ensureStarted() once this
-// builds, and adjust the floor below to the measured number rather than trusting
-// this estimate.
-inline constexpr size_t kStartMinFreeHeap = 70 * 1024;
+// Measured on real X3 hardware (2026-07-22, ESP32-C3, stock NimBLE footprint,
+// no custom_sdkconfig trim — see platformio.ini's note on why): ensureStarted()
+// logs ESP.getFreeHeap() immediately before NimBLEDevice::init() and right
+// after g_server->start() (CBLE tag), isolating NimBLE's own cost from
+// navigation/activity overhead. Measured delta: 99220 -> 34620 bytes, a
+// 64600-byte (~63 KB) cost — confirmed stable afterward (steady low-heap
+// reading held, no crash, no drift over the session). Floor set with ~16 KB
+// margin above that measured cost.
+inline constexpr size_t kStartMinFreeHeap = 80 * 1024;
+
+// Max bytes buffered per field (title/body), independent of negotiated MTU —
+// this bounds the reassembly buffer, not a single CHUNK packet. Advertised to
+// clients via the capability characteristic's max-content-length field;
+// content past this length is truncated per docs/companion-display-protocol.md.
+inline constexpr uint16_t kMaxFieldLen = 4096;
 
 enum class ButtonEvent : uint8_t {
   Confirm = 0x01,
   Back = 0x02,
 };
+
+// Field identifiers for ContentFieldCallback, matching docs/companion-display-protocol.md.
+inline constexpr uint8_t kFieldTitle = 0x01;
+inline constexpr uint8_t kFieldBody = 0x02;
 
 // Start advertising the Companion Display Protocol GATT service (idempotent).
 // Follow BleInput::ensureStarted()'s pattern: wrap NimBLE init in
@@ -46,7 +60,12 @@ enum class ButtonEvent : uint8_t {
 // clock — see BleInput.cpp's comment on this), and gate on
 // ESP.getFreeHeap() >= kStartMinFreeHeap same as bleinput::ensureStarted() does,
 // logging + returning false rather than starting under budget.
-bool ensureStarted();
+//
+// `renderer` and `fontId` are used once, synchronously, to compute the static
+// capability characteristic (screen width/height in characters at the
+// Companion Mode font, per root CLAUDE.md § Orientation-Aware Logic — never
+// hardcode screen dimensions). No reference to `renderer` is retained.
+bool ensureStarted(const GfxRenderer& renderer, int fontId);
 bool startInProgress();
 
 // Full NimBLE teardown, mirroring bleinput::stop() — must return the stack's
@@ -56,20 +75,24 @@ void stop();
 
 bool isConnected();
 
-// Push one field (title or body) to the connected central, framed per
-// docs/companion-display-protocol.md (START declares field + total length,
-// CHUNK carries payload sized to the negotiated MTU minus 1 byte framing
-// overhead, END closes it). No-op if not connected. `field` is 0x01 for title,
-// 0x02 for body, matching the protocol doc.
-bool pushField(uint8_t field, const char* utf8, size_t len);
+// Notify a button press (CONFIRM/BACK) to the connected central, if any.
+// No-op if not connected. Call this directly from CompanionModeActivity::loop()
+// after polling mappedInput.wasPressed(...) — same pattern every other Activity
+// uses to read input (there is no host-task-originated button path to hand off:
+// buttons are polled on the main loop task, and NimBLE's notify() is safe to
+// call from any task). Returns false if not connected or the notify failed.
+bool notifyButtonEvent(ButtonEvent event);
 
-// Registers the callback invoked from the NimBLE host task when a button-event
-// notification's subscription is live and the corresponding physical button
-// (CONFIRM/BACK — see MappedInputManager::Button) is pressed while Companion
-// Mode is the active activity. Runs on the NimBLE host task, not the main loop
-// task — do only cheap, thread-safe work here (e.g. xQueueSend to hand off to
-// the activity's loop()), per the ISR/task shared-state rules in CLAUDE.md.
-using ButtonEventCallback = void (*)(ButtonEvent);
-void setButtonEventCallback(ButtonEventCallback cb);
+// Callback for a completed content field (title or body), fully reassembled
+// from START/CHUNK/END frames. Registered via setContentFieldCallback() and
+// invoked from the NimBLE host task's write callback — this direction DOES cross a
+// task boundary (NimBLE host task -> main loop task), so implementations must
+// only do cheap, thread-safe work here (e.g. copy into a lock-guarded buffer
+// and set a flag CompanionModeActivity::loop() polls), per the ISR/task
+// shared-state rules in root CLAUDE.md. `field` is 0x01 for title, 0x02 for
+// body, matching the protocol doc. `data`/`len` are only valid for the
+// duration of the call.
+using ContentFieldCallback = void (*)(uint8_t field, const uint8_t* data, size_t len);
+void setContentFieldCallback(ContentFieldCallback cb);
 
 }  // namespace companionble

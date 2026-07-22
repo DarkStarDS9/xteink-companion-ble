@@ -1,94 +1,84 @@
-# Companion Mode — implementation notes / TODO
+# Companion Mode — implementation status
 
-Written without a PlatformIO/ESP-IDF toolchain available (no `pio` in this
-environment, so nothing here has been built or flashed). This is a scoped
-TODO list for whoever implements Companion Mode next, not a claim that it
-works.
+Implemented and verified on real X3 hardware (2026-07-22). See
+`docs/companion-display-protocol.md` for the wire protocol and
+`src/CompanionBle.h` for the interface.
 
-See `docs/companion-display-protocol.md` for the wire protocol and
-`src/CompanionBle.h` for the interface contract this needs to fill in.
+## What's implemented
 
-## Why this can't reuse `feat-bluetooth`'s BLE code
+- `src/CompanionBle.cpp` — NimBLE GATT peripheral: service/characteristics,
+  content reassembly (START/CHUNK/END), capability characteristic, button
+  notify, heap-floor-gated `ensureStarted()`/`stop()`.
+- `src/activities/companion/CompanionModeActivity.{h,cpp}` — waiting screen,
+  pagination (reuses the reader's text-wrap measure-and-break loop), LEFT/RIGHT
+  local paging, CONFIRM/BACK BLE notify.
+- Settings menu entry (`SettingsActivity`).
+- iOS side already implemented and TestFlight-deployed
+  (`src/iOS/SpokenFeedsMixer/.../Services/CompanionDeviceService.swift`).
 
-`src/BleInput.h`/`.cpp` on `feat-bluetooth` is a BLE HID **host** — the X3
-acts as BLE *central*, pairing to page-turner remotes (external keyboards).
-Companion Mode needs the opposite role: X3 as GATT *peripheral*, phone as
-central. The FreeInk SDK (`freeink-sdk/libs/network/BleKeyboardHost/`) only
-implements the host role — there's no peripheral/GATT-server helper to build
-on. `CompanionBle` will need to talk to NimBLE-Arduino's server APIs
-(`NimBLEServer`, `NimBLEService`, `NimBLECharacteristic`) directly, the same
-underlying library `BleKeyboardHost` uses internally, just a different API
-surface.
+## Verified end-to-end (independent Mac `bleak` client, real X3 hardware)
 
-One thing *is* reusable from `feat-bluetooth`: proof that NimBLE fits in this
-device's RAM budget, and the exact pattern for doing it safely —
-`bleinput::kStartMinFreeHeap`/`kStartMinFreeHeapExplicit` gate `ensureStarted()`
-on measured free heap before touching NimBLE, and `HalPowerManager::Lock`
-wraps the init/deinit calls because NimBLE controller init hangs at the 10 MHz
-low-power CPU frequency. `CompanionBle::ensureStarted()` should follow the
-same two patterns.
+Connect → read capability characteristic → push 47 content packets
+(title+body, 834 chars) → device paginates and renders → clean disconnect →
+reconnect → clean disconnect again. Heap stable (~40-45 KB free) across both
+connect cycles, no leak.
 
-## Remaining work
+**Not yet verified**: CONFIRM/BACK button-press notify round-trip (needs a
+human physically pressing the device's buttons while a central is connected
+and subscribed — not something a scripted test can drive). Code review
+confidence is high (mirrors `BleKeyboardHost`'s already-tested notify
+mechanics), but do a real press-and-confirm pass before considering this done.
 
-1. **`CompanionBle.cpp`** — implement the interface in `CompanionBle.h`:
-   - `ensureStarted()`: heap-floor check, `HalPowerManager::Lock`, bring up
-     `NimBLEServer` + one `NimBLEService` (UUID from the protocol doc) with
-     the three characteristics, start advertising.
-   - Content characteristic write callback: reassemble START/CHUNK/END frames
-     into two buffers (title, body) sized to the capability characteristic's
-     advertised max content length. Use `makeUniqueNoThrow<uint8_t[]>` per
-     `lib/Memory/Memory.h`, not bare `new` (see root `CLAUDE.md` § Heap
-     Buffer Allocation) — this runs on the NimBLE host task and OOM there
-     should degrade gracefully, not `abort()`.
-   - Button-event notify: call from `MappedInputManager`'s CONFIRM/BACK
-     handling, but only while Companion Mode is the active activity (don't
-     hijack these buttons globally).
-   - Capability characteristic: static read value, protocol version + screen
-     char-grid size (`renderer.getScreenWidth()`/`getScreenHeight()` divided
-     by the Companion Mode font's advance width/line height, not hardcoded —
-     see root `CLAUDE.md` § Orientation-Aware Logic) + max content length.
-   - `stop()`: full NimBLE deinit, mirroring `bleinput::stop()`, so the ~52-70
-     KB comes back for EPUB/reader work when Companion Mode exits.
+## Bugs found and fixed during hardware bring-up
 
-2. **`src/activities/companion/CompanionModeActivity.{h,cpp}`** — new
-   `Activity` subclass (see `src/activities/Activity.h`, and
-   `src/activities/reader/TxtReaderActivity.h` as the closest existing
-   pattern for the pagination piece):
-   - `onEnter()`: `companionble::ensureStarted()`, show a "waiting for
-     connection" screen until `isConnected()`.
-   - On content received (register via `setButtonEventCallback`-style
-     handoff, or poll a flag set from the BLE callback — cross the NimBLE
-     host task → main loop task boundary with a queue/flag per the ISR/task
-     rules in root `CLAUDE.md`, not a raw shared struct): paginate the body
-     text into `linesPerPage`/`pageOffsets`-style chunks like
-     `TxtReaderActivity` does, using the renderer's existing text-wrap path
-     rather than reimplementing wrapping.
-   - `loop()`: LEFT/RIGHT move `currentPage` and re-render locally, no BLE
-     traffic. CONFIRM/BACK call `companionble`'s notify path instead of any
-     local action.
-   - `onExit()`: `companionble::stop()`.
-   - Use partial/grayscale refresh for page turns (`renderer`'s grayscale
-     refresh path, ~127 ms per the hardware specs in the main protocol doc),
-     not full refresh.
+1. **Heap-floor mistuning.** First guess (70 KB, copied from `BleInput.h`'s
+   HID-*host* figure) was replaced with a wrong 100 KB "fix" derived from a
+   whole-session heap logger that conflated navigation overhead with NimBLE's
+   own cost. `ensureStarted()` now logs `ESP.getFreeHeap()` immediately before
+   `NimBLEDevice::init()` and right after `g_server->start()` — the isolated
+   delta measured 64,600-64,724 bytes across multiple runs. Floor set to 80 KB
+   (measured cost + ~16 KB margin).
 
-3. **Menu wiring** — add a "Companion Mode" entry to Home/Settings
-   (`src/activities/settings/SettingsActivity.cpp` shows the pattern
-   `feat-bluetooth` used to add `BluetoothSettingsActivity` at line ~63/300).
-   Not done here — deliberately left out until step 1-2 build clean, so
-   nothing half-working is reachable from the menu.
+2. **Advertising payload overflow.** A 128-bit service UUID (18 bytes) + the
+   device name "SpokenFeeds X3" (16 bytes) + flags (3 bytes) = 37 bytes,
+   over BLE's 31-byte legacy advertising PDU limit. Central-role scanning that
+   filters by service UUID (`scanForPeripherals(withServices:)` on iOS) may
+   never match if the UUID gets silently dropped/truncated to fit. Fixed by
+   splitting the primary advertisement (service UUID only) from the scan
+   response (device name), via `NimBLEAdvertisementData` +
+   `setAdvertisementData()`/`setScanResponseData()`.
 
-4. **`platformio.ini`** — add the NimBLE-Arduino dependency (or confirm it's
-   already pulled transitively via `BleKeyboardHost`'s `library.json` — check
-   before adding a duplicate). `feat-bluetooth`'s `platformio.ini` diff is the
-   reference for what changed there.
+3. **CPU low-power mode killed connection establishment (the real blocker).**
+   `ensureStarted()` originally wrapped only `NimBLEDevice::init()` in a scoped
+   `HalPowerManager::Lock`, matching `BleInput.cpp`'s pattern. But
+   `HalPowerManager`'s idle logic drops the CPU to its low-power clock after a
+   period of no screen activity — exactly what happens sitting on "Waiting for
+   phone" with no further redraws — and NimBLE's connection-establishment
+   processing on the host task hangs at that low clock, the same WDT-hang
+   class documented for init/deinit specifically, but it turns out to also
+   affect live connection negotiation. Symptom: advertising was running and
+   independently discoverable (byte-verified UUID), but no central ever
+   completed a connection unless it happened to arrive during a brief
+   normal-frequency window (e.g. right after a screen refresh). Fixed by
+   holding the `HalPowerManager::Lock` for the entire BLE session
+   (`ensureStarted()` success through `stop()`, via a `g_powerLock` member),
+   not just around init. Confirmed by reproducing the hang on real hardware
+   (Mac `bleak` client's `connect()` timed out after 10s with zero `central
+   connected` log) and then confirming the fix (immediate connect, full
+   protocol round-trip, clean reconnect).
 
-## Verification (do this before considering it done)
+## Known non-firmware issue (iOS side, already documented in that code)
 
-- `pio run` clean build, `pio check` (cppcheck) clean.
-- `ESP.getFreeHeap()` logged immediately before and after
-  `companionble::ensureStarted()`, on real hardware — replace the `70 * 1024`
-  estimate in `CompanionBle.h` with the measured number.
-- Manual device test: connect, push a body long enough to need 3+ pages, page
-  through with LEFT/RIGHT, press CONFIRM and BACK and confirm a connected
-  central sees the notify, disconnect/reconnect, and check heap doesn't creep
-  down over repeated connect/disconnect cycles (leak check).
+`SettingsView.swift`'s Companion Display status text doesn't live-update while
+the sheet is open (nested `@Published` not observed) — close and reopen
+Settings to see a fresh connection state. Not something this session needed to
+fix; already flagged in the iOS code's own comment.
+
+## Remaining before merging to master
+
+- Physical CONFIRM/BACK button-press verification with a connected central.
+- Remove the temporary auto-enter-Companion-Mode-after-3s debug aid in
+  `HomeActivity.{h,cpp}` (clearly marked, grep for "TEMPORARY DEBUG AID").
+- Re-test pairing directly against the iOS app (verified independently via a
+  scripted Mac BLE client above; the one iOS pairing attempt during this
+  session predated the power-lock fix).
