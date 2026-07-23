@@ -405,3 +405,20 @@ void RoundedRaffTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, 
 
   renderer.setOrientation(origOrientation);
 }
+
+int RoundedRaffTheme::getButtonHintsSideBandWidth() const {
+  // Mirrors this file's own sidePadding constant above — the two button
+  // groups span almost the full width, so sidePadding IS the clear band.
+  return 20;
+}
+
+int RoundedRaffTheme::getButtonHintsRowCenterY(const GfxRenderer& renderer) const {
+  // Mirrors this file's own hintY/hintHeight/bottomMargin constants above —
+  // unlike Base/Lyra, this row sits bottomMargin px above the screen edge,
+  // not flush against it.
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  constexpr int bottomMargin = 10;
+  const int hintHeight = metrics.buttonHintsHeight - 10;
+  const int hintY = renderer.getScreenHeight() - hintHeight - bottomMargin;
+  return hintY + hintHeight / 2;
+}

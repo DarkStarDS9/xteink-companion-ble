@@ -186,6 +186,19 @@ class BaseTheme {
   virtual void fillBatteryIcon(const GfxRenderer& renderer, Rect rect, uint16_t percentage) const;
   virtual void drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3,
                                const char* btn4) const;
+  // Width of the clear space at each side of the button-hint row, between the
+  // screen edge and the first/last button box — mirrored, so callers can
+  // treat left and right as symmetric. Themes lay out that row very
+  // differently (button count/width/padding), so this must come from the
+  // active theme rather than being assumed by a caller. Used by
+  // CompanionModeActivity to place battery%/page-count text without
+  // overlapping the buttons, whichever theme is active.
+  virtual int getButtonHintsSideBandWidth() const;
+  // Vertical center of the button-hint row, in the same logical coordinate
+  // space drawButtonHints() draws in. Themes differ here too (RoundedRaffTheme
+  // sits a fixed margin above the screen edge instead of flush against it),
+  // so this must come from the active theme rather than an assumed offset.
+  virtual int getButtonHintsRowCenterY(const GfxRenderer& renderer) const;
   virtual void drawSideButtonHints(const GfxRenderer& renderer, const char* topBtn, const char* bottomBtn) const;
   virtual int getListRowStep(bool hasSubtitle) const;
   virtual int getListPageItems(int contentHeight, bool hasSubtitle) const;

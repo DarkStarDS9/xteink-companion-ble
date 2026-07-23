@@ -184,6 +184,21 @@ void BaseTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, const c
   renderer.setOrientation(orig_orientation);
 }
 
+int BaseTheme::getButtonHintsSideBandWidth() const {
+  // Mirrors the x3/x4ButtonPositions tables in drawButtonHints() above —
+  // the first button's x position IS the clear band width by construction.
+  constexpr int x4FirstButtonX = 25;
+  constexpr int x3FirstButtonX = 38;
+  return gpio.deviceIsX3() ? x3FirstButtonX : x4FirstButtonX;
+}
+
+int BaseTheme::getButtonHintsRowCenterY(const GfxRenderer& renderer) const {
+  // Mirrors drawButtonHints()'s own box math above: the box spans
+  // [pageHeight - buttonHintsHeight, pageHeight) — flush against the edge.
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  return renderer.getScreenHeight() - metrics.buttonHintsHeight / 2;
+}
+
 void BaseTheme::drawSideButtonHints(const GfxRenderer& renderer, const char* topBtn, const char* bottomBtn) const {
   if (gpio.hasTouch()) {
     return;

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 #include "CompanionBle.h"
@@ -46,6 +47,15 @@ constexpr int kReadLaterIconAreaWidth = 24;
 // Title wraps onto at most this many lines before falling back to
 // ellipsis-truncating the last line (see wrapTitleToLines()).
 constexpr int kMaxTitleLines = 2;
+
+// Battery% (left) / page count (right) are drawn inline with the button-hint
+// row instead of in a separate status bar strip above it. The hint row's
+// left/right margins are widened well beyond the button strip (see
+// computeViewport()) specifically to make room for this text without any
+// overlap. Position comes from GUI.getButtonHintsRowCenterY()/
+// getButtonHintsSideBandWidth() (renderPage()) rather than fixed offsets
+// here — BaseTheme/LyraTheme/RoundedRaffTheme lay out that row very
+// differently, and the active theme is user-selectable.
 
 // UTF-8-safe: drop one full codepoint (a lead byte plus any continuation
 // bytes), matching the boundary-walk CompanionModeActivity::paginate() uses.
@@ -160,18 +170,17 @@ void CompanionModeActivity::onExit() {
 void CompanionModeActivity::computeViewport() {
   renderer.getOrientedViewableTRBL(&cachedOrientedMarginTop, &cachedOrientedMarginRight, &cachedOrientedMarginBottom,
                                    &cachedOrientedMarginLeft);
-  cachedOrientedMarginBottom += UITheme::getInstance().getStatusBarHeight();
 
   if (!mappedInput.hasTouch()) {
-    // Reserve room for the bottom button-hint bar. The side margins below
-    // (sideButtonHintsWidth) are kept reserved for layout/hardware-parity
-    // reasons even though renderPage() no longer draws side hint text there
-    // (see the removed GUI.drawSideButtonHints() call) — not reclaimed for
-    // the title-wrap width budget by design.
+    // Reserve room for the bottom button-hint bar. renderPage() no longer draws
+    // side hint text (see the removed GUI.drawSideButtonHints() call), so the
+    // left/right margins don't need sideButtonHintsWidth's reservation — but they
+    // shouldn't collapse to the bare bezel margin either. Twice the top margin
+    // reads as comfortable side whitespace without eating too much line width.
     const auto& metrics = UITheme::getInstance().getMetrics();
     cachedOrientedMarginBottom += metrics.buttonHintsHeight;
-    cachedOrientedMarginLeft += metrics.sideButtonHintsWidth;
-    cachedOrientedMarginRight += metrics.sideButtonHintsWidth;
+    cachedOrientedMarginLeft = cachedOrientedMarginTop * 2;
+    cachedOrientedMarginRight = cachedOrientedMarginTop * 2;
   }
 
   viewportWidth = renderer.getScreenWidth() - cachedOrientedMarginLeft - cachedOrientedMarginRight;
@@ -548,10 +557,34 @@ void CompanionModeActivity::renderPage() {
     }
   }
 
-  GUI.drawStatusBar(renderer, totalPages > 0 ? (currentPage + 1) * 100.0f / totalPages : 0, currentPage + 1,
-                    std::max(totalPages, 1), title);
-
   if (!mappedInput.hasTouch()) {
+    // Battery% (left) / page count (right): each centered in its own
+    // edge-to-button band (not the body-text margin, so a wide string like
+    // "100%" can never run into the button box) and vertically centered on
+    // the button-hint row — both driven by the active theme, since
+    // BaseTheme/LyraTheme/RoundedRaffTheme lay that row out completely
+    // differently (button count/width/padding, flush-to-edge vs. margined).
+    const int rowCenterY = GUI.getButtonHintsRowCenterY(renderer);
+    const int statusTextY = rowCenterY - renderer.getLineHeight(UI_10_FONT_ID) / 2;
+    const int leftBandWidth = GUI.getButtonHintsSideBandWidth();
+    const int rightBandStart = renderer.getScreenWidth() - leftBandWidth;
+    const int rightBandWidth = leftBandWidth;
+
+    char batteryStr[8];
+    snprintf(batteryStr, sizeof(batteryStr), "%u%%", powerManager.getBatteryPercentage());
+    const int batteryTextWidth = renderer.getTextWidth(UI_10_FONT_ID, batteryStr);
+    const int batteryX = std::max(0, (leftBandWidth - batteryTextWidth) / 2);
+    renderer.drawText(UI_10_FONT_ID, batteryX, statusTextY, batteryStr);
+
+    // Kept even though this device doesn't need to track reading progress —
+    // an empty-looking left/right pair would read as a layout mistake, and
+    // it's a free-standing display of the current page vs. total.
+    char pageStr[16];
+    snprintf(pageStr, sizeof(pageStr), "%d/%d", currentPage + 1, std::max(totalPages, 1));
+    const int pageTextWidth = renderer.getTextWidth(UI_10_FONT_ID, pageStr);
+    const int pageX = rightBandStart + std::max(0, (rightBandWidth - pageTextWidth) / 2);
+    renderer.drawText(UI_10_FONT_ID, pageX, statusTextY, pageStr);
+
     // PageBack/PageForward hints only appear when that direction is actually
     // pageable right now (empty string = hidden, the convention drawButtonHints()
     // itself checks — see e.g. FileBrowserActivity's confirmLabel/dirUp/dirDown).

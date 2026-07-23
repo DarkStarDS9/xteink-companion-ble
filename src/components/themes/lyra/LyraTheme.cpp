@@ -389,6 +389,13 @@ void LyraTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, const c
   renderer.setOrientation(orig_orientation);
 }
 
+int LyraTheme::getButtonHintsSideBandWidth() const {
+  // Mirrors this file's own x3/x4ButtonPositions tables above.
+  constexpr int x4FirstButtonX = 58;
+  constexpr int x3FirstButtonX = 65;
+  return gpio.deviceIsX3() ? x3FirstButtonX : x4FirstButtonX;
+}
+
 void LyraTheme::drawSideButtonHints(const GfxRenderer& renderer, const char* topBtn, const char* bottomBtn) const {
   if (gpio.hasTouch()) {
     return;

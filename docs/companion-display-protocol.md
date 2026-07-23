@@ -227,6 +227,13 @@ currently-displayed article's save state, not a running total.
   `src/activities/companion/CompanionModeActivity.{h,cpp}` implements the
   on-device screen (pagination, button routing, read-later icon). See
   `docs/companion-mode-implementation-notes.md` for the bring-up log.
+- `scripts/push_companion_content.py` pushes title/body/content-id over BLE
+  directly from a dev machine (`bleak`, see `scripts/requirements.txt`) —
+  useful for on-device layout testing when the paired phone isn't available,
+  or to force a specific body length (e.g. a long multi-page article) that's
+  awkward to trigger from the app. Run `python scripts/push_companion_content.py
+  --help`; it implements the exact START/CHUNK/END + final-flag framing
+  described above.
 - No firmware-side automated tests exist for this feature — this project has
   no on-target test harness. Verify manually: connect, push a multi-page
   body, page with LEFT/RIGHT (page-turn hints appear only when that direction
