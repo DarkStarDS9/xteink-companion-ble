@@ -462,6 +462,12 @@ void loop() {
         uint8_t* buf = display.getFrameBuffer();
         logSerial.write(buf, bufferSize);
         logSerial.printf("SCREENSHOT_END\n");
+      } else if (cmd == "CRASHREPORT") {
+        logSerial.printf("CRASHREPORT_START\n");
+        if (!Storage.readFileToStream("/crash_report.txt", logSerial)) {
+          logSerial.printf("CRASHREPORT_ERROR: no file or read failed\n");
+        }
+        logSerial.printf("\nCRASHREPORT_END\n");
       }
     }
   }

@@ -305,6 +305,14 @@ void CompanionModeActivity::loop() {
 
   const bool nowConnected = companionble::isConnected();
   if (nowConnected != connected) {
+    // RenderLock: connected/haveContent/pages gate which branch render() takes
+    // (renderWaiting() vs renderPage()) and renderPage() iterates `pages`
+    // directly — mutating it here without the lock races the render task,
+    // which can observe a torn `pages` (mid-clear()) against a stale
+    // `totalPages`/`currentPage` and index out of bounds. Confirmed via a
+    // real device crash (EXC inside renderPage()'s pages[currentPage] loop)
+    // before this fix. See EpubReaderActivity.cpp for the same convention.
+    RenderLock lock;
     connected = nowConnected;
     if (!connected) {
       haveContent = false;
@@ -342,23 +350,31 @@ void CompanionModeActivity::loop() {
   }
   portEXIT_CRITICAL(&g_mux);
 
-  if (gotTitle) {
-    title = newTitle;
-    updateTitleLayout();
-    // If the body's already loaded and isn't about to be re-paginated below
-    // by gotBody, re-paginate now — linesPerPage may have changed with the
-    // title's wrapped line count.
-    if (haveContent && !gotBody) paginate();
-    requestUpdate();
-  }
-  if (gotBody) {
-    body = newBody;
-    paginate();
-    haveContent = true;
-    readLaterSaved = false;  // new article: reset any previous save-state indicator
+  if (gotTitle || gotBody) {
+    // One lock for both halves (rather than two separate locks) so a render
+    // can never land between the title and body updates of a single push and
+    // see a mismatched pairing (e.g. new title still showing the old page
+    // count). See the connect/disconnect branch above for why this needs a
+    // RenderLock at all.
+    RenderLock lock;
+    if (gotTitle) {
+      title = newTitle;
+      updateTitleLayout();
+      // If the body's already loaded and isn't about to be re-paginated below
+      // by gotBody, re-paginate now — linesPerPage may have changed with the
+      // title's wrapped line count.
+      if (haveContent && !gotBody) paginate();
+    }
+    if (gotBody) {
+      body = newBody;
+      paginate();
+      haveContent = true;
+      readLaterSaved = false;  // new article: reset any previous save-state indicator
+    }
     requestUpdate();
   }
   if (gotStatus && newStatus == static_cast<uint8_t>(companionble::StatusEvent::ReadLaterSaved)) {
+    RenderLock lock;
     readLaterSaved = true;
     forceFastRefreshNextRender = true;
     requestUpdate();
@@ -367,9 +383,11 @@ void CompanionModeActivity::loop() {
   if (!haveContent || !connected) return;
 
   if (mappedInput.wasPressed(MappedInputManager::Button::Left) && currentPage > 0) {
+    RenderLock lock;
     currentPage--;
     requestUpdate();
   } else if (mappedInput.wasPressed(MappedInputManager::Button::Right) && currentPage < totalPages - 1) {
+    RenderLock lock;
     currentPage++;
     requestUpdate();
   }
