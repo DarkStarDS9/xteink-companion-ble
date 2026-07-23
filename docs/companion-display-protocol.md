@@ -14,7 +14,7 @@ Home/reader entry path in normal operation.
 
 ## Status
 
-v4, implemented and verified on real X3 hardware. This is a **BLE
+v5, implemented and verified on real X3 hardware. This is a **BLE
 peripheral/GATT-server role**, not something upstream CrossPoint or this
 fork's `feat-bluetooth` branch already has — that branch's BLE code is a HID
 *host* (X3 pairs to page-turner remotes as central), the opposite role from
@@ -121,58 +121,94 @@ typed value (a UUID, a hash, a short numeric string, etc. all fit).
 
 ## Button-event characteristic — receiving input
 
-The device notifies whenever one of the mapped buttons is pressed while
-Companion Mode is active and the phone is connected. The notification payload
-is:
+The device notifies whenever one of the mapped buttons is pressed, repeated
+about every 100ms while it stays held, plus one final notification on
+release — while Companion Mode is active and the phone is connected. Unlike
+v2-v4, the firmware reports **raw physical button identity**, not a semantic
+action (no more PLAY_PAUSE/PREV/NEXT/READ_LATER) — interpreting what a button
+or a hold of a given duration means is entirely the client app's job. The
+notification payload (v5) is:
 
 ```
-byte 0:      event            (0x01 = PLAY_PAUSE, 0x02 = PREV, 0x03 = NEXT, 0x04 = READ_LATER)
-bytes 1..N:  content-id bytes (the most recently pushed content-id field, verbatim — 0 bytes if none pushed yet)
+byte 0:      header           bit7 = isFinal
+                               bits6-4 = event type (0x1 = ButtonPress; reserved otherwise)
+                               bits3-0 = button id (see table below)
+bytes 1..2:  duration         uint16, little-endian, elapsed hold time in 100ms ticks
+                               since the initial press (0 for the initial-down event)
+bytes 3..N:  content-id bytes (the most recently pushed content-id field, verbatim — 0 bytes if none pushed yet)
 ```
 
 ```
-0x01  PLAY_PAUSE   (bottom BACK button)
-0x02  PREV         (a side button — see note below)
-0x03  NEXT         (the other side button)
-0x04  READ_LATER   (bottom CONFIRM button)
+0x00  BACK      (bottom BACK button)
+0x01  CONFIRM   (bottom CONFIRM button)
+0x02  LEFT      (bottom LEFT button — never notified, see below)
+0x03  RIGHT     (bottom RIGHT button — never notified, see below)
+0x04  UP        (a side button — see note below)
+0x05  DOWN      (the other side button)
+0x06  POWER     (never notified, handled on-device)
 ```
+
+These ids mirror `HalGPIO::BTN_*`/`InputManager::BTN_*` exactly (see
+`lib/hal/HalGPIO.h`) — the wire byte is the same index the firmware's own HAL
+uses internally, not a companion-protocol-specific renumbering.
+
+A press/hold/release sequence looks like this on the wire (BACK held for
+1.5s, then released):
+
+```
+[header: button=BACK, isFinal=0]  duration=0    <- initial press
+[header: button=BACK, isFinal=0]  duration=1    <- ~100ms held
+[header: button=BACK, isFinal=0]  duration=2    <- ~200ms held
+...
+[header: button=BACK, isFinal=1]  duration=15   <- released at ~1.5s
+```
+
+A client MUST NOT rely on the `isFinal` notification alone to detect
+release — a disconnect mid-hold means it may never arrive. Treat "no repeat
+notification for noticeably longer than ~100ms" as an implicit release too.
 
 There is no length prefix on the content-id bytes — the GATT notification's
-own value length delimits it (`payload length - 1` bytes). A client that
-doesn't use content-id can simply ignore any bytes after byte 0.
+own value length delimits it (`payload length - 3` bytes, after the 3-byte
+header+duration prefix). A client that doesn't use content-id can simply
+ignore any bytes after byte 2.
 
 `LEFT`/`RIGHT` (the other two bottom buttons) page through whatever body text
 is currently buffered, entirely on-device — the device already has the full
 text locally, so local paging needs no round trip, and pressing them never
 produces a BLE event. `POWER` (sleep/wake) is likewise handled entirely
-on-device.
+on-device. Both keep their HAL-matching id values above for completeness,
+even though neither ever appears on the wire.
 
 **Side button (UP/DOWN) note**: which physical side of the device UP vs DOWN
 is on is a hardware detail that isn't visible from firmware source (shared
-X3/X4 binary) — see `kSideUpMeansPrev` in
-`src/activities/companion/CompanionModeActivity.cpp`, a single named constant
-that maps physical UP/DOWN to PREV/NEXT. If PREV/NEXT feel backwards on a
-given device, that's the one line to flip. UP/DOWN presses are intentionally
-not accompanied by an on-screen hint (unlike the bottom PLAY_PAUSE/READ_LATER/
-page-turn hints) — they still work and still notify PREV/NEXT.
+X3/X4 binary). Prior to v5 the firmware compensated for this with a single
+named constant (`kSideUpMeansPrev`) that remapped UP/DOWN to a
+device-independent PREV/NEXT before sending. v5 removes that remapping —
+the firmware reports raw UP/DOWN as-is, so a client that wants a consistent
+PREV/NEXT feel across devices now owns that decision itself (or exposes it
+as a user-facing setting). UP/DOWN presses are intentionally not accompanied
+by an on-screen hint (unlike the bottom BACK/CONFIRM/page-turn hints) — they
+still work and still notify.
 
 The semantic meaning of these events (e.g. "toggle playback", "save for
-later", "previous/next article") is entirely up to the client app — the
-firmware only reports which physical button was pressed.
+later", "previous/next article", "hold N seconds to do X") is entirely up to
+the client app — the firmware only reports which physical button fired and
+for how long it's been held.
 
 ### Content-id budget
 
 The device requests MTU 185 (`NimBLEDevice::setMTU(185)`); ATT overhead is
 always 3 bytes, so the practically available notification payload today is
-~182 bytes, i.e. up to ~181 bytes for content-id after the event byte. That is
-**not** the number to design against, though: this protocol is meant to stay
-usable by other app-agnostic clients that may negotiate a smaller MTU, and
-BLE's guaranteed floor (a central that only supports the minimum MTU, 23) is
-20 usable ATT bytes — 19 bytes for content-id in the worst case. The firmware
-enforces its own hard cap of 32 bytes (`kMaxContentIdLen`) regardless of
-negotiated MTU: comfortably under the guaranteed floor, while still large
-enough for e.g. a UUID string or a short opaque token. Don't rely on the full
-negotiated-MTU headroom for content-id — treat 32 bytes as the contract.
+~182 bytes, i.e. up to ~179 bytes for content-id after the 3-byte
+header+duration prefix. That is **not** the number to design against, though:
+this protocol is meant to stay usable by other app-agnostic clients that may
+negotiate a smaller MTU, and BLE's guaranteed floor (a central that only
+supports the minimum MTU, 23) is 20 usable ATT bytes — 17 bytes for
+content-id in the worst case. The firmware enforces its own hard cap of 32
+bytes (`kMaxContentIdLen`) regardless of negotiated MTU: comfortably under
+the guaranteed floor, while still large enough for e.g. a UUID string or a
+short opaque token. Don't rely on the full negotiated-MTU headroom for
+content-id — treat 32 bytes as the contract.
 
 ## Capability characteristic — introspection
 
@@ -180,11 +216,17 @@ A single read-only value clients can query instead of hardcoding assumptions
 about the device:
 
 ```
-byte 0:      protocol version (currently 4)
+byte 0:      protocol version (currently 5)
 byte 1:      screen width in characters, at the font Companion Mode uses
 byte 2:      screen height in characters (lines per page)
 bytes 3..4:  max content length per field, in bytes (uint16, little-endian) — title/body only, not content-id
 ```
+
+v5 changes from v4: replaced the button-event characteristic's single
+semantic event byte (PLAY_PAUSE/PREV/NEXT/READ_LATER) with a packed
+raw-button-id + hold-duration payload, repeated while a button is held (see
+"Button-event characteristic" above). The byte layout above is unchanged —
+only the version number, and the button-event payload's shape, changed.
 
 v4 changes from v3: added the `0x80` final-field flag on the Content
 characteristic's START field byte for atomic multi-field pushes (see above).
@@ -212,8 +254,9 @@ Phone → device, single byte. Currently one value:
 0x01  READ_LATER_SAVED
 ```
 
-Sent by the client after it has durably saved a READ_LATER button-press
-notification (e.g. "article queued for later"). The device flips its
+Sent by the client after it has durably saved whatever it interprets a
+button-press notification as meaning (e.g. "article queued for later" — a
+client-side decision, not a firmware one as of v5). The device flips its
 on-screen read-later indicator from outline to filled and redraws with a
 no-flash differential refresh. The indicator resets to outline whenever a new
 body is pushed (see Content characteristic above) — it reflects the

@@ -3,12 +3,15 @@
 #include <string>
 #include <vector>
 
+#include "CompanionBle.h"
 #include "activities/Activity.h"
 
 // Companion Mode: X3 as a BLE GATT peripheral showing title/body text pushed
 // from a phone app (see docs/companion-display-protocol.md). Bottom LEFT/RIGHT
-// page the locally-buffered body text; side UP/DOWN and bottom BACK/CONFIRM
-// report PREV/NEXT/PLAY_PAUSE/READ_LATER over BLE. See
+// page the locally-buffered body text, entirely on-device; side UP/DOWN and
+// bottom BACK/CONFIRM report their raw button id over BLE, repeated every
+// ~100ms while held (see loop()'s hold-tracking block) — the client app
+// decides what each button/hold-duration means, the firmware doesn't. See
 // docs/companion-mode-implementation-notes.md for the design rationale. This
 // is the device's sole normal-boot activity (see main.cpp) — the firmware is
 // companion-only.
@@ -50,6 +53,22 @@ class CompanionModeActivity final : public Activity {
   unsigned long waitingSinceMs = 0;
   static constexpr unsigned long kWaitingIdleSleepMs = 5UL * 60UL * 1000UL;  // 5 minutes
 
+  // Hold-tracking for the four BLE-reported buttons (UP/DOWN/BACK/CONFIRM).
+  // The hardware only ever has one physical button held at a time (mirrors
+  // InputManager::getHeldTime()'s own single global press-start timestamp),
+  // so one in-flight sequence is all that needs tracking. holdActive is false
+  // whenever no BLE-reported button is currently down; set on the initial
+  // notifyButtonEvent() send (duration 0) and cleared on the final
+  // (isFinal=true) send at release. holdTicksSent is the last duration (in
+  // 100ms ticks) already notified, so loop() only sends a repeat once
+  // getHeldTime() has actually crossed into the next tick — never on every
+  // loop() iteration.
+  bool holdActive = false;
+  companionble::ButtonId holdButton = companionble::ButtonId::Back;
+  uint16_t holdTicksSent = 0;
+  static constexpr unsigned long kHoldTickMs = 100;
+
+  void notifyHeldButton(companionble::ButtonId button);
   void computeViewport();
   void updateTitleLayout();
   std::vector<std::string> wrapTitleToLines(const std::string& text) const;

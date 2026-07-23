@@ -25,12 +25,6 @@ namespace {
 constexpr int kCompanionFontId = NOTOSANS_14_FONT_ID;       // body
 constexpr int kCompanionTitleFontId = NOTOSANS_16_FONT_ID;  // title: larger + bold
 
-// Which physical side button is UP is a hardware detail shared across the
-// X3/X4 binary that can't be derived from code (see root CLAUDE.md's
-// "Established hardware facts") — swap this single constant after on-device
-// testing if UP/DOWN turn out backwards from the intended PREV/NEXT feel.
-constexpr bool kSideUpMeansPrev = true;
-
 // Bottom-row hint labels. Plain ASCII (guaranteed present in the built-in
 // font's Basic Latin range) standing in for icons: the companion font's
 // glyph set (see notosans_14_regular's EpdUnicodeInterval table) has no
@@ -457,23 +451,53 @@ void CompanionModeActivity::loop() {
     requestUpdate();
   }
 
-  // Side UP/DOWN report PREV/NEXT over BLE (see kSideUpMeansPrev); bottom
-  // BACK/CONFIRM report PLAY_PAUSE/READ_LATER. LEFT/RIGHT above page the
-  // locally-buffered body and never produce a BLE event.
+  // Side UP/DOWN and bottom BACK/CONFIRM report their raw button id over BLE
+  // (see notifyHeldButton()), repeated every ~kHoldTickMs while held. LEFT/
+  // RIGHT above page the locally-buffered body and never produce a BLE event.
   if (mappedInput.wasPressed(MappedInputManager::Button::Up)) {
-    companionble::notifyButtonEvent(kSideUpMeansPrev ? companionble::ButtonEvent::Prev
-                                                     : companionble::ButtonEvent::Next);
+    notifyHeldButton(companionble::ButtonId::Up);
+  } else if (mappedInput.wasPressed(MappedInputManager::Button::Down)) {
+    notifyHeldButton(companionble::ButtonId::Down);
+  } else if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+    notifyHeldButton(companionble::ButtonId::Back);
+  } else if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+    notifyHeldButton(companionble::ButtonId::Confirm);
   }
-  if (mappedInput.wasPressed(MappedInputManager::Button::Down)) {
-    companionble::notifyButtonEvent(kSideUpMeansPrev ? companionble::ButtonEvent::Next
-                                                     : companionble::ButtonEvent::Prev);
+
+  if (holdActive) {
+    // Map the tracked button back to its MappedInputManager role to poll
+    // isPressed/wasReleased/getHeldTime for it specifically — getHeldTime()
+    // is a single global timer (only one physical button can be held at a
+    // time on this hardware), so it's always describing holdButton's press.
+    const MappedInputManager::Button trackedRole =
+        holdButton == companionble::ButtonId::Up      ? MappedInputManager::Button::Up
+        : holdButton == companionble::ButtonId::Down  ? MappedInputManager::Button::Down
+        : holdButton == companionble::ButtonId::Back   ? MappedInputManager::Button::Back
+                                                        : MappedInputManager::Button::Confirm;
+    if (mappedInput.wasReleased(trackedRole)) {
+      const uint16_t finalTicks =
+          static_cast<uint16_t>(std::min<unsigned long>(mappedInput.getHeldTime() / kHoldTickMs, 0xFFFFUL));
+      companionble::notifyButtonEvent(holdButton, finalTicks, /*isFinal=*/true);
+      holdActive = false;
+    } else if (mappedInput.isPressed(trackedRole)) {
+      const uint16_t heldTicks =
+          static_cast<uint16_t>(std::min<unsigned long>(mappedInput.getHeldTime() / kHoldTickMs, 0xFFFFUL));
+      if (heldTicks > holdTicksSent) {
+        companionble::notifyButtonEvent(holdButton, heldTicks, /*isFinal=*/false);
+        holdTicksSent = heldTicks;
+      }
+    }
   }
-  if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
-    companionble::notifyButtonEvent(companionble::ButtonEvent::PlayPause);
-  }
-  if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
-    companionble::notifyButtonEvent(companionble::ButtonEvent::ReadLater);
-  }
+}
+
+// Starts (or restarts) hold-tracking for a just-pressed button and sends the
+// initial-down notification (duration 0, isFinal false). See holdActive's
+// doc comment in CompanionModeActivity.h.
+void CompanionModeActivity::notifyHeldButton(companionble::ButtonId button) {
+  companionble::notifyButtonEvent(button, /*durationTicks=*/0, /*isFinal=*/false);
+  holdActive = true;
+  holdButton = button;
+  holdTicksSent = 0;
 }
 
 void CompanionModeActivity::render(RenderLock&&) {

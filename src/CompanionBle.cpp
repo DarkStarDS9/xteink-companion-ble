@@ -98,7 +98,9 @@ void computeCapabilityValue(const GfxRenderer& renderer, int fontId) {
   const int screenWidthChars = advanceWidth > 0 ? renderer.getScreenWidth() / advanceWidth : 0;
   const int screenHeightChars = lineHeight > 0 ? renderer.getScreenHeight() / lineHeight : 0;
 
-  g_capabilityValue[0] = 4;  // protocol version — v4 adds kFinalFieldFlag (atomic multi-field pushes)
+  g_capabilityValue[0] = 5;  // protocol version — v5 replaces the button-event characteristic's
+                              // semantic ButtonEvent byte with a packed raw-button-id + hold-duration
+                              // payload (see docs/companion-display-protocol.md)
   g_capabilityValue[1] = static_cast<uint8_t>(screenWidthChars > 255 ? 255 : screenWidthChars);
   g_capabilityValue[2] = static_cast<uint8_t>(screenHeightChars > 255 ? 255 : screenHeightChars);
   g_capabilityValue[3] = static_cast<uint8_t>(kMaxFieldLen & 0xFF);
@@ -359,14 +361,21 @@ void stop() {
 
 bool isConnected() { return g_begun && g_server && g_server->getConnectedCount() > 0; }
 
-bool notifyButtonEvent(ButtonEvent event) {
+bool notifyButtonEvent(ButtonId button, uint16_t durationTicks, bool isFinal) {
   if (!isConnected() || !g_buttonChar) return false;
-  uint8_t payload[1 + kMaxContentIdLen];
-  payload[0] = static_cast<uint8_t>(event);
+  // Header byte: bit7 isFinal, bits6-4 event type, bits3-0 button id — see
+  // notifyButtonEvent()'s doc comment in CompanionBle.h for the wire layout.
+  const uint8_t header = (isFinal ? 0x80 : 0x00) |
+                          ((static_cast<uint8_t>(ButtonEventType::ButtonPress) & 0x07) << 4) |
+                          (static_cast<uint8_t>(button) & 0x0F);
+  uint8_t payload[3 + kMaxContentIdLen];
+  payload[0] = header;
+  payload[1] = static_cast<uint8_t>(durationTicks & 0xFF);
+  payload[2] = static_cast<uint8_t>((durationTicks >> 8) & 0xFF);
   if (g_lastContentIdLen > 0) {
-    memcpy(payload + 1, g_lastContentId, g_lastContentIdLen);
+    memcpy(payload + 3, g_lastContentId, g_lastContentIdLen);
   }
-  g_buttonChar->setValue(payload, 1 + g_lastContentIdLen);
+  g_buttonChar->setValue(payload, 3 + g_lastContentIdLen);
   return g_buttonChar->notify();
 }
 

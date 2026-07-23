@@ -54,24 +54,39 @@ inline constexpr uint16_t kMaxFieldLen = 4096;
 // "the button was pressed for a since-replaced article" and no-op instead of
 // acting on stale state. Kept small on purpose: the button-event
 // characteristic's notify payload is bounded by (negotiated MTU - 3 bytes ATT
-// overhead) minus the 1 event byte, and other/future clients on this
-// app-agnostic protocol may negotiate a much smaller MTU than this firmware's
+// overhead) minus the 3-byte header+duration prefix (see notifyButtonEvent()),
+// and other/future clients on this app-agnostic protocol may negotiate a
+// much smaller MTU than this firmware's
 // own 185 (BLE's guaranteed floor is MTU 23, i.e. 19 usable bytes worst
 // case) — see docs/companion-display-protocol.md for the full budget math.
 // A push exceeding this length is truncated, exactly like kMaxFieldLen for
 // title/body.
 inline constexpr size_t kMaxContentIdLen = 32;
 
-// Wire protocol v3 (see docs/companion-display-protocol.md). ButtonEvent
-// values match the button-event characteristic's first byte exactly — do not
-// renumber without bumping the capability characteristic's protocol version.
-// v3 adds kFieldContentId and appends the last-pushed content-id bytes after
-// this byte in the notification payload (v2 sent this byte alone).
-enum class ButtonEvent : uint8_t {
-  PlayPause = 0x01,
-  Prev = 0x02,
-  Next = 0x03,
-  ReadLater = 0x04,
+// Wire protocol v5 (see docs/companion-display-protocol.md). Raw physical
+// button identity — mirrors HalGPIO::BTN_*/InputManager::BTN_* exactly (do
+// not renumber independently of those). Unlike the v2-v4 ButtonEvent enum
+// this replaced (PLAY_PAUSE/PREV/NEXT/READ_LATER), the firmware assigns no
+// meaning to a button beyond its physical identity — interpretation is
+// entirely up to the client app. LEFT/RIGHT/POWER never reach BLE (see
+// notifyButtonEvent()'s doc comment) but keep their HAL-matching values here
+// so this enum stays a straight mirror of the HAL rather than a subset.
+enum class ButtonId : uint8_t {
+  Back = 0,
+  Confirm = 1,
+  Left = 2,
+  Right = 3,
+  Up = 4,
+  Down = 5,
+  Power = 6,
+};
+
+// Button-event characteristic event types (top 3 bits of the header byte,
+// see notifyButtonEvent()). Only one exists today; the field is reserved so
+// a future non-press event (e.g. a heartbeat) could share this
+// characteristic without a wire-incompatible change.
+enum class ButtonEventType : uint8_t {
+  ButtonPress = 0x01,
 };
 
 // Status characteristic values, phone -> device (see docs/companion-display-protocol.md).
@@ -122,18 +137,28 @@ void stop();
 
 bool isConnected();
 
-// Notify a button press (PLAY_PAUSE/PREV/NEXT/READ_LATER) to the connected
-// central, if any. No-op if not connected. Call this directly from
-// CompanionModeActivity::loop() after polling mappedInput.wasPressed(...) —
-// same pattern every other Activity uses to read input (there is no
-// host-task-originated button path to hand off: buttons are polled on the
-// main loop task, and NimBLE's notify() is safe to call from any task).
+// Notify a button-press event to the connected central, if any. No-op if not
+// connected. Call this from CompanionModeActivity::loop() — the caller owns
+// all hold-tracking (first-press vs. repeat-while-held vs. release): this
+// function just serializes whatever it's given. Buttons are polled on the
+// main loop task, and NimBLE's notify() is safe to call from any task.
 // Returns false if not connected or the notify failed.
 //
-// The notification payload is `[event byte] + [last-pushed content-id
-// bytes]` (v3) — the caller does not pass the id; it's read internally from
-// whatever kFieldContentId push landed most recently (empty if none yet).
-bool notifyButtonEvent(ButtonEvent event);
+// `durationTicks` is elapsed hold time in 100ms units since the initial press
+// (0 for the initial-down event); `isFinal` marks the release event — the
+// last one for this press/hold/release sequence. A client MUST NOT rely on
+// `isFinal` alone to detect release (a disconnect mid-hold means it may never
+// arrive) — treat "no repeat tick for noticeably longer than 100ms" as an
+// implicit release too. See docs/companion-display-protocol.md.
+//
+// The notification payload (v5) is `[header byte] + [duration, uint16 LE] +
+// [last-pushed content-id bytes]`. The header byte packs isFinal (bit 7),
+// event type (bits 6-4, currently always ButtonEventType::ButtonPress), and
+// the button id (bits 3-0) — see docs/companion-display-protocol.md for the
+// exact bit layout. The caller does not pass the content-id; it's read
+// internally from whatever kFieldContentId push landed most recently (empty
+// if none yet).
+bool notifyButtonEvent(ButtonId button, uint16_t durationTicks, bool isFinal);
 
 // Callback for a completed content field (title, body, or content-id), fully reassembled
 // from START/CHUNK/END frames. Registered via setContentFieldCallback() and
