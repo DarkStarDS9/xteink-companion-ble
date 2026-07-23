@@ -315,6 +315,12 @@ void CompanionModeActivity::paginate() {
 void CompanionModeActivity::checkWaitingIdleSleep() {
   if (connected || waitingSinceMs == 0) return;
   if (millis() - waitingSinceMs < kWaitingIdleSleepMs) return;
+  // See main.cpp's general auto-sleep check for why USB power skips this too —
+  // deep-sleeping drops the USB CDC connection, which is actively unhelpful
+  // while plugged in (charging, or connected for serial debugging).
+  // isUsbConnected() alone misses a debug/data cable with no net charge
+  // current (see main.cpp's fuller comment) — `Serial` catches that case.
+  if (gpio.isUsbConnected() || Serial) return;
 
   LOG_INF("CMA", "No phone connected for %lu ms on the waiting screen, deep-sleeping", kWaitingIdleSleepMs);
   powerManager.startDeepSleep(gpio);  // [[noreturn]] — wakes on power button, panel keeps its last image
