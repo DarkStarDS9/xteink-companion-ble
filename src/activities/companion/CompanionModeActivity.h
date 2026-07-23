@@ -15,7 +15,7 @@
 class CompanionModeActivity final : public Activity {
   bool connected = false;
   bool haveContent = false;
-  bool startFailed = false;  // ensureStarted() refused (heap floor or NimBLE init failure)
+  bool startFailed = false;     // ensureStarted() refused (heap floor or NimBLE init failure)
   bool readLaterSaved = false;  // toggled by the Status characteristic's READ_LATER_SAVED write
   // Set when a Status write lands, so the next renderPage() flips the E-ink
   // panel with FAST_REFRESH regardless of the normal per-page-turn refresh

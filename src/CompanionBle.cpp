@@ -35,8 +35,7 @@ char g_deviceName[48] = {0};
 
 void buildDeviceName() {
   const uint64_t mac = ESP.getEfuseMac();
-  snprintf(g_deviceName, sizeof(g_deviceName), "%s %04X", kDeviceNamePrefix,
-           static_cast<unsigned>(mac & 0xFFFF));
+  snprintf(g_deviceName, sizeof(g_deviceName), "%s %04X", kDeviceNamePrefix, static_cast<unsigned>(mac & 0xFFFF));
 }
 
 volatile bool g_startInProgress = false;
@@ -269,8 +268,7 @@ bool ensureStarted(const GfxRenderer& renderer, int fontId) {
 
   NimBLEService* service = g_server->createService(kServiceUuid);
 
-  g_contentChar = service->createCharacteristic(
-      kContentCharUuid, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+  g_contentChar = service->createCharacteristic(kContentCharUuid, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
   g_contentChar->setCallbacks(&g_contentCharCallbacks);
 
   g_buttonChar = service->createCharacteristic(kButtonCharUuid, NIMBLE_PROPERTY::NOTIFY);
@@ -307,8 +305,8 @@ bool ensureStarted(const GfxRenderer& renderer, int fontId) {
     for (size_t i = 0; i < payload.size() && off + 3 < sizeof(hex); ++i) {
       off += snprintf(hex + off, sizeof(hex) - off, "%02x ", payload[i]);
     }
-    LOG_DBG("CBLE", "advertising: start()=%d isAdvertising()=%d advPayloadLen=%u adv=%s",
-            advStarted ? 1 : 0, advertising->isAdvertising() ? 1 : 0, static_cast<unsigned>(payload.size()), hex);
+    LOG_DBG("CBLE", "advertising: start()=%d isAdvertising()=%d advPayloadLen=%u adv=%s", advStarted ? 1 : 0,
+            advertising->isAdvertising() ? 1 : 0, static_cast<unsigned>(payload.size()), hex);
   }
 
   g_begun = true;

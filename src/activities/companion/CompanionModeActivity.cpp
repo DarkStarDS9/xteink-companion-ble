@@ -222,8 +222,7 @@ std::vector<std::string> CompanionModeActivity::wrapTitleToLines(const std::stri
   std::string remaining = text;
 
   while (!remaining.empty()) {
-    if (maxWidth <= 0 ||
-        renderer.getTextWidth(cachedTitleFontId, remaining.c_str(), EpdFontFamily::BOLD) <= maxWidth) {
+    if (maxWidth <= 0 || renderer.getTextWidth(cachedTitleFontId, remaining.c_str(), EpdFontFamily::BOLD) <= maxWidth) {
       lines.push_back(remaining);
       remaining.clear();
       break;
@@ -233,8 +232,8 @@ std::vector<std::string> CompanionModeActivity::wrapTitleToLines(const std::stri
     if (lastAllowedLine) {
       std::string truncated = remaining;
       const std::string ellipsis = "\xE2\x80\xA6";  // U+2026 HORIZONTAL ELLIPSIS
-      while (!truncated.empty() && renderer.getTextWidth(cachedTitleFontId, (truncated + ellipsis).c_str(),
-                                                          EpdFontFamily::BOLD) > maxWidth) {
+      while (!truncated.empty() &&
+             renderer.getTextWidth(cachedTitleFontId, (truncated + ellipsis).c_str(), EpdFontFamily::BOLD) > maxWidth) {
         popUtf8Char(truncated);
       }
       lines.push_back(truncated + ellipsis);
@@ -244,7 +243,7 @@ std::vector<std::string> CompanionModeActivity::wrapTitleToLines(const std::stri
 
     size_t breakPos = remaining.length();
     while (breakPos > 0 && renderer.getTextWidth(cachedTitleFontId, remaining.substr(0, breakPos).c_str(),
-                                                  EpdFontFamily::BOLD) > maxWidth) {
+                                                 EpdFontFamily::BOLD) > maxWidth) {
       size_t spacePos = remaining.rfind(' ', breakPos - 1);
       if (spacePos != std::string::npos && spacePos > 0) {
         breakPos = spacePos;
@@ -296,7 +295,7 @@ void CompanionModeActivity::paginate() {
 
       size_t breakPos = line.length();
       while (breakPos > 0 && renderer.getTextAdvanceX(cachedFontId, line.substr(0, breakPos).c_str(),
-                                                       EpdFontFamily::REGULAR) > viewportWidth) {
+                                                      EpdFontFamily::REGULAR) > viewportWidth) {
         size_t spacePos = line.rfind(' ', breakPos - 1);
         if (spacePos != std::string::npos && spacePos > 0) {
           breakPos = spacePos;
@@ -463,11 +462,11 @@ void CompanionModeActivity::loop() {
   // locally-buffered body and never produce a BLE event.
   if (mappedInput.wasPressed(MappedInputManager::Button::Up)) {
     companionble::notifyButtonEvent(kSideUpMeansPrev ? companionble::ButtonEvent::Prev
-                                                      : companionble::ButtonEvent::Next);
+                                                     : companionble::ButtonEvent::Next);
   }
   if (mappedInput.wasPressed(MappedInputManager::Button::Down)) {
     companionble::notifyButtonEvent(kSideUpMeansPrev ? companionble::ButtonEvent::Next
-                                                      : companionble::ButtonEvent::Prev);
+                                                     : companionble::ButtonEvent::Prev);
   }
   if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
     companionble::notifyButtonEvent(companionble::ButtonEvent::PlayPause);
@@ -509,7 +508,7 @@ void CompanionModeActivity::renderReadLaterIcon(int x, int y) const {
   constexpr int kPoints = 10;
   constexpr float kOuterR = 8.0f;
   constexpr float kInnerR = 3.2f;
-  constexpr float kStepRad = 0.6283185307f;   // 2*PI/10 = 36 degrees
+  constexpr float kStepRad = 0.6283185307f;    // 2*PI/10 = 36 degrees
   constexpr float kStartRad = -1.5707963268f;  // -90 degrees: first point straight up
 
   int xs[kPoints];
