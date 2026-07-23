@@ -14,7 +14,7 @@ Home/reader entry path in normal operation.
 
 ## Status
 
-v3, implemented and verified on real X3 hardware. This is a **BLE
+v4, implemented and verified on real X3 hardware. This is a **BLE
 peripheral/GATT-server role**, not something upstream CrossPoint or this
 fork's `feat-bluetooth` branch already has — that branch's BLE code is a HID
 *host* (X3 pairs to page-turner remotes as central), the opposite role from
@@ -49,7 +49,9 @@ Each packet written to the content characteristic has the shape:
 
 ```
 byte 0:      opcode          (0x01 = START, 0x02 = CHUNK, 0x03 = END)
-byte 1:      field           (0x01 = title, 0x02 = body, 0x03 = content-id)  — START packets only
+byte 1:      field | flag    (low 7 bits: 0x01 = title, 0x02 = body, 0x03 = content-id;
+                               top bit 0x80 = "final field of this atomic push", see below)
+                                                              — START packets only
 bytes 2..3:  total length    (uint16, little-endian)         — START packets only
 bytes 1..N:  payload bytes                                    — CHUNK packets only
 (no payload)                                                    — END packets
@@ -64,13 +66,34 @@ before starting the next. The device does not assume an order beyond "each
 field is internally ordered."
 
 The device buffers a field's bytes as CHUNKs arrive and considers it
-complete on END, at which point it becomes visible (a partial START without
-a matching END is a no-op and is discarded if a new START for the same field
-arrives). If title/body exceeds the capability characteristic's advertised
-max content length, the device truncates and shows what fits; content-id has
-its own, much smaller cap (see below) and is truncated the same way. A fresh
-body push also resets the device's read-later indicator (see Status
-characteristic below) back to "not saved" — it's per-article state.
+complete on END. If title/body exceeds the capability characteristic's
+advertised max content length, the device truncates and shows what fits;
+content-id has its own, much smaller cap (see below) and is truncated the
+same way. A fresh body push also resets the device's read-later indicator
+(see Status characteristic below) back to "not saved" — it's per-article
+state.
+
+### Atomic multi-field pushes (`0x80` final-field flag, v4)
+
+By default, each field becomes visible independently the instant its own END
+arrives — if a client pushes title then body as two separate field pushes,
+the title can render (and be seen on screen) before the body finishes
+transmitting, since body is typically much larger and takes measurably
+longer over BLE. To push multiple fields so they always appear together, set
+the top bit (`0x80`) of the **last** field's START byte in the batch. The
+device keeps reassembling/buffering every field as usual, but only commits
+(applies the buffered fields and redraws) when it processes an END whose
+START carried this bit — so e.g. title, then body, then a content-id push
+with `field = 0x03 | 0x80` renders title+body together instead of the
+headline updating first. A client that doesn't need atomicity across fields
+can simply never set this bit, which reproduces the pre-v4 per-field
+behavior exactly.
+
+This only brackets atomicity within a single push over the Content
+characteristic — it does not coordinate with the Status characteristic or
+across reconnects. If the client disconnects mid-batch before sending the
+final-flagged field, the device applies whatever was buffered so far after a
+short timeout, rather than getting stuck showing stale content indefinitely.
 
 On the client side this is a small, fully synchronous send loop — there's no
 ack per chunk. If reliable delivery matters, use "Write" (not "Write Without
@@ -157,11 +180,18 @@ A single read-only value clients can query instead of hardcoding assumptions
 about the device:
 
 ```
-byte 0:      protocol version (currently 3)
+byte 0:      protocol version (currently 4)
 byte 1:      screen width in characters, at the font Companion Mode uses
 byte 2:      screen height in characters (lines per page)
 bytes 3..4:  max content length per field, in bytes (uint16, little-endian) — title/body only, not content-id
 ```
+
+v4 changes from v3: added the `0x80` final-field flag on the Content
+characteristic's START field byte for atomic multi-field pushes (see above).
+The byte layout above is unchanged — only the version number, and the
+Content characteristic's field byte gaining a high-bit flag, changed. A v3
+client that never sets the bit is unaffected (identical wire behavior to
+before).
 
 v3 changes from v2: added the content-id content field (0x03) and the
 content-id bytes appended to every button-event notification (see above). The
@@ -209,4 +239,6 @@ currently-displayed article's save state, not a running total.
   confirm the icon flips, disconnect/reconnect while content is loaded and
   confirm the client's re-push lands (not stuck on "Waiting for phone"),
   leave the waiting screen idle past the idle-sleep timeout and confirm the
-  device sleeps.
+  device sleeps, push a new article (title+body+final-flagged content-id) and
+  confirm headline and body change on screen together in one redraw rather
+  than the headline updating first.

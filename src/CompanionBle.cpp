@@ -78,12 +78,14 @@ uint8_t g_lastContentIdLen = 0;
 uint8_t g_activeField = 0;
 uint16_t g_activeTotalLen = 0;
 uint16_t g_activeWritten = 0;
+bool g_activeFinal = false;  // this field's START carried kFinalFieldFlag
 std::unique_ptr<uint8_t[]> g_activeBuf;
 
 void resetReassembly() {
   g_activeField = 0;
   g_activeTotalLen = 0;
   g_activeWritten = 0;
+  g_activeFinal = false;
   g_activeBuf.reset();
 }
 
@@ -97,7 +99,7 @@ void computeCapabilityValue(const GfxRenderer& renderer, int fontId) {
   const int screenWidthChars = advanceWidth > 0 ? renderer.getScreenWidth() / advanceWidth : 0;
   const int screenHeightChars = lineHeight > 0 ? renderer.getScreenHeight() / lineHeight : 0;
 
-  g_capabilityValue[0] = 3;  // protocol version — v3 adds kFieldContentId + id-echo on button-event notify
+  g_capabilityValue[0] = 4;  // protocol version — v4 adds kFinalFieldFlag (atomic multi-field pushes)
   g_capabilityValue[1] = static_cast<uint8_t>(screenWidthChars > 255 ? 255 : screenWidthChars);
   g_capabilityValue[2] = static_cast<uint8_t>(screenHeightChars > 255 ? 255 : screenHeightChars);
   g_capabilityValue[3] = static_cast<uint8_t>(kMaxFieldLen & 0xFF);
@@ -118,7 +120,9 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           LOG_ERR("CBLE", "START packet too short (%u bytes)", static_cast<unsigned>(len));
           return;
         }
-        const uint8_t field = data[1];
+        const uint8_t fieldByte = data[1];
+        const bool final = (fieldByte & kFinalFieldFlag) != 0;
+        const uint8_t field = fieldByte & kFieldMask;
         if (field != kFieldTitle && field != kFieldBody && field != kFieldContentId) {
           LOG_ERR("CBLE", "START packet unknown field 0x%02x", field);
           return;
@@ -140,6 +144,7 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
         g_activeField = field;
         g_activeTotalLen = bufLen;
         g_activeWritten = 0;
+        g_activeFinal = final;
         break;
       }
       case kOpChunk: {
@@ -158,12 +163,15 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
       case kOpEnd: {
         if (g_activeField == 0 || !g_activeBuf) return;  // no START in progress: ignore stray end
         if (g_activeField == kFieldContentId) {
-          // Not routed through g_contentCb — the id is opaque and only needed
-          // internally, to echo back from notifyButtonEvent().
+          // The id itself is opaque and only needed internally, to echo back
+          // from notifyButtonEvent() — but the completed-field callback still
+          // fires below (with field == kFieldContentId, no title/body data)
+          // so a final-flagged content-id push can commit a pending batch.
           memcpy(g_lastContentId, g_activeBuf.get(), g_activeWritten);
           g_lastContentIdLen = static_cast<uint8_t>(g_activeWritten);
-        } else if (g_contentCb) {
-          g_contentCb(g_activeField, g_activeBuf.get(), g_activeWritten);
+        }
+        if (g_contentCb) {
+          g_contentCb(g_activeField, g_activeBuf.get(), g_activeWritten, g_activeFinal);
         }
         resetReassembly();
         break;

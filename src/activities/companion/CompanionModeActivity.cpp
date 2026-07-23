@@ -71,10 +71,24 @@ volatile bool g_pendingBodyReady = false;
 uint8_t g_pendingStatusValue = 0;
 volatile bool g_pendingStatusReady = false;
 
+// Set once a field's END arrives with kFinalFieldFlag set (see CompanionBle.h). loop() only
+// applies gotTitle/gotBody to on-screen state once this is true, so a multi-field push (title,
+// then body, then a final-flagged content-id) always lands on screen together instead of the
+// title updating first while body is still mid-transfer.
+volatile bool g_pendingCommitReady = false;
+
+// millis() timestamp of the first pending (title or body) field of the current batch — 0 when
+// idle. Safety net for kPendingBatchTimeoutMs below: if the final-flagged field's END never
+// arrives (app crash / disconnect mid-push), pending fields are applied anyway rather than
+// leaving the screen stuck on stale content indefinitely.
+uint32_t g_pendingBatchStartMs = 0;
+constexpr uint32_t kPendingBatchTimeoutMs = 3000;
+
 // Runs on the NimBLE host task — copy into the fixed buffer and set a flag;
 // CompanionModeActivity::loop() (main loop task) does the rest.
-void onContentField(uint8_t field, const uint8_t* data, size_t len) {
+void onContentField(uint8_t field, const uint8_t* data, size_t len, bool final) {
   portENTER_CRITICAL(&g_mux);
+  const bool wasIdle = !g_pendingTitleReady && !g_pendingBodyReady;
   if (field == companionble::kFieldTitle) {
     const size_t n = len > sizeof(g_pendingTitleBuf) ? sizeof(g_pendingTitleBuf) : len;
     memcpy(g_pendingTitleBuf, data, n);
@@ -86,6 +100,10 @@ void onContentField(uint8_t field, const uint8_t* data, size_t len) {
     g_pendingBodyLen = static_cast<uint16_t>(n);
     g_pendingBodyReady = true;
   }
+  if (wasIdle && (field == companionble::kFieldTitle || field == companionble::kFieldBody)) {
+    g_pendingBatchStartMs = millis();
+  }
+  if (final) g_pendingCommitReady = true;
   portEXIT_CRITICAL(&g_mux);
 }
 
@@ -134,6 +152,8 @@ void CompanionModeActivity::onExit() {
   g_pendingTitleReady = false;
   g_pendingBodyReady = false;
   g_pendingStatusReady = false;
+  g_pendingCommitReady = false;
+  g_pendingBatchStartMs = 0;
   portEXIT_CRITICAL(&g_mux);
 }
 
@@ -318,6 +338,15 @@ void CompanionModeActivity::loop() {
       haveContent = false;
       pages.clear();
       waitingSinceMs = millis();  // re-arm the idle-sleep timer for the waiting screen
+      // Discard any in-flight, not-yet-committed batch — a disconnect mid-push means the
+      // final-flagged field's END may never arrive, and the buffered bytes belong to a
+      // session that's now gone (mirrors CompanionBle.cpp's resetReassembly() on disconnect).
+      portENTER_CRITICAL(&g_mux);
+      g_pendingTitleReady = false;
+      g_pendingBodyReady = false;
+      g_pendingCommitReady = false;
+      g_pendingBatchStartMs = 0;
+      portEXIT_CRITICAL(&g_mux);
     } else {
       waitingSinceMs = 0;
     }
@@ -328,6 +357,7 @@ void CompanionModeActivity::loop() {
 
   bool gotTitle = false;
   bool gotBody = false;
+  bool commit = false;
   bool gotStatus = false;
   std::string newTitle;
   std::string newBody;
@@ -335,13 +365,28 @@ void CompanionModeActivity::loop() {
   portENTER_CRITICAL(&g_mux);
   if (g_pendingTitleReady) {
     newTitle.assign(reinterpret_cast<char*>(g_pendingTitleBuf), g_pendingTitleLen);
-    g_pendingTitleReady = false;
     gotTitle = true;
   }
   if (g_pendingBodyReady) {
     newBody.assign(reinterpret_cast<char*>(g_pendingBodyBuf), g_pendingBodyLen);
-    g_pendingBodyReady = false;
     gotBody = true;
+  }
+  if (g_pendingCommitReady) {
+    commit = true;
+  } else if ((gotTitle || gotBody) && g_pendingBatchStartMs != 0 &&
+             millis() - g_pendingBatchStartMs > kPendingBatchTimeoutMs) {
+    // Safety net: the final-flagged field's END never arrived in time (e.g. the app
+    // crashed or lost the connection mid-push). Apply whatever we have rather than
+    // leaving the screen stuck on stale content indefinitely.
+    LOG_ERR("CMA", "content batch commit flag missed after %lu ms, applying pending fields anyway",
+            static_cast<unsigned long>(kPendingBatchTimeoutMs));
+    commit = true;
+  }
+  if (commit) {
+    g_pendingTitleReady = false;
+    g_pendingBodyReady = false;
+    g_pendingCommitReady = false;
+    g_pendingBatchStartMs = 0;
   }
   if (g_pendingStatusReady) {
     newStatus = g_pendingStatusValue;
@@ -350,12 +395,15 @@ void CompanionModeActivity::loop() {
   }
   portEXIT_CRITICAL(&g_mux);
 
-  if (gotTitle || gotBody) {
+  if (commit && (gotTitle || gotBody)) {
     // One lock for both halves (rather than two separate locks) so a render
     // can never land between the title and body updates of a single push and
     // see a mismatched pairing (e.g. new title still showing the old page
     // count). See the connect/disconnect branch above for why this needs a
-    // RenderLock at all.
+    // RenderLock at all. Gating on `commit` (rather than applying gotTitle/
+    // gotBody the moment each arrives) is what makes title+body land on
+    // screen together instead of the headline updating first while body is
+    // still mid-transfer — see CompanionBle.h's kFinalFieldFlag doc comment.
     RenderLock lock;
     if (gotTitle) {
       title = newTitle;

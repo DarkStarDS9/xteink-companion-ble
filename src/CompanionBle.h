@@ -83,11 +83,22 @@ enum class StatusEvent : uint8_t {
 inline constexpr uint8_t kFieldTitle = 0x01;
 inline constexpr uint8_t kFieldBody = 0x02;
 
+// Wire protocol v4: the top bit of a START packet's field byte marks "this is the last field of
+// an atomic content push". The device buffers each field's END as before, but only commits
+// (applies + redraws) everything gathered so far once it processes an END whose START carried
+// this bit — see the "Atomic multi-field pushes" section of docs/companion-display-protocol.md.
+// Kept out of the low 7 bits used for field identity so `data[1] & kFieldMask` recovers the
+// field id regardless of the flag.
+inline constexpr uint8_t kFinalFieldFlag = 0x80;
+inline constexpr uint8_t kFieldMask = 0x7F;
+
 // Opaque client-defined correlation token (see kMaxContentIdLen's comment).
-// Pushed via the same START/CHUNK/END framing as title/body, but NOT routed
-// through ContentFieldCallback — the device only remembers the latest value
-// internally (to echo back from notifyButtonEvent()), it never surfaces this
-// field to CompanionModeActivity since nothing on-screen depends on it.
+// Pushed via the same START/CHUNK/END framing as title/body, and fires
+// ContentFieldCallback like title/body do — but CompanionModeActivity ignores
+// this field id for on-screen state (nothing displayed depends on it) and
+// only reacts to its `final` flag, to commit a pending title/body batch. The
+// bytes themselves are handled entirely inside CompanionBle.cpp (remembered
+// internally to echo back from notifyButtonEvent()).
 inline constexpr uint8_t kFieldContentId = 0x03;
 
 // Start advertising the Companion Display Protocol GATT service (idempotent).
@@ -124,16 +135,19 @@ bool isConnected();
 // whatever kFieldContentId push landed most recently (empty if none yet).
 bool notifyButtonEvent(ButtonEvent event);
 
-// Callback for a completed content field (title or body), fully reassembled
+// Callback for a completed content field (title, body, or content-id), fully reassembled
 // from START/CHUNK/END frames. Registered via setContentFieldCallback() and
 // invoked from the NimBLE host task's write callback — this direction DOES cross a
 // task boundary (NimBLE host task -> main loop task), so implementations must
 // only do cheap, thread-safe work here (e.g. copy into a lock-guarded buffer
 // and set a flag CompanionModeActivity::loop() polls), per the ISR/task
 // shared-state rules in root CLAUDE.md. `field` is 0x01 for title, 0x02 for
-// body, matching the protocol doc. `data`/`len` are only valid for the
-// duration of the call.
-using ContentFieldCallback = void (*)(uint8_t field, const uint8_t* data, size_t len);
+// body, 0x03 for content-id (kFinalFieldFlag already stripped), matching the
+// protocol doc. `data`/`len` are only valid for the duration of the call.
+// `final` mirrors kFinalFieldFlag from this field's START packet — callers
+// that defer applying updates until a batch is complete (see
+// CompanionModeActivity::onContentField()) use this to know when to commit.
+using ContentFieldCallback = void (*)(uint8_t field, const uint8_t* data, size_t len, bool final);
 void setContentFieldCallback(ContentFieldCallback cb);
 
 // Callback for a Status characteristic write (phone -> device), e.g. a
