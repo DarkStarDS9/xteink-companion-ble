@@ -38,10 +38,14 @@ constexpr const char* kPlayPauseHint = "> ||";
 constexpr const char* kReadLaterHint = "*";
 constexpr const char* kPageBackHint = "<";
 constexpr const char* kPageForwardHint = ">";
-// Side hints use double chevrons so they read as distinct from the single-
-// chevron LEFT/RIGHT local-paging hints above.
-constexpr const char* kPrevArticleHint = "<<";
-constexpr const char* kNextArticleHint = ">>";
+
+// Width reserved at the title line's right edge for the read-later star icon
+// — shared by the title-wrap width budget and the icon's own x position.
+constexpr int kReadLaterIconAreaWidth = 24;
+
+// Title wraps onto at most this many lines before falling back to
+// ellipsis-truncating the last line (see wrapTitleToLines()).
+constexpr int kMaxTitleLines = 2;
 
 // UTF-8-safe: drop one full codepoint (a lead byte plus any continuation
 // bytes), matching the boundary-walk CompanionModeActivity::paginate() uses.
@@ -139,9 +143,11 @@ void CompanionModeActivity::computeViewport() {
   cachedOrientedMarginBottom += UITheme::getInstance().getStatusBarHeight();
 
   if (!mappedInput.hasTouch()) {
-    // Reserve room for the bottom button-hint bar and the two side hint
-    // strips drawn in renderPage() (GUI.drawButtonHints()/drawSideButtonHints()
-    // early-return on touch devices, so no reservation is needed there).
+    // Reserve room for the bottom button-hint bar. The side margins below
+    // (sideButtonHintsWidth) are kept reserved for layout/hardware-parity
+    // reasons even though renderPage() no longer draws side hint text there
+    // (see the removed GUI.drawSideButtonHints() call) — not reclaimed for
+    // the title-wrap width budget by design.
     const auto& metrics = UITheme::getInstance().getMetrics();
     cachedOrientedMarginBottom += metrics.buttonHintsHeight;
     cachedOrientedMarginLeft += metrics.sideButtonHintsWidth;
@@ -149,10 +155,23 @@ void CompanionModeActivity::computeViewport() {
   }
 
   viewportWidth = renderer.getScreenWidth() - cachedOrientedMarginLeft - cachedOrientedMarginRight;
-
   cachedTitleFontId = kCompanionTitleFontId;
-  constexpr int kTitleBottomSpacing = 6;  // gap between the bold title line and the first body line
-  cachedTitleBlockHeight = renderer.getLineHeight(cachedTitleFontId) + kTitleBottomSpacing;
+
+  updateTitleLayout();
+}
+
+// Re-wraps `title` into `titleLines` (see kMaxTitleLines) and, since the
+// title block's height varies with the wrapped line count, recomputes
+// linesPerPage for the body underneath it. Called from computeViewport()
+// (title == "" on first call, i.e. one line reserved) and again whenever a
+// new title arrives in loop() — the body must be re-paginated afterward if
+// it's already loaded, since linesPerPage may have changed.
+void CompanionModeActivity::updateTitleLayout() {
+  titleLines = wrapTitleToLines(title);
+
+  constexpr int kTitleBottomSpacing = 6;  // gap between the title block and the first body line
+  const int titleLineHeight = renderer.getLineHeight(cachedTitleFontId);
+  cachedTitleBlockHeight = static_cast<int>(titleLines.size()) * titleLineHeight + kTitleBottomSpacing;
 
   const int viewportHeight =
       renderer.getScreenHeight() - cachedOrientedMarginTop - cachedOrientedMarginBottom - cachedTitleBlockHeight;
@@ -160,6 +179,60 @@ void CompanionModeActivity::computeViewport() {
 
   linesPerPage = lineHeight > 0 ? viewportHeight / lineHeight : 1;
   if (linesPerPage < 1) linesPerPage = 1;
+}
+
+// Wraps `text` onto at most kMaxTitleLines lines, breaking at the last space
+// that fits (falling back to a UTF-8-safe hard break), mirroring paginate()'s
+// body-wrap loop but measured with the bold title font. If text still
+// doesn't fit after kMaxTitleLines lines, the last line is ellipsis-truncated
+// (the same popUtf8Char-based approach the single-line elide used before).
+std::vector<std::string> CompanionModeActivity::wrapTitleToLines(const std::string& text) const {
+  const int maxWidth = viewportWidth - kReadLaterIconAreaWidth;
+  std::vector<std::string> lines;
+  std::string remaining = text;
+
+  while (!remaining.empty()) {
+    if (maxWidth <= 0 ||
+        renderer.getTextWidth(cachedTitleFontId, remaining.c_str(), EpdFontFamily::BOLD) <= maxWidth) {
+      lines.push_back(remaining);
+      remaining.clear();
+      break;
+    }
+
+    const bool lastAllowedLine = static_cast<int>(lines.size()) + 1 >= kMaxTitleLines;
+    if (lastAllowedLine) {
+      std::string truncated = remaining;
+      const std::string ellipsis = "\xE2\x80\xA6";  // U+2026 HORIZONTAL ELLIPSIS
+      while (!truncated.empty() && renderer.getTextWidth(cachedTitleFontId, (truncated + ellipsis).c_str(),
+                                                          EpdFontFamily::BOLD) > maxWidth) {
+        popUtf8Char(truncated);
+      }
+      lines.push_back(truncated + ellipsis);
+      remaining.clear();
+      break;
+    }
+
+    size_t breakPos = remaining.length();
+    while (breakPos > 0 && renderer.getTextWidth(cachedTitleFontId, remaining.substr(0, breakPos).c_str(),
+                                                  EpdFontFamily::BOLD) > maxWidth) {
+      size_t spacePos = remaining.rfind(' ', breakPos - 1);
+      if (spacePos != std::string::npos && spacePos > 0) {
+        breakPos = spacePos;
+      } else {
+        breakPos--;
+        while (breakPos > 0 && (remaining[breakPos] & 0xC0) == 0x80) breakPos--;  // UTF-8 boundary
+      }
+    }
+    if (breakPos == 0) breakPos = 1;
+
+    lines.push_back(remaining.substr(0, breakPos));
+    size_t skipChars = breakPos;
+    if (breakPos < remaining.length() && remaining[breakPos] == ' ') skipChars++;
+    remaining = remaining.substr(skipChars);
+  }
+
+  if (lines.empty()) lines.emplace_back();
+  return lines;
 }
 
 void CompanionModeActivity::paginate() {
@@ -269,7 +342,15 @@ void CompanionModeActivity::loop() {
   }
   portEXIT_CRITICAL(&g_mux);
 
-  if (gotTitle) title = newTitle;
+  if (gotTitle) {
+    title = newTitle;
+    updateTitleLayout();
+    // If the body's already loaded and isn't about to be re-paginated below
+    // by gotBody, re-paginate now — linesPerPage may have changed with the
+    // title's wrapped line count.
+    if (haveContent && !gotBody) paginate();
+    requestUpdate();
+  }
   if (gotBody) {
     body = newBody;
     paginate();
@@ -370,25 +451,17 @@ void CompanionModeActivity::renderPage() {
   if (currentPage < 0) currentPage = 0;
   if (currentPage >= totalPages) currentPage = totalPages > 0 ? totalPages - 1 : 0;
 
-  // Title: bold, larger than the body, single line. Right-elided if it
-  // overflows, leaving room for the read-later icon at the line's right edge.
-  constexpr int kReadLaterIconAreaWidth = 24;
-  const int titleMaxWidth = viewportWidth - kReadLaterIconAreaWidth;
-  std::string displayTitle = title;
-  if (titleMaxWidth > 0 &&
-      renderer.getTextWidth(cachedTitleFontId, displayTitle.c_str(), EpdFontFamily::BOLD) > titleMaxWidth) {
-    const std::string ellipsis = "\xE2\x80\xA6";  // U+2026 HORIZONTAL ELLIPSIS
-    while (!displayTitle.empty() &&
-           renderer.getTextWidth(cachedTitleFontId, (displayTitle + ellipsis).c_str(), EpdFontFamily::BOLD) >
-               titleMaxWidth) {
-      popUtf8Char(displayTitle);
-    }
-    displayTitle += ellipsis;
-  }
-  renderer.drawText(cachedTitleFontId, cachedOrientedMarginLeft, cachedOrientedMarginTop, displayTitle.c_str(), true,
-                    EpdFontFamily::BOLD);
-
+  // Title: bold, larger than the body, wraps onto up to kMaxTitleLines lines
+  // (see wrapTitleToLines(), computed in updateTitleLayout() whenever the
+  // title changes), leaving room for the read-later icon at the first
+  // line's right edge.
   const int titleLineHeight = renderer.getLineHeight(cachedTitleFontId);
+  int titleY = cachedOrientedMarginTop;
+  for (const auto& line : titleLines) {
+    renderer.drawText(cachedTitleFontId, cachedOrientedMarginLeft, titleY, line.c_str(), true, EpdFontFamily::BOLD);
+    titleY += titleLineHeight;
+  }
+
   renderReadLaterIcon(cachedOrientedMarginLeft + viewportWidth - kReadLaterIconAreaWidth / 2,
                       cachedOrientedMarginTop + titleLineHeight / 2);
 
@@ -407,12 +480,15 @@ void CompanionModeActivity::renderPage() {
                     std::max(totalPages, 1), title);
 
   if (!mappedInput.hasTouch()) {
-    const auto labels = mappedInput.mapLabels(kPlayPauseHint, kReadLaterHint, kPageBackHint, kPageForwardHint);
+    // PageBack/PageForward hints only appear when that direction is actually
+    // pageable right now (empty string = hidden, the convention drawButtonHints()
+    // itself checks — see e.g. FileBrowserActivity's confirmLabel/dirUp/dirDown).
+    // No side (UP/DOWN) hints are drawn — those buttons still work and still
+    // notify PREV/NEXT over BLE (see loop()), just without an on-screen hint.
+    const char* pageBack = currentPage > 0 ? kPageBackHint : "";
+    const char* pageForward = currentPage < totalPages - 1 ? kPageForwardHint : "";
+    const auto labels = mappedInput.mapLabels(kPlayPauseHint, kReadLaterHint, pageBack, pageForward);
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
-
-    const char* upLabel = kSideUpMeansPrev ? kPrevArticleHint : kNextArticleHint;
-    const char* downLabel = kSideUpMeansPrev ? kNextArticleHint : kPrevArticleHint;
-    GUI.drawSideButtonHints(renderer, upLabel, downLabel);
   }
 
   if (forceFastRefreshNextRender) {

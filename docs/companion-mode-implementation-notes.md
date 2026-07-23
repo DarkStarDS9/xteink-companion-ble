@@ -1,24 +1,30 @@
 # Companion Mode — implementation status
 
-Implemented and verified on real X3 hardware (2026-07-22). See
-`docs/companion-display-protocol.md` for the wire protocol (now v2) and
+Implemented and verified on real X3 hardware (2026-07-22, v1/v2). v3 (this
+session) build-verified only — see "Remaining before merging to master". See
+`docs/companion-display-protocol.md` for the wire protocol (now v3) and
 `src/CompanionBle.h` for the interface.
 
 ## What's implemented
 
 - `src/CompanionBle.cpp` — NimBLE GATT peripheral: service/characteristics,
-  content reassembly (START/CHUNK/END), capability characteristic (protocol
-  v2), button notify (PLAY_PAUSE/PREV/NEXT/READ_LATER), Status characteristic
-  (READ_LATER_SAVED), heap-floor-gated `ensureStarted()`/`stop()`. Advertised
-  name is a generic prefix + a short eFuse-MAC-derived suffix, not a fixed
-  string, so multiple devices don't collide in a phone's BLE picker.
+  content reassembly (START/CHUNK/END, now including the content-id field
+  0x03), capability characteristic (protocol v3), button notify
+  (PLAY_PAUSE/PREV/NEXT/READ_LATER, now with the last-pushed content-id bytes
+  appended to every notification), Status characteristic (READ_LATER_SAVED),
+  heap-floor-gated `ensureStarted()`/`stop()`. Advertised name is a generic
+  prefix + a short eFuse-MAC-derived suffix, not a fixed string, so multiple
+  devices don't collide in a phone's BLE picker.
 - `src/activities/companion/CompanionModeActivity.{h,cpp}` — waiting screen,
   pagination (reuses the reader's text-wrap measure-and-break loop), bottom
-  LEFT/RIGHT local paging, side UP/DOWN → BLE PREV/NEXT (behind the
-  `kSideUpMeansPrev` swap constant), bottom BACK → PLAY_PAUSE, bottom CONFIRM
-  → READ_LATER, bold larger title with a hand-drawn read-later star
-  (outline/filled, flipped by the Status write), button-hint bar + side
-  hints, idle-sleep timeout on the waiting screen (`kWaitingIdleSleepMs`).
+  LEFT/RIGHT local paging (page-turn hints shown only when that direction is
+  actually pageable), side UP/DOWN → BLE PREV/NEXT (behind the
+  `kSideUpMeansPrev` swap constant, no on-screen hint drawn for these two
+  buttons), bottom BACK → PLAY_PAUSE, bottom CONFIRM → READ_LATER, bold
+  larger title that wraps onto up to 2 lines (falling back to ellipsis
+  truncation only if still too long) with a hand-drawn read-later star
+  (outline/filled, flipped by the Status write), bottom button-hint bar,
+  idle-sleep timeout on the waiting screen (`kWaitingIdleSleepMs`).
 - The device now boots directly into Companion Mode (`main.cpp`) — the
   firmware is companion-only in normal operation. Recovery firmware mode
   (UP+POWER at boot) and crash-report-after-panic are the only other boot
@@ -26,11 +32,10 @@ Implemented and verified on real X3 hardware (2026-07-22). See
   `SettingsActivity`'s old Companion Mode entry point and other now-dead
   internal paths) but are not reached from a normal boot or from within
   Companion Mode's own button routing.
-- iOS side already implemented and TestFlight-deployed
-  (`src/iOS/SpokenFeedsMixer/.../Services/CompanionDeviceService.swift`) —
-  **not yet updated for the v2 button codes / Status characteristic** as of
-  this firmware change; needs a matching iOS update before end-to-end testing
-  the new mapping.
+- iOS side (`src/iOS/SpokenFeedsMixer/.../Services/CompanionDeviceService.swift`)
+  is being updated alongside this v3 firmware change (content-id push,
+  content-id comparison before acting on a button event, re-push on
+  reconnect) — see that repo's own history for the matching commit.
 
 ## Verified end-to-end (independent Mac `bleak` client, real X3 hardware, protocol v1)
 
@@ -112,3 +117,10 @@ reaches it.
 - iOS app update for the v2 button codes and Status characteristic — the
   currently-deployed iOS build still expects v1's CONFIRM/BACK codes and has
   no Status-characteristic write path.
+- v3 content-id round-trip on real hardware: push a content-id, press a
+  mapped button, confirm the phone receives it appended after the event byte;
+  push a *different* content-id and confirm a stale phone-side comparison
+  would reject the next press. Title-wrap (up to 2 lines) and the
+  side-UP/DOWN hint removal also need on-device visual confirmation — both
+  were only exercised via `pio run` build-verification, not rendered on a
+  real panel yet.

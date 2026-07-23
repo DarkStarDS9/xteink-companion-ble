@@ -47,9 +47,26 @@ inline constexpr size_t kStartMinFreeHeap = 80 * 1024;
 // content past this length is truncated per docs/companion-display-protocol.md.
 inline constexpr uint16_t kMaxFieldLen = 4096;
 
-// Wire protocol v2 (see docs/companion-display-protocol.md). Values match the
-// button-event characteristic byte exactly — do not renumber without bumping
-// the capability characteristic's protocol version.
+// Max bytes retained for the content-id field (kFieldContentId) — deliberately
+// much smaller than kMaxFieldLen. This is an opaque, client-defined
+// correlation token (device never interprets it), appended verbatim to every
+// button-event notification (see notifyButtonEvent()) so a client can detect
+// "the button was pressed for a since-replaced article" and no-op instead of
+// acting on stale state. Kept small on purpose: the button-event
+// characteristic's notify payload is bounded by (negotiated MTU - 3 bytes ATT
+// overhead) minus the 1 event byte, and other/future clients on this
+// app-agnostic protocol may negotiate a much smaller MTU than this firmware's
+// own 185 (BLE's guaranteed floor is MTU 23, i.e. 19 usable bytes worst
+// case) — see docs/companion-display-protocol.md for the full budget math.
+// A push exceeding this length is truncated, exactly like kMaxFieldLen for
+// title/body.
+inline constexpr size_t kMaxContentIdLen = 32;
+
+// Wire protocol v3 (see docs/companion-display-protocol.md). ButtonEvent
+// values match the button-event characteristic's first byte exactly — do not
+// renumber without bumping the capability characteristic's protocol version.
+// v3 adds kFieldContentId and appends the last-pushed content-id bytes after
+// this byte in the notification payload (v2 sent this byte alone).
 enum class ButtonEvent : uint8_t {
   PlayPause = 0x01,
   Prev = 0x02,
@@ -65,6 +82,13 @@ enum class StatusEvent : uint8_t {
 // Field identifiers for ContentFieldCallback, matching docs/companion-display-protocol.md.
 inline constexpr uint8_t kFieldTitle = 0x01;
 inline constexpr uint8_t kFieldBody = 0x02;
+
+// Opaque client-defined correlation token (see kMaxContentIdLen's comment).
+// Pushed via the same START/CHUNK/END framing as title/body, but NOT routed
+// through ContentFieldCallback — the device only remembers the latest value
+// internally (to echo back from notifyButtonEvent()), it never surfaces this
+// field to CompanionModeActivity since nothing on-screen depends on it.
+inline constexpr uint8_t kFieldContentId = 0x03;
 
 // Start advertising the Companion Display Protocol GATT service (idempotent).
 // Follow BleInput::ensureStarted()'s pattern: wrap NimBLE init in
@@ -94,6 +118,10 @@ bool isConnected();
 // host-task-originated button path to hand off: buttons are polled on the
 // main loop task, and NimBLE's notify() is safe to call from any task).
 // Returns false if not connected or the notify failed.
+//
+// The notification payload is `[event byte] + [last-pushed content-id
+// bytes]` (v3) — the caller does not pass the id; it's read internally from
+// whatever kFieldContentId push landed most recently (empty if none yet).
 bool notifyButtonEvent(ButtonEvent event);
 
 // Callback for a completed content field (title or body), fully reassembled

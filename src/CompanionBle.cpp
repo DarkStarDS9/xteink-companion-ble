@@ -65,6 +65,13 @@ NimBLECharacteristic* g_statusChar = nullptr;
 ContentFieldCallback g_contentCb = nullptr;
 StatusCallback g_statusCb = nullptr;
 
+// Last-received content-id blob (see kFieldContentId's doc comment) — not
+// routed through g_contentCb, just remembered here so notifyButtonEvent() can
+// echo it. Cleared on disconnect (a stray notify before the next reconnect's
+// re-push should carry an empty id, not a stale one from a previous session).
+uint8_t g_lastContentId[kMaxContentIdLen] = {0};
+uint8_t g_lastContentIdLen = 0;
+
 // Reassembly state for the field currently being received (title xor body —
 // the protocol doc guarantees "each field is internally ordered" but does not
 // interleave title/body chunks). 0 == no field in progress.
@@ -90,7 +97,7 @@ void computeCapabilityValue(const GfxRenderer& renderer, int fontId) {
   const int screenWidthChars = advanceWidth > 0 ? renderer.getScreenWidth() / advanceWidth : 0;
   const int screenHeightChars = lineHeight > 0 ? renderer.getScreenHeight() / lineHeight : 0;
 
-  g_capabilityValue[0] = 2;  // protocol version — v2 adds the Status characteristic + new button codes
+  g_capabilityValue[0] = 3;  // protocol version — v3 adds kFieldContentId + id-echo on button-event notify
   g_capabilityValue[1] = static_cast<uint8_t>(screenWidthChars > 255 ? 255 : screenWidthChars);
   g_capabilityValue[2] = static_cast<uint8_t>(screenHeightChars > 255 ? 255 : screenHeightChars);
   g_capabilityValue[3] = static_cast<uint8_t>(kMaxFieldLen & 0xFF);
@@ -112,13 +119,14 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           return;
         }
         const uint8_t field = data[1];
-        if (field != kFieldTitle && field != kFieldBody) {
+        if (field != kFieldTitle && field != kFieldBody && field != kFieldContentId) {
           LOG_ERR("CBLE", "START packet unknown field 0x%02x", field);
           return;
         }
         uint16_t totalLen;
         memcpy(&totalLen, data + 2, sizeof(totalLen));  // data may be unaligned
-        const uint16_t bufLen = totalLen > kMaxFieldLen ? kMaxFieldLen : totalLen;
+        const uint16_t fieldCap = field == kFieldContentId ? static_cast<uint16_t>(kMaxContentIdLen) : kMaxFieldLen;
+        const uint16_t bufLen = totalLen > fieldCap ? fieldCap : totalLen;
 
         // A new START discards any partial field of the same type (per the
         // protocol doc: "a partial START without a matching END ... is
@@ -149,7 +157,12 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
       }
       case kOpEnd: {
         if (g_activeField == 0 || !g_activeBuf) return;  // no START in progress: ignore stray end
-        if (g_contentCb) {
+        if (g_activeField == kFieldContentId) {
+          // Not routed through g_contentCb — the id is opaque and only needed
+          // internally, to echo back from notifyButtonEvent().
+          memcpy(g_lastContentId, g_activeBuf.get(), g_activeWritten);
+          g_lastContentIdLen = static_cast<uint8_t>(g_activeWritten);
+        } else if (g_contentCb) {
           g_contentCb(g_activeField, g_activeBuf.get(), g_activeWritten);
         }
         resetReassembly();
@@ -177,6 +190,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
   void onDisconnect(NimBLEServer* server, NimBLEConnInfo& /*connInfo*/, int /*reason*/) override {
     LOG_DBG("CBLE", "central disconnected");
     resetReassembly();
+    g_lastContentIdLen = 0;  // see g_lastContentId's doc comment
     // Only one central at a time (see docs/companion-display-protocol.md) — resume
     // advertising so a reconnect (or a fresh phone) can pair without a full restart.
     if (g_begun && server) server->startAdvertising();
@@ -341,8 +355,12 @@ bool isConnected() { return g_begun && g_server && g_server->getConnectedCount()
 
 bool notifyButtonEvent(ButtonEvent event) {
   if (!isConnected() || !g_buttonChar) return false;
-  const uint8_t value = static_cast<uint8_t>(event);
-  g_buttonChar->setValue(&value, 1);
+  uint8_t payload[1 + kMaxContentIdLen];
+  payload[0] = static_cast<uint8_t>(event);
+  if (g_lastContentIdLen > 0) {
+    memcpy(payload + 1, g_lastContentId, g_lastContentIdLen);
+  }
+  g_buttonChar->setValue(payload, 1 + g_lastContentIdLen);
   return g_buttonChar->notify();
 }
 

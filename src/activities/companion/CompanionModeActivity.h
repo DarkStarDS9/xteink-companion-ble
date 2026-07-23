@@ -25,6 +25,7 @@ class CompanionModeActivity final : public Activity {
 
   std::string title;
   std::string body;
+  std::vector<std::string> titleLines;  // title wrapped to at most kMaxTitleLines lines (see wrapTitleToLines())
 
   int currentPage = 0;
   int totalPages = 0;
@@ -50,6 +51,8 @@ class CompanionModeActivity final : public Activity {
   static constexpr unsigned long kWaitingIdleSleepMs = 5UL * 60UL * 1000UL;  // 5 minutes
 
   void computeViewport();
+  void updateTitleLayout();
+  std::vector<std::string> wrapTitleToLines(const std::string& text) const;
   void paginate();
   void renderWaiting();
   void renderStartFailed();
