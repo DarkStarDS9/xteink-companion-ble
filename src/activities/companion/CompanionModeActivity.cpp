@@ -5,6 +5,7 @@
 #include <HalPowerManager.h>
 #include <I18n.h>
 #include <Logging.h>
+#include <driver/usb_serial_jtag.h>
 
 #include <algorithm>
 #include <cmath>
@@ -327,9 +328,11 @@ void CompanionModeActivity::checkWaitingIdleSleep() {
   // See main.cpp's general auto-sleep check for why USB power skips this too —
   // deep-sleeping drops the USB CDC connection, which is actively unhelpful
   // while plugged in (charging, or connected for serial debugging).
-  // isUsbConnected() alone misses a debug/data cable with no net charge
-  // current (see main.cpp's fuller comment) — `Serial` catches that case.
-  if (gpio.isUsbConnected() || Serial) return;
+  // isUsbConnected() alone misses a debug/data cable with no net charge current
+  // (see main.cpp's fuller comment, incl. why the charge IC's STAT pin can't
+  // help either) — usb_serial_jtag_is_connected() catches that case without
+  // needing a terminal app to have the port open.
+  if (gpio.isUsbConnected() || usb_serial_jtag_is_connected()) return;
 
   LOG_INF("CMA", "No phone connected for %lu ms on the waiting screen, deep-sleeping", kWaitingIdleSleepMs);
   powerManager.startDeepSleep(gpio);  // [[noreturn]] — wakes on power button, panel keeps its last image
