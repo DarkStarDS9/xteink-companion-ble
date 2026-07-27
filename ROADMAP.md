@@ -77,6 +77,16 @@ framebuffer on a no-PSRAM ESP32-C3.
 **Open:** on-device UI/mode design, "developing" indicator UX, photo orientation/crop,
 corrupt-transfer cleanup, exact size cap (needs real encoder output to tune).
 
+**Prerequisite — review prior art before designing the on-device UI.** Two CrossPoint forks already
+solved multi-mode selection on this hardware:
+
+* [`0x1abin/crossmux`](https://github.com/0x1abin/crossmux) — apps hub with mini-games, tools, standby faces
+* [`zakerytclarke/crosspoint-reader-apps`](https://github.com/zakerytclarke/crosspoint-reader-apps) — app support framework
+
+Read how they handle mode entry, exit, and per-mode state before designing ours. Not a base to
+adopt (see [SCOPE.md §6](SCOPE.md)) — just the wheel that already exists. The same prior art applies
+to item 2's boot-path re-wiring.
+
 **Non-firmware, decided:** the camera app will be **source-available** (not "open source" — the
 mislabeling is what drew the HashiCorp/Elastic/Redis backlash), under an existing named license
 (PolyForm Noncommercial/Shield, or Sentry's FSL) plus a CLA granting exclusive distribution
@@ -135,3 +145,16 @@ path to optionally enter the dormant reader/library activity.
 upstream, and it conflicts on nearly every upstream sync. If this item is picked up, that
 divergence shrinks — the fork would move back *toward* upstream's routing structure rather than
 further from it. Worth factoring into the sync cost.
+
+---
+
+## Watch
+
+**`upstream/feat-bluetooth` — a second BLE consumer.** That branch adds `src/BleInput.cpp` and
+`BleButtonMapActivity`: the device acting as BLE **central**, receiving from a page-turner remote.
+Opposite direction from our peripheral role, same stack. It carries a commit titled *"Stop BLE
+before initializing WiFi in activities"*, which is the coexistence problem in miniature.
+
+If it merges to `develop`, we inherit central + peripheral + WiFi contending on a single-core C3
+where NimBLE already costs ~63 KB. Check its state before any large protocol work, rather than
+discovering the collision during a sync.
