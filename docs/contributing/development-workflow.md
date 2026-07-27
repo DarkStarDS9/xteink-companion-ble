@@ -31,7 +31,7 @@ If `clang-format` is missing or too old locally, see [Getting Started](./getting
 ## 4) Open the PR
 
 - Use a semantic title (example: `fix: avoid crash when opening malformed epub`)
-- Fill out `.github/PULL_REQUEST_TEMPLATE.md`
+- Fill out [upstream's PR template](https://github.com/crosspoint-reader/crosspoint-reader/blob/develop/.github/PULL_REQUEST_TEMPLATE.md)
 - Describe the problem, approach, and any tradeoffs
 - Include reproduction and verification steps for bug fixes
 

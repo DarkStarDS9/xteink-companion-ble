@@ -147,7 +147,7 @@ Endpoint details are documented in [webserver-endpoints.md](./webserver-endpoint
 
 ## Related Documentation
 
-- [User Guide](../USER_GUIDE.md)
+- [User Guide](https://github.com/crosspoint-reader/crosspoint-reader/blob/develop/USER_GUIDE.md) (upstream; describes reader features not reachable in this fork)
 - [Webserver Endpoints](./webserver-endpoints.md)
 - [SD Card Fonts](./sd-card-fonts.md)
 - [Troubleshooting](./troubleshooting.md)

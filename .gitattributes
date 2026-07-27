@@ -1,0 +1,18 @@
+# Fork-owned documents. These are wholly rewritten for this fork and share no
+# content with upstream's versions, so any upstream edit would conflict on the
+# entire file. The `ours` merge driver keeps our version and drops theirs.
+#
+# REQUIRES a one-time setup per clone (git will not commit merge logic):
+#
+#     git config merge.ours.driver true
+#
+# Without it these fall back to normal conflicts — noisy, but never silently wrong.
+#
+# Only list files we have fully forked. Never add shared technical docs here:
+# the driver hides upstream's changes rather than surfacing them.
+
+README.md                              merge=ours
+ROADMAP.md                             merge=ours
+SCOPE.md                               merge=ours
+CLAUDE.md                              merge=ours
+.claude/skills/scope-discipline/SKILL.md merge=ours

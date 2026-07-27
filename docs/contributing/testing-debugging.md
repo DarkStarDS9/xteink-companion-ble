@@ -44,5 +44,5 @@ python3 scripts/debugging_monitor.py
 
 ## Common troubleshooting references
 
-- [User Guide troubleshooting section](../../USER_GUIDE.md#7-troubleshooting-issues--escaping-bootloop)
+- [User Guide troubleshooting section](https://github.com/crosspoint-reader/crosspoint-reader/blob/develop/USER_GUIDE.md#7-troubleshooting-issues--escaping-bootloop) (upstream)
 - [Webserver troubleshooting](../troubleshooting.md)
