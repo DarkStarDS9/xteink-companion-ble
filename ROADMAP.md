@@ -1,88 +1,137 @@
-# CrossPoint Reader Roadmap
+# Companion Firmware Roadmap
 
-This roadmap describes how CrossPoint is moving through the tighter scope defined in [SCOPE.md](SCOPE.md). It is
-intentionally phased: Phase 0 closed out the commitments already in flight before locking down to the stricter
-"fill gaps the stock firmware leaves" delineator.
+This is the roadmap for **this fork** — a general-purpose BLE companion-display firmware for
+Xteink hardware. It is not upstream CrossPoint Reader's roadmap; see
+[crosspoint-reader/crosspoint-reader](https://github.com/crosspoint-reader/crosspoint-reader) for that.
 
-Phases are sequential. We do not start the next phase until the prior one is wrapped or explicitly carried over.
+## What this fork is
 
----
+Upstream CrossPoint is a dedicated e-reader. This fork repurposes the same hardware and SDK as a
+**BLE-attached second screen driven by a phone**. The device boots straight into
+`CompanionModeActivity` ([src/main.cpp:423](src/main.cpp)) and has no Home/reader entry path in
+normal operation.
 
-## Phase 0 - Close Out Legacy Scope Items — **COMPLETE**
+The important consequence for planning: **the firmware serves more than one consumer app.** It is a
+platform, not the device half of a single product. Today that means:
 
-**Goal:** Land the work that was already in motion under the prior, broader scope so contributors are not left
-hanging, and so we enter the stricter phases with a clean slate.
+| Consumer | Repo | Status |
+|---|---|---|
+| SpokenFeeds audio companion | `DarkStarDS9/SpokenFeeds` (iOS) | Shipped, protocol v5 |
+| Polaroid camera app | not started, separate app | Design sketch |
+| Offline article reader | undecided — may fold into SpokenFeeds | Idea |
 
-**Landed in Phase 0:**
-
-* **RTL support PRs.** The in-flight right-to-left work was reviewed, iterated, and merged.
-* **Dictionary PR.** The offline dictionary lookup work was reviewed and merged.
-* **Bookmarks** feature. First-class navigation markers in EPUBs.
-* ~~**Transparent sleep screens.**~~ Shelved; not picked back up under the stricter phases.
-
-Phase 0 is closed. The tighter scope in [SCOPE.md](SCOPE.md) is now fully enforced. "But it was on the old roadmap"
-is not a valid argument for accepting a PR.
-
----
-
-## Phase 1 - Consolidation, Footprint, and Multi-Device Support — **IN PROGRESS**
-
-**Goal:** Reduce memory and flash usage, clean up the codebase, and land the SDK / HAL generalization work so
-CrossPoint runs cleanly on ESP32-based e-reader hardware beyond Xteink (X3 / X4), including ESP32-S3 class devices.
-
-**Focus areas:**
-
-* DRAM and heap fragmentation reduction across the reader core.
-* Flash footprint reduction (dead code, redundant strings, oversized tables).
-* Refactors that tighten the HAL / SDK boundary.
-* Pluggable per-device SDK layers (display, input, storage, battery) and per-device build configuration without
-  forking the reader core.
-* Documentation for adding a new ESP32 e-reader target.
-* E-ink driver refinement (ghosting, partial update behavior).
-
-**Closed during this phase:** new themes built into firmware, new external network connectors (sync engines, cloud
-storage, remote file access).
+Anything app-specific belongs in that app's repo. What lives here is the **protocol, the on-device
+UI, and the capability surface** every consumer shares. The authoritative wire reference is
+[docs/companion-display-protocol.md](docs/companion-display-protocol.md).
 
 ---
 
-## Phase 2 - Languages, Fonts, and Themes
+## Shipped — Protocol v5, text companion
 
-**Goal:** With the codebase smaller and portable, make reading great in every language: multi-language support,
-better font support with custom fonts, UI translations, and themes loaded from the SD card instead of consuming
-flash.
-
-**Focus areas:**
-
-* Multi-language reading support (underserved languages, complex script support where realistic on ESP32 hardware).
-* Better font support and custom fonts.
-* UI languages and localization.
-* Moving themes off-firmware to SD-loaded assets (see SCOPE.md Section 6).
-* **Moving hyphenation files off-firmware.** Hyphenation rules vary per language and the files are large (German
-  alone is ~200KB). Today these eat flash budget that should be available for the reader core. The plan is to build
-  a downloader analogous to the existing font downloader and store the dictionaries on SD / SPIFFS, loading on
-  demand. This unlocks better hyphenation for long-word languages (German, Finnish, Norwegian, etc.) without paying
-  the flash cost up front.
-
-This phase depends on Phase 1 cleanup landing first; otherwise we generalize a moving target.
+GATT service `7c9c0000-…0001`, four characteristics (content / button-event / capability / status).
+Phone pushes title/body/content-id; device notifies raw button identity plus hold duration. See the
+protocol doc for the full field and framing definition.
 
 ---
 
-## Out of Roadmap
+## Planned
 
-The following are explicitly *not* on the roadmap. They may live in other CrossPoint forks; they will not be picked
-up here:
+### 1. Image push — "Polaroid" camera companion
 
-* Interactive apps (games, calculators, notepads).
-* Writing / authoring tools.
-* Active connectivity features (RSS, news, browsers).
-* PDF rendering as a first-class format.
+**Consumer:** a new, separate iPhone camera app. Not SpokenFeeds. This is explicitly a fork-only
+capability — upstream's `SCOPE.md` excludes non-reading interactive apps, so it can never go
+upstream.
 
-See [SCOPE.md](SCOPE.md) for the full rationale.
+**Concept:** iPhone captures a photo, dithers it client-side, pushes it over BLE; the reader
+displays it as a low-fi print. Slow draw (BLE transfer + two-pass grayscale settle) is acceptable
+and thematically fitting — no need to optimize for speed.
+
+**Protocol delta:** new `kFieldImage = 0x04`, reusing the existing START/CHUNK/END framing and
+the content characteristic — no new characteristic. `0x04` is the next free id
+(`kFieldContentId = 0x03`, [src/CompanionBle.h:117](src/CompanionBle.h)). Needs a uint16 length
+field to clear the current `kMaxFieldLen = 4096` cap ([src/CompanionBle.h:48](src/CompanionBle.h));
+sketch proposes a 65 KB ceiling. Capability characteristic goes to v6.
+
+**Payload:** pre-dithered PNG — not raw bitmap, not JPEG.
+
+**Decided: dither on the phone, not on-device.** Avoids JPEG-compression-vs-dither artifact
+conflicts, gives full creative control over dither style (Atkinson / Floyd–Steinberg / ordered),
+and lets the firmware quantize-pass-through with `useDithering = false`
+([lib/Epub/Epub/converters/ImageToFramebufferDecoder.h:18](lib/Epub/Epub/converters/ImageToFramebufferDecoder.h))
+provided the phone pre-quantizes to exactly `{0, 85, 170, 255}`.
+
+**Reuse (verified):**
+- 4-level grayscale via two-pass overlay: `RenderMode::GRAYSCALE_LSB/MSB` and
+  `preconditionGrayscale()` ([lib/GfxRenderer/GfxRenderer.h:30,282](lib/GfxRenderer/GfxRenderer.h)),
+  on top of the native 1-bit framebuffer.
+- PNG/JPEG → framebuffer decoders built for EPUB cover art
+  ([lib/Epub/Epub/converters/](lib/Epub/Epub/converters/)), including
+  `applyBayerDither4Level()` ([DitherUtils.h:15](lib/Epub/Epub/converters/DitherUtils.h)).
+
+**Known integration snag:** `PngToFramebufferConverter::decodeToFramebuffer()` takes a
+`const std::string& imagePath` ([PngToFramebufferConverter.h:9](lib/Epub/Epub/converters/PngToFramebufferConverter.h))
+— it decodes from SD, not from RAM. Stream BLE chunks straight to a scratch SD file rather than
+buffering in RAM; a third large allocation will not fit alongside NimBLE (~63 KB) and the 48 KB
+framebuffer on a no-PSRAM ESP32-C3.
+
+**Open:** on-device UI/mode design, "developing" indicator UX, photo orientation/crop,
+corrupt-transfer cleanup, exact size cap (needs real encoder output to tune).
+
+**Non-firmware, decided:** the camera app will be **source-available** (not "open source" — the
+mislabeling is what drew the HashiCorp/Elastic/Redis backlash), under an existing named license
+(PolyForm Noncommercial/Shield, or Sentry's FSL) plus a CLA granting exclusive distribution
+rights. CodeRabbit's free tier only requires a public repo — no OSI-license check — so this does
+not block free code review. No license chosen yet.
+
+**Detailed sketch:** [docs/companion-image-protocol-sketch.md](docs/companion-image-protocol-sketch.md)
 
 ---
 
-## How This Roadmap Changes
+### 2. Offline article sync
 
-* Phase boundaries are decided by maintainers, not by individual PRs.
-* If a phase needs to be extended or an item carried over, that is documented here with a short note.
-* Proposals for new phases or reordering should go through a Discussion first.
+**Consumer:** undecided — most likely SpokenFeeds, possibly its own app.
+
+**Concept:** sync a list of articles to the device for offline text reading with no phone
+connection, then reconcile read/favourite status and usage data back on reconnect.
+
+**Status: experimental spec, not committed work.** This cuts against the product's audio-first
+premise (TTS voice cloning). Treat it as an offline fallback / differentiator, not a core path, and
+write the spec before spending engineering time.
+
+**Mostly reuse, not new build:**
+- The reader UI, library/home activities, bookmarks, and EPUB rendering are **already compiled into
+  the companion binary** — they are merely unreachable, because `main.cpp` boots directly into
+  `CompanionModeActivity` and never routes into them. `ActivityManager::goToReader()` still exists
+  ([src/activities/ActivityManager.h:89](src/activities/ActivityManager.h)).
+- Full read/write SD HAL exists: `Storage` singleton ([lib/hal/HalStorage.h](lib/hal/HalStorage.h)),
+  thread-safe, general-purpose. Companion mode currently uses it only for `/crash_report.txt`.
+- Generic JSON persistence exists:
+  [lib/Serialization/PersistableStore.h](lib/Serialization/PersistableStore.h), already backing
+  settings and app state.
+
+**The one genuinely new piece is the protocol.** v5 is single-item, ephemeral, phone→device only,
+~4096-byte cap. There is no bulk list transfer, no persisted state, and no device→phone data pull.
+
+**Proposed architecture — dumb firmware, smart phone:**
+- One JSON file per article (or one JSON log) via the existing `PersistableStore` / `HalStorage`.
+  No new storage engine.
+- Device records **raw events only**: button presses and on-screen dwell time per article. No
+  on-device interpretation — "read vs skimmed", "favourited" and similar are the phone's job.
+- Phone pushes the article list and content down; device accumulates an event log; on reconnect the
+  phone pulls and reconciles.
+- **Merge, don't overwrite.** Sync must union device events newer than a last-synced cursor into
+  phone state and write back a merged result. A naive last-writer-wins file swap silently drops
+  everything recorded while offline.
+- **Append, don't rewrite.** The event log is append-only on-device, compacted only after the phone
+  confirms a successful sync — otherwise every button press triggers a full-file rewrite
+  (SD/flash wear plus write cost).
+
+**Scope for a real spec:** (1) new BLE opcodes for bulk list transfer and device→phone pull —
+extending the existing chunking, not a new transport; (2) JSON schema for article list and
+per-article event log; (3) phone-side cursor-based merge logic; (4) re-wiring the companion boot
+path to optionally enter the dormant reader/library activity.
+
+**Note on (4):** the boot path in `main.cpp` is the one place this fork deliberately diverges from
+upstream, and it conflicts on nearly every upstream sync. If this item is picked up, that
+divergence shrinks — the fork would move back *toward* upstream's routing structure rather than
+further from it. Worth factoring into the sync cost.
