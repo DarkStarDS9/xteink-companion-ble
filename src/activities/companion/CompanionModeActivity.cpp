@@ -13,6 +13,8 @@
 #include <cstring>
 
 #include "CompanionBle.h"
+#include "CompanionPeerStore.h"
+#include "Epub/converters/ImageDecoderFactory.h"
 #include "MappedInputManager.h"
 #include "activities/reader/ReaderUtils.h"
 #include "components/UITheme.h"
@@ -25,16 +27,6 @@ namespace {
 constexpr int kCompanionFontId = NOTOSANS_14_FONT_ID;       // body
 constexpr int kCompanionTitleFontId = NOTOSANS_16_FONT_ID;  // title: larger + bold
 
-// Bottom-row hint labels. Plain ASCII (guaranteed present in the built-in
-// font's Basic Latin range) standing in for icons: the companion font's
-// glyph set (see notosans_14_regular's EpdUnicodeInterval table) has no
-// star/play/arrow glyphs (U+25xx/U+26xx), so these are drawn as short
-// symbolic text rather than as icon codepoints.
-constexpr const char* kPlayPauseHint = "> ||";
-constexpr const char* kReadLaterHint = "*";
-constexpr const char* kPageBackHint = "<";
-constexpr const char* kPageForwardHint = ">";
-
 // Width reserved at the title line's right edge for the read-later star icon
 // — shared by the title-wrap width budget and the icon's own x position.
 constexpr int kReadLaterIconAreaWidth = 24;
@@ -43,14 +35,10 @@ constexpr int kReadLaterIconAreaWidth = 24;
 // ellipsis-truncating the last line (see wrapTitleToLines()).
 constexpr int kMaxTitleLines = 2;
 
-// Battery% (left) / page count (right) are drawn inline with the button-hint
-// row instead of in a separate status bar strip above it. The hint row's
-// left/right margins are widened well beyond the button strip (see
-// computeViewport()) specifically to make room for this text without any
-// overlap. Position comes from GUI.getButtonHintsRowCenterY()/
-// getButtonHintsSideBandWidth() (renderPage()) rather than fixed offsets
-// here — BaseTheme/LyraTheme/RoundedRaffTheme lay out that row very
-// differently, and the active theme is user-selectable.
+// Sleep-screen grid geometry. 64x64 tiles with room to breathe; the cap comes
+// from companionpeer::kMaxIconTiles.
+constexpr int kIconGridColumns = 6;
+constexpr int kIconGridGap = 24;
 
 // UTF-8-safe: drop one full codepoint (a lead byte plus any continuation
 // bytes), matching the boundary-walk CompanionModeActivity::paginate() uses.
@@ -62,10 +50,10 @@ void popUtf8Char(std::string& s) {
   }
 }
 
-// Task-boundary handoff for content/status arriving on the NimBLE host task
-// (see CompanionBle.h's ContentFieldCallback/StatusCallback doc comments).
-// Fixed-size buffers, not heap allocation, so the critical section only ever
-// does a memcpy/scalar assignment.
+// Task-boundary handoff for everything arriving on the NimBLE host task (see
+// CompanionBle.h's callback doc comments). Fixed-size buffers, not heap
+// allocation, so the critical section only ever does a memcpy/scalar
+// assignment.
 portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
 uint8_t g_pendingTitleBuf[companionble::kMaxFieldLen];
 uint16_t g_pendingTitleLen = 0;
@@ -76,16 +64,26 @@ volatile bool g_pendingBodyReady = false;
 uint8_t g_pendingStatusValue = 0;
 volatile bool g_pendingStatusReady = false;
 
-// Set once a field's END arrives with kFinalFieldFlag set (see CompanionBle.h). loop() only
-// applies gotTitle/gotBody to on-screen state once this is true, so a multi-field push (title,
-// then body, then a final-flagged content-id) always lands on screen together instead of the
-// title updating first while body is still mid-transfer.
+// Foreground handover and pairing requests are also host-task events. Paths and
+// names are short and fixed-length here so the critical section stays a memcpy.
+char g_pendingForegroundKey[companionpeer::kPeerKeyLen] = {0};
+char g_pendingForegroundName[companionpeer::kMaxNameLen + 1] = {0};
+volatile bool g_pendingForegroundReady = false;
+char g_pendingPairingName[companionpeer::kMaxNameLen + 1] = {0};
+volatile bool g_pendingPairingReady = false;
+char g_pendingImagePath[96] = {0};
+volatile bool g_pendingImageReady = false;
+
+// Set once a field's END arrives with kFinalFieldFlag set. loop() only applies
+// gotTitle/gotBody once this is true, so a multi-field push (title, then body,
+// then a final-flagged content-id) always lands on screen together instead of
+// the title updating first while body is still mid-transfer.
 volatile bool g_pendingCommitReady = false;
 
-// millis() timestamp of the first pending (title or body) field of the current batch — 0 when
-// idle. Safety net for kPendingBatchTimeoutMs below: if the final-flagged field's END never
-// arrives (app crash / disconnect mid-push), pending fields are applied anyway rather than
-// leaving the screen stuck on stale content indefinitely.
+// millis() timestamp of the first pending field of the current batch — 0 when
+// idle. Safety net for kPendingBatchTimeoutMs: if the final-flagged field's END
+// never arrives (app crash / disconnect mid-push), pending fields are applied
+// anyway rather than leaving the screen stuck on stale content indefinitely.
 uint32_t g_pendingBatchStartMs = 0;
 constexpr uint32_t kPendingBatchTimeoutMs = 3000;
 
@@ -112,11 +110,32 @@ void onContentField(uint8_t field, const uint8_t* data, size_t len, bool final) 
   portEXIT_CRITICAL(&g_mux);
 }
 
-// Runs on the NimBLE host task — same handoff pattern as onContentField().
 void onStatus(uint8_t status) {
   portENTER_CRITICAL(&g_mux);
   g_pendingStatusValue = status;
   g_pendingStatusReady = true;
+  portEXIT_CRITICAL(&g_mux);
+}
+
+void onPairingRequest(const char* displayName) {
+  portENTER_CRITICAL(&g_mux);
+  snprintf(g_pendingPairingName, sizeof(g_pendingPairingName), "%s", displayName ? displayName : "");
+  g_pendingPairingReady = true;
+  portEXIT_CRITICAL(&g_mux);
+}
+
+void onForegroundChange(const char* peerKey, const char* displayName) {
+  portENTER_CRITICAL(&g_mux);
+  snprintf(g_pendingForegroundKey, sizeof(g_pendingForegroundKey), "%s", peerKey ? peerKey : "");
+  snprintf(g_pendingForegroundName, sizeof(g_pendingForegroundName), "%s", displayName ? displayName : "");
+  g_pendingForegroundReady = true;
+  portEXIT_CRITICAL(&g_mux);
+}
+
+void onImageStaged(const char* path) {
+  portENTER_CRITICAL(&g_mux);
+  snprintf(g_pendingImagePath, sizeof(g_pendingImagePath), "%s", path ? path : "");
+  g_pendingImageReady = true;
   portEXIT_CRITICAL(&g_mux);
 }
 
@@ -131,17 +150,23 @@ void CompanionModeActivity::onEnter() {
   currentPage = 0;
   totalPages = 0;
   pages.clear();
+  clearButtonMap();
   cachedFontId = kCompanionFontId;
   computeViewport();
 
   companionble::setContentFieldCallback(onContentField);
   companionble::setStatusCallback(onStatus);
-  startFailed = !companionble::ensureStarted(renderer, cachedFontId);
-  if (startFailed) {
+  companionble::setPairingRequestCallback(onPairingRequest);
+  companionble::setForegroundChangeCallback(onForegroundChange);
+  companionble::setImageStagedCallback(onImageStaged);
+
+  if (!companionble::ensureStarted(renderer, cachedFontId)) {
     LOG_ERR("CMA", "ensureStarted() failed (heap floor or NimBLE init)");
-    waitingSinceMs = 0;
+    screen = Screen::StartFailed;
+    idleSinceMs = 0;
   } else {
-    waitingSinceMs = millis();  // start the "no phone connected" idle-sleep timer
+    chooseIdleScreen();
+    idleSinceMs = millis();  // start the "nobody is driving the screen" idle timer
   }
 
   requestUpdate();
@@ -151,6 +176,9 @@ void CompanionModeActivity::onExit() {
   Activity::onExit();
   companionble::setContentFieldCallback(nullptr);
   companionble::setStatusCallback(nullptr);
+  companionble::setPairingRequestCallback(nullptr);
+  companionble::setForegroundChangeCallback(nullptr);
+  companionble::setImageStagedCallback(nullptr);
   companionble::stop();
 
   portENTER_CRITICAL(&g_mux);
@@ -158,20 +186,80 @@ void CompanionModeActivity::onExit() {
   g_pendingBodyReady = false;
   g_pendingStatusReady = false;
   g_pendingCommitReady = false;
+  g_pendingForegroundReady = false;
+  g_pendingPairingReady = false;
+  g_pendingImageReady = false;
   g_pendingBatchStartMs = 0;
   portEXIT_CRITICAL(&g_mux);
 }
+
+// ---------------------------------------------------------------------------
+// Button map
+// ---------------------------------------------------------------------------
+
+void CompanionModeActivity::clearButtonMap() {
+  for (auto& spec : buttons) {
+    spec.routing = companionble::ButtonRouting::None;
+    spec.label.clear();
+  }
+}
+
+// Reads the foreground peer's declared control scheme off the SD card. Called
+// on every foreground handover and whenever that peer pushes a new map, so an
+// app update changes the buttons without a re-pair and without a firmware mode.
+void CompanionModeActivity::loadButtonMap() {
+  clearButtonMap();
+  if (foregroundPeerKey.empty()) return;
+
+  uint8_t raw[companionpeer::kMaxButtonMapLen];
+  const size_t len =
+      companionpeer::readAssetBody(foregroundPeerKey.c_str(), companionpeer::kAssetButtonMap, raw, sizeof(raw));
+  if (len < 1) return;
+
+  const uint8_t count = raw[0];
+  size_t offset = 1;
+  for (uint8_t i = 0; i < count && offset + 3 <= len; ++i) {
+    const uint8_t buttonId = raw[offset];
+    const uint8_t routing = raw[offset + 1];
+    const uint8_t labelLen = raw[offset + 2];
+    offset += 3;
+    if (offset + labelLen > len) break;
+
+    // POWER is firmware-owned in every app: a wedged app must never be able to
+    // make the device un-sleepable.
+    if (buttonId < kButtonCount && buttonId != static_cast<uint8_t>(companionble::ButtonId::Power) &&
+        routing <= static_cast<uint8_t>(companionble::ButtonRouting::LocalSleep)) {
+      buttons[buttonId].routing = static_cast<companionble::ButtonRouting>(routing);
+      buttons[buttonId].label.assign(reinterpret_cast<const char*>(raw + offset), labelLen);
+    }
+    offset += labelLen;
+  }
+}
+
+companionble::ButtonRouting CompanionModeActivity::routingFor(companionble::ButtonId button) const {
+  const size_t index = static_cast<size_t>(button);
+  return index < kButtonCount ? buttons[index].routing : companionble::ButtonRouting::None;
+}
+
+const char* CompanionModeActivity::labelFor(companionble::ButtonId button) const {
+  const size_t index = static_cast<size_t>(button);
+  if (index >= kButtonCount) return "";
+  // An empty label hides the hint entirely — the convention drawButtonHints()
+  // itself checks.
+  return buttons[index].routing == companionble::ButtonRouting::None ? "" : buttons[index].label.c_str();
+}
+
+// ---------------------------------------------------------------------------
+// Layout
+// ---------------------------------------------------------------------------
 
 void CompanionModeActivity::computeViewport() {
   renderer.getOrientedViewableTRBL(&cachedOrientedMarginTop, &cachedOrientedMarginRight, &cachedOrientedMarginBottom,
                                    &cachedOrientedMarginLeft);
 
   if (!mappedInput.hasTouch()) {
-    // Reserve room for the bottom button-hint bar. renderPage() no longer draws
-    // side hint text (see the removed GUI.drawSideButtonHints() call), so the
-    // left/right margins don't need sideButtonHintsWidth's reservation — but they
-    // shouldn't collapse to the bare bezel margin either. Twice the top margin
-    // reads as comfortable side whitespace without eating too much line width.
+    // Reserve room for the bottom button-hint bar. Twice the top margin reads as
+    // comfortable side whitespace without eating too much line width.
     const auto& metrics = UITheme::getInstance().getMetrics();
     cachedOrientedMarginBottom += metrics.buttonHintsHeight;
     cachedOrientedMarginLeft = cachedOrientedMarginTop * 2;
@@ -184,12 +272,9 @@ void CompanionModeActivity::computeViewport() {
   updateTitleLayout();
 }
 
-// Re-wraps `title` into `titleLines` (see kMaxTitleLines) and, since the
-// title block's height varies with the wrapped line count, recomputes
-// linesPerPage for the body underneath it. Called from computeViewport()
-// (title == "" on first call, i.e. one line reserved) and again whenever a
-// new title arrives in loop() — the body must be re-paginated afterward if
-// it's already loaded, since linesPerPage may have changed.
+// Re-wraps `title` into `titleLines` (see kMaxTitleLines) and, since the title
+// block's height varies with the wrapped line count, recomputes linesPerPage
+// for the body underneath it.
 void CompanionModeActivity::updateTitleLayout() {
   titleLines = wrapTitleToLines(title);
 
@@ -205,11 +290,6 @@ void CompanionModeActivity::updateTitleLayout() {
   if (linesPerPage < 1) linesPerPage = 1;
 }
 
-// Wraps `text` onto at most kMaxTitleLines lines, breaking at the last space
-// that fits (falling back to a UTF-8-safe hard break), mirroring paginate()'s
-// body-wrap loop but measured with the bold title font. If text still
-// doesn't fit after kMaxTitleLines lines, the last line is ellipsis-truncated
-// (the same popUtf8Char-based approach the single-line elide used before).
 std::vector<std::string> CompanionModeActivity::wrapTitleToLines(const std::string& text) const {
   const int maxWidth = viewportWidth - kReadLaterIconAreaWidth;
   std::vector<std::string> lines;
@@ -262,11 +342,6 @@ void CompanionModeActivity::paginate() {
   pages.clear();
   currentPage = 0;
 
-  // Wrap the body into lines using the same measure-and-break loop
-  // TxtReaderActivity uses (renderer.getTextAdvanceX + break at the last
-  // space, or a UTF-8-safe character boundary if there's no space to break
-  // at), then group linesPerPage lines per page. Content is a small in-memory
-  // buffer (bounded by kMaxFieldLen), not a file, so no offset bookkeeping.
   std::vector<std::string> lines;
   size_t pos = 0;
   while (pos < body.size()) {
@@ -315,64 +390,161 @@ void CompanionModeActivity::paginate() {
   totalPages = static_cast<int>(pages.size());
 }
 
-void CompanionModeActivity::checkWaitingIdleSleep() {
-  if (connected || waitingSinceMs == 0) return;
-  if (millis() - waitingSinceMs < kWaitingIdleSleepMs) return;
+// The screen shown when nobody is driving: the icon grid if any enrolled app
+// has an icon, otherwise the plain waiting text.
+void CompanionModeActivity::chooseIdleScreen() {
+  screen = companionpeer::anyEnrolled() ? Screen::IconGrid : Screen::Waiting;
+}
+
+// ---------------------------------------------------------------------------
+// Idle / power
+// ---------------------------------------------------------------------------
+
+void CompanionModeActivity::checkIdleTimers() {
+  if (screen == Screen::Pairing && millis() > pairingDeadlineMs) {
+    LOG_INF("CMA", "pairing prompt timed out");
+    companionble::resolvePairing(/*accept=*/false, /*timedOut=*/true);
+    pairingAppName.clear();
+    RenderLock lock;
+    chooseIdleScreen();
+    requestUpdate();
+    return;
+  }
+
+  if (idleSinceMs == 0) return;
+  if (millis() - idleSinceMs < kWaitingIdleSleepMs) return;
+
+  // The screen has been held since a disconnect (see the protocol doc's
+  // "On-screen behaviour"): the idle timeout is what finally takes it to the
+  // sleep grid, rather than blanking the moment the phone goes away.
+  if (screen == Screen::Text || screen == Screen::Image) {
+    RenderLock lock;
+    haveContent = false;
+    pages.clear();
+    chooseIdleScreen();
+    idleSinceMs = millis();
+    requestUpdate();
+    return;
+  }
+
   // See main.cpp's general auto-sleep check for why USB power skips this too —
   // deep-sleeping drops the USB CDC connection, which is actively unhelpful
   // while plugged in (charging, or connected for serial debugging).
-  // isUsbConnected() alone misses a debug/data cable with no net charge current
-  // (see main.cpp's fuller comment, incl. why the charge IC's STAT pin can't
-  // help either) — usb_serial_jtag_is_connected() catches that case without
-  // needing a terminal app to have the port open.
   if (gpio.isUsbConnected() || usb_serial_jtag_is_connected()) return;
 
-  LOG_INF("CMA", "No phone connected for %lu ms on the waiting screen, deep-sleeping", kWaitingIdleSleepMs);
+  LOG_INF("CMA", "No app driving the screen for %lu ms, deep-sleeping", kWaitingIdleSleepMs);
   powerManager.startDeepSleep(gpio);  // [[noreturn]] — wakes on power button, panel keeps its last image
 }
 
+// ---------------------------------------------------------------------------
+// Handover / image
+// ---------------------------------------------------------------------------
+
+void CompanionModeActivity::applyForegroundChange() {
+  RenderLock lock;
+  loadButtonMap();
+
+  if (foregroundPeerKey.empty()) {
+    // Nobody holds the screen. Content stays up — it is the idle timeout, not
+    // the handover, that clears it.
+    idleSinceMs = millis();
+    if (!haveContent && screen != Screen::Image) chooseIdleScreen();
+  } else {
+    // A different app took the screen: clear whatever the previous one left,
+    // since the device retains no content for a background session.
+    idleSinceMs = 0;
+    title.clear();
+    body.clear();
+    pages.clear();
+    totalPages = 0;
+    currentPage = 0;
+    haveContent = false;
+    readLaterSaved = false;
+    displayedImagePath.clear();
+    updateTitleLayout();
+    screen = Screen::Text;
+  }
+  requestUpdate();
+}
+
+// Decodes a staged PNG on the main loop task and reports the outcome back to
+// the app. Never runs on the NimBLE host task: decoding writes the framebuffer.
+void CompanionModeActivity::handlePendingImage() {
+  const std::string path = pendingImagePath;
+  pendingImagePath.clear();
+
+  ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(path);
+  if (!decoder) {
+    LOG_ERR("CMA", "no decoder for staged image %s", path.c_str());
+    companionble::notifyImageStatus(companionble::ImageResult::DecodeFailed);
+    return;
+  }
+  ImageDimensions dims{};
+  if (!decoder->getDimensions(path, dims)) {
+    LOG_ERR("CMA", "staged image %s did not decode", path.c_str());
+    companionble::notifyImageStatus(companionble::ImageResult::DecodeFailed);
+    return;
+  }
+
+  RenderLock lock;
+  displayedImagePath = path;
+  screen = Screen::Image;
+  requestUpdate();
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+
 void CompanionModeActivity::loop() {
-  if (startFailed) return;  // nothing to poll: BLE never came up
+  if (screen == Screen::StartFailed) return;  // nothing to poll: BLE never came up
 
   const bool nowConnected = companionble::isConnected();
   if (nowConnected != connected) {
-    // RenderLock: connected/haveContent/pages gate which branch render() takes
-    // (renderWaiting() vs renderPage()) and renderPage() iterates `pages`
-    // directly — mutating it here without the lock races the render task,
-    // which can observe a torn `pages` (mid-clear()) against a stale
-    // `totalPages`/`currentPage` and index out of bounds. Confirmed via a
-    // real device crash (EXC inside renderPage()'s pages[currentPage] loop)
-    // before this fix. See EpubReaderActivity.cpp for the same convention.
+    // RenderLock: screen/pages gate which branch render() takes and renderPage()
+    // iterates `pages` directly — mutating either here without the lock races
+    // the render task, which can observe a torn `pages` against a stale
+    // totalPages/currentPage and index out of bounds. Confirmed via a real
+    // device crash before this fix. See EpubReaderActivity.cpp for the same
+    // convention.
     RenderLock lock;
     connected = nowConnected;
     if (!connected) {
-      haveContent = false;
-      pages.clear();
-      waitingSinceMs = millis();  // re-arm the idle-sleep timer for the waiting screen
-      // Discard any in-flight, not-yet-committed batch — a disconnect mid-push means the
-      // final-flagged field's END may never arrive, and the buffered bytes belong to a
-      // session that's now gone (mirrors CompanionBle.cpp's resetReassembly() on disconnect).
+      // Content is deliberately NOT cleared here. The last thing pushed stays on
+      // screen until the idle timeout takes it to the sleep grid.
+      idleSinceMs = millis();
+      foregroundPeerKey.clear();
+      foregroundAppName.clear();
+      if (screen == Screen::Pairing) {
+        pairingAppName.clear();
+        chooseIdleScreen();
+      }
       portENTER_CRITICAL(&g_mux);
       g_pendingTitleReady = false;
       g_pendingBodyReady = false;
       g_pendingCommitReady = false;
       g_pendingBatchStartMs = 0;
       portEXIT_CRITICAL(&g_mux);
-    } else {
-      waitingSinceMs = 0;
     }
     requestUpdate();
   }
 
-  checkWaitingIdleSleep();
-
+  // Drain the host-task handoffs.
   bool gotTitle = false;
   bool gotBody = false;
   bool commit = false;
   bool gotStatus = false;
+  bool gotForeground = false;
+  bool gotPairing = false;
+  bool gotImage = false;
   std::string newTitle;
   std::string newBody;
   uint8_t newStatus = 0;
+  char newForegroundKey[companionpeer::kPeerKeyLen] = {0};
+  char newForegroundName[companionpeer::kMaxNameLen + 1] = {0};
+  char newPairingName[companionpeer::kMaxNameLen + 1] = {0};
+  char newImagePath[sizeof(g_pendingImagePath)] = {0};
+
   portENTER_CRITICAL(&g_mux);
   if (g_pendingTitleReady) {
     newTitle.assign(reinterpret_cast<char*>(g_pendingTitleBuf), g_pendingTitleLen);
@@ -386,9 +558,9 @@ void CompanionModeActivity::loop() {
     commit = true;
   } else if ((gotTitle || gotBody) && g_pendingBatchStartMs != 0 &&
              millis() - g_pendingBatchStartMs > kPendingBatchTimeoutMs) {
-    // Safety net: the final-flagged field's END never arrived in time (e.g. the app
-    // crashed or lost the connection mid-push). Apply whatever we have rather than
-    // leaving the screen stuck on stale content indefinitely.
+    // Safety net: the final-flagged field's END never arrived in time (e.g. the
+    // app crashed or lost the connection mid-push). Apply whatever we have
+    // rather than leaving the screen stuck on stale content indefinitely.
     LOG_ERR("CMA", "content batch commit flag missed after %lu ms, applying pending fields anyway",
             static_cast<unsigned long>(kPendingBatchTimeoutMs));
     commit = true;
@@ -404,24 +576,51 @@ void CompanionModeActivity::loop() {
     g_pendingStatusReady = false;
     gotStatus = true;
   }
+  if (g_pendingForegroundReady) {
+    memcpy(newForegroundKey, g_pendingForegroundKey, sizeof(newForegroundKey));
+    memcpy(newForegroundName, g_pendingForegroundName, sizeof(newForegroundName));
+    g_pendingForegroundReady = false;
+    gotForeground = true;
+  }
+  if (g_pendingPairingReady) {
+    memcpy(newPairingName, g_pendingPairingName, sizeof(newPairingName));
+    g_pendingPairingReady = false;
+    gotPairing = true;
+  }
+  if (g_pendingImageReady) {
+    memcpy(newImagePath, g_pendingImagePath, sizeof(newImagePath));
+    g_pendingImageReady = false;
+    gotImage = true;
+  }
   portEXIT_CRITICAL(&g_mux);
 
+  if (gotPairing) {
+    RenderLock lock;
+    pairingAppName = newPairingName;
+    pairingDeadlineMs = millis() + kPairingTimeoutMs;
+    screen = Screen::Pairing;
+    idleSinceMs = 0;  // a prompt on screen is not idle
+    requestUpdate();
+  }
+
+  if (gotForeground) {
+    foregroundPeerKey = newForegroundKey;
+    foregroundAppName = newForegroundName;
+    applyForegroundChange();
+  }
+
+  if (gotImage) {
+    pendingImagePath = newImagePath;
+    handlePendingImage();
+  }
+
   if (commit && (gotTitle || gotBody)) {
-    // One lock for both halves (rather than two separate locks) so a render
-    // can never land between the title and body updates of a single push and
-    // see a mismatched pairing (e.g. new title still showing the old page
-    // count). See the connect/disconnect branch above for why this needs a
-    // RenderLock at all. Gating on `commit` (rather than applying gotTitle/
-    // gotBody the moment each arrives) is what makes title+body land on
-    // screen together instead of the headline updating first while body is
-    // still mid-transfer — see CompanionBle.h's kFinalFieldFlag doc comment.
+    // One lock for both halves so a render can never land between the title and
+    // body updates of a single push and see a mismatched pairing.
     RenderLock lock;
     if (gotTitle) {
       title = newTitle;
       updateTitleLayout();
-      // If the body's already loaded and isn't about to be re-paginated below
-      // by gotBody, re-paginate now — linesPerPage may have changed with the
-      // title's wrapped line count.
       if (haveContent && !gotBody) paginate();
     }
     if (gotBody) {
@@ -430,8 +629,13 @@ void CompanionModeActivity::loop() {
       haveContent = true;
       readLaterSaved = false;  // new article: reset any previous save-state indicator
     }
+    // Text replaces an image, and vice versa. There is no compositing and no
+    // mode to enter: the last completed push owns the screen.
+    screen = Screen::Text;
+    displayedImagePath.clear();
     requestUpdate();
   }
+
   if (gotStatus && newStatus == static_cast<uint8_t>(companionble::StatusEvent::ReadLaterSaved)) {
     RenderLock lock;
     readLaterSaved = true;
@@ -439,41 +643,69 @@ void CompanionModeActivity::loop() {
     requestUpdate();
   }
 
-  if (!haveContent || !connected) return;
+  checkIdleTimers();
 
-  if (mappedInput.wasPressed(MappedInputManager::Button::Left) && currentPage > 0) {
-    RenderLock lock;
-    currentPage--;
-    requestUpdate();
-  } else if (mappedInput.wasPressed(MappedInputManager::Button::Right) && currentPage < totalPages - 1) {
-    RenderLock lock;
-    currentPage++;
-    requestUpdate();
+  // The pairing prompt is the one screen with a firmware-owned control scheme —
+  // the app asking to pair has, by definition, not had a button map accepted
+  // yet.
+  if (screen == Screen::Pairing) {
+    if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+      companionble::resolvePairing(/*accept=*/true);
+      RenderLock lock;
+      pairingAppName.clear();
+      screen = Screen::Text;  // the app will ACQUIRE and push next
+      requestUpdate();
+    } else if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+      companionble::resolvePairing(/*accept=*/false);
+      RenderLock lock;
+      pairingAppName.clear();
+      chooseIdleScreen();
+      requestUpdate();
+    }
+    return;
   }
 
-  // Side UP/DOWN and bottom BACK/CONFIRM report their raw button id over BLE
-  // (see notifyHeldButton()), repeated every ~kHoldTickMs while held. LEFT/
-  // RIGHT above page the locally-buffered body and never produce a BLE event.
-  if (mappedInput.wasPressed(MappedInputManager::Button::Up)) {
-    notifyHeldButton(companionble::ButtonId::Up);
-  } else if (mappedInput.wasPressed(MappedInputManager::Button::Down)) {
-    notifyHeldButton(companionble::ButtonId::Down);
-  } else if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
-    notifyHeldButton(companionble::ButtonId::Back);
-  } else if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
-    notifyHeldButton(companionble::ButtonId::Confirm);
-  }
+  if (foregroundPeerKey.empty()) return;  // no app owns the buttons
+
+  // Route each button through the foreground app's declared map. Nothing here
+  // decides what a button means — routingFor() is the app's own answer, read
+  // back off the SD card.
+  const bool handled = handleMappedButton(MappedInputManager::Button::Left, companionble::ButtonId::Left) ||
+                       handleMappedButton(MappedInputManager::Button::Right, companionble::ButtonId::Right) ||
+                       handleMappedButton(MappedInputManager::Button::Up, companionble::ButtonId::Up) ||
+                       handleMappedButton(MappedInputManager::Button::Down, companionble::ButtonId::Down) ||
+                       handleMappedButton(MappedInputManager::Button::Back, companionble::ButtonId::Back) ||
+                       handleMappedButton(MappedInputManager::Button::Confirm, companionble::ButtonId::Confirm);
+  (void)handled;
 
   if (holdActive) {
     // Map the tracked button back to its MappedInputManager role to poll
-    // isPressed/wasReleased/getHeldTime for it specifically — getHeldTime()
-    // is a single global timer (only one physical button can be held at a
-    // time on this hardware), so it's always describing holdButton's press.
-    const MappedInputManager::Button trackedRole =
-        holdButton == companionble::ButtonId::Up      ? MappedInputManager::Button::Up
-        : holdButton == companionble::ButtonId::Down  ? MappedInputManager::Button::Down
-        : holdButton == companionble::ButtonId::Back   ? MappedInputManager::Button::Back
-                                                        : MappedInputManager::Button::Confirm;
+    // isPressed/wasReleased/getHeldTime for it specifically — getHeldTime() is a
+    // single global timer (only one physical button can be held at a time on
+    // this hardware), so it is always describing holdButton's press.
+    MappedInputManager::Button trackedRole = MappedInputManager::Button::Confirm;
+    switch (holdButton) {
+      case companionble::ButtonId::Up:
+        trackedRole = MappedInputManager::Button::Up;
+        break;
+      case companionble::ButtonId::Down:
+        trackedRole = MappedInputManager::Button::Down;
+        break;
+      case companionble::ButtonId::Left:
+        trackedRole = MappedInputManager::Button::Left;
+        break;
+      case companionble::ButtonId::Right:
+        trackedRole = MappedInputManager::Button::Right;
+        break;
+      case companionble::ButtonId::Back:
+        trackedRole = MappedInputManager::Button::Back;
+        break;
+      case companionble::ButtonId::Confirm:
+      case companionble::ButtonId::Power:
+        trackedRole = MappedInputManager::Button::Confirm;
+        break;
+    }
+
     if (mappedInput.wasReleased(trackedRole)) {
       const uint16_t finalTicks =
           static_cast<uint16_t>(std::min<unsigned long>(mappedInput.getHeldTime() / kHoldTickMs, 0xFFFFUL));
@@ -490,9 +722,45 @@ void CompanionModeActivity::loop() {
   }
 }
 
+// Applies one button press according to the foreground app's map. Returns true
+// if the press was consumed.
+bool CompanionModeActivity::handleMappedButton(MappedInputManager::Button role, companionble::ButtonId id) {
+  if (!mappedInput.wasPressed(role)) return false;
+
+  switch (routingFor(id)) {
+    case companionble::ButtonRouting::None:
+      return false;
+
+    case companionble::ButtonRouting::Remote:
+      notifyHeldButton(id);
+      return true;
+
+    case companionble::ButtonRouting::LocalPagePrev:
+      if (screen == Screen::Text && currentPage > 0) {
+        RenderLock lock;
+        currentPage--;
+        requestUpdate();
+      }
+      return true;
+
+    case companionble::ButtonRouting::LocalPageNext:
+      if (screen == Screen::Text && currentPage < totalPages - 1) {
+        RenderLock lock;
+        currentPage++;
+        requestUpdate();
+      }
+      return true;
+
+    case companionble::ButtonRouting::LocalSleep:
+      LOG_INF("CMA", "app-mapped sleep button");
+      powerManager.startDeepSleep(gpio);  // [[noreturn]]
+      return true;
+  }
+  return false;
+}
+
 // Starts (or restarts) hold-tracking for a just-pressed button and sends the
-// initial-down notification (duration 0, isFinal false). See holdActive's
-// doc comment in CompanionModeActivity.h.
+// initial-down notification (duration 0, isFinal false).
 void CompanionModeActivity::notifyHeldButton(companionble::ButtonId button) {
   companionble::notifyButtonEvent(button, /*durationTicks=*/0, /*isFinal=*/false);
   holdActive = true;
@@ -500,20 +768,49 @@ void CompanionModeActivity::notifyHeldButton(companionble::ButtonId button) {
   holdTicksSent = 0;
 }
 
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
 void CompanionModeActivity::render(RenderLock&&) {
   renderer.clearScreen();
-  if (startFailed) {
-    renderStartFailed();
-  } else if (!haveContent || !connected) {
-    renderWaiting();
-  } else {
-    renderPage();
+  switch (screen) {
+    case Screen::StartFailed:
+      renderStartFailed();
+      break;
+    case Screen::Pairing:
+      renderPairingPrompt();
+      break;
+    case Screen::IconGrid:
+      renderIconGrid();
+      break;
+    case Screen::Image:
+      renderImage();
+      break;
+    case Screen::Text:
+      if (haveContent) {
+        renderPage();
+      } else {
+        renderWaiting();
+      }
+      break;
+    case Screen::Waiting:
+      renderWaiting();
+      break;
   }
 }
 
 void CompanionModeActivity::renderWaiting() {
-  renderer.drawCenteredText(kCompanionFontId, renderer.getScreenHeight() / 2, tr(STR_COMPANION_WAITING), true,
-                            EpdFontFamily::BOLD);
+  // "Waiting for <app>" once an app holds the screen but has pushed nothing;
+  // the generic "Waiting for phone..." before that.
+  const int centerY = renderer.getScreenHeight() / 2;
+  if (!foregroundAppName.empty()) {
+    renderer.drawCenteredText(cachedTitleFontId, centerY - renderer.getLineHeight(cachedTitleFontId),
+                              foregroundAppName.c_str(), true, EpdFontFamily::BOLD);
+    renderer.drawCenteredText(kCompanionFontId, centerY, tr(STR_COMPANION_WAITING_APP), true);
+  } else {
+    renderer.drawCenteredText(kCompanionFontId, centerY, tr(STR_COMPANION_WAITING), true, EpdFontFamily::BOLD);
+  }
   renderer.displayBuffer();
 }
 
@@ -523,12 +820,116 @@ void CompanionModeActivity::renderStartFailed() {
   renderer.displayBuffer();
 }
 
+void CompanionModeActivity::renderPairingPrompt() {
+  const int centerY = renderer.getScreenHeight() / 2;
+  const int lineHeight = renderer.getLineHeight(cachedTitleFontId);
+  renderer.drawCenteredText(kCompanionFontId, centerY - lineHeight, tr(STR_COMPANION_PAIR_PROMPT), true);
+  renderer.drawCenteredText(cachedTitleFontId, centerY, pairingAppName.c_str(), true, EpdFontFamily::BOLD);
+
+  if (!mappedInput.hasTouch()) {
+    const auto labels = mappedInput.mapLabels(tr(STR_COMPANION_PAIR_NO), tr(STR_COMPANION_PAIR_YES), "", "");
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  }
+  renderer.displayBuffer();
+}
+
+// The decorative sleep grid: one tile per enrolled app, grouped by appId, with
+// the connected app's tile marked. Not a launcher — the device cannot start an
+// app on the phone, so a selectable grid would promise something it cannot
+// deliver.
+void CompanionModeActivity::renderIconGrid() {
+  char keys[companionpeer::kMaxIconTiles][companionpeer::kPeerKeyLen];
+  const size_t count = companionpeer::listIconTiles(keys, companionpeer::kMaxIconTiles);
+  if (count == 0) {
+    renderWaiting();
+    return;
+  }
+
+  const int tile = companionble::kIconWidthPx;
+  const int columns = std::min<int>(kIconGridColumns, static_cast<int>(count));
+  const int rows = static_cast<int>((count + columns - 1) / columns);
+  const int gridWidth = columns * tile + (columns - 1) * kIconGridGap;
+  const int gridHeight = rows * tile + (rows - 1) * kIconGridGap;
+  const int originX = (renderer.getScreenWidth() - gridWidth) / 2;
+  const int originY = (renderer.getScreenHeight() - gridHeight) / 2;
+
+  // One 512-byte stack buffer, reused for every tile: icons are read from SD one
+  // at a time, drawn, and discarded. None are resident.
+  uint8_t bitmap[companionble::kIconBytes];
+  const int bytesPerRow = companionble::kIconWidthPx / 8;
+
+  for (size_t i = 0; i < count; ++i) {
+    const int column = static_cast<int>(i) % columns;
+    const int row = static_cast<int>(i) / columns;
+    const int x0 = originX + column * (tile + kIconGridGap);
+    const int y0 = originY + row * (tile + kIconGridGap);
+
+    if (companionpeer::readAssetBody(keys[i], companionpeer::kAssetIcon, bitmap, sizeof(bitmap)) != sizeof(bitmap)) {
+      continue;
+    }
+    for (int y = 0; y < companionble::kIconHeightPx; ++y) {
+      for (int x = 0; x < companionble::kIconWidthPx; ++x) {
+        const uint8_t byte = bitmap[y * bytesPerRow + (x / 8)];
+        if (byte & (0x80 >> (x % 8))) renderer.drawPixel(x0 + x, y0 + y, true);
+      }
+    }
+
+    if (!foregroundPeerKey.empty() && foregroundPeerKey == keys[i]) {
+      renderer.drawRect(x0 - 4, y0 - 4, tile + 8, tile + 8, true);
+    }
+  }
+  renderer.displayBuffer();
+}
+
+void CompanionModeActivity::renderImage() {
+  if (displayedImagePath.empty()) {
+    renderWaiting();
+    return;
+  }
+
+  ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(displayedImagePath);
+  if (!decoder) {
+    renderer.drawCenteredText(kCompanionFontId, renderer.getScreenHeight() / 2, tr(STR_COMPANION_IMAGE_FAILED), true);
+    renderer.displayBuffer();
+    companionble::notifyImageStatus(companionble::ImageResult::DecodeFailed);
+    displayedImagePath.clear();
+    return;
+  }
+
+  RenderConfig config;
+  config.x = 0;
+  config.y = 0;
+  config.maxWidth = renderer.getScreenWidth();
+  config.maxHeight = renderer.getScreenHeight();
+  config.useGrayscale = true;
+  // The phone already dithered to this panel's exact 4-level palette. Running
+  // the firmware's own dither on top would double-quantize and destroy the
+  // pattern the app chose — see the quantization contract in the protocol doc.
+  config.useDithering = false;
+  config.performanceMode = false;
+
+  const std::string path = displayedImagePath;
+  bool decoded = decoder->decodeToFramebuffer(path, renderer, config);
+  if (!decoded) {
+    renderer.clearScreen();
+    renderer.drawCenteredText(kCompanionFontId, renderer.getScreenHeight() / 2, tr(STR_COMPANION_IMAGE_FAILED), true);
+    renderer.displayBuffer();
+    companionble::notifyImageStatus(companionble::ImageResult::DecodeFailed);
+    displayedImagePath.clear();
+    return;
+  }
+
+  // Two-pass grayscale settle. This re-decodes the image twice more, which is
+  // slow — several seconds — and that is fine: a visible "developing" draw is
+  // thematically wanted here, not a defect to optimise away.
+  ReaderUtils::renderAntiAliased(renderer, [&]() { decoder->decodeToFramebuffer(path, renderer, config); });
+
+  companionble::notifyImageStatus(companionble::ImageResult::Displayed);
+}
+
 void CompanionModeActivity::renderReadLaterIcon(int x, int y) const {
-  // Small hand-drawn 5-point star (the built-in font has no U+2605/U+2606
-  // star glyphs — see notosans_14_regular's EpdUnicodeInterval table). Filled
-  // when readLaterSaved, outline otherwise. Points computed at render time
-  // (cheap relative to the E-ink refresh this is always followed by); no
-  // trig-table caching needed for ~10 calls/render.
+  // Small hand-drawn 5-point star (the built-in font has no U+2605/U+2606 star
+  // glyphs). Filled when readLaterSaved, outline otherwise.
   constexpr int kPoints = 10;
   constexpr float kOuterR = 8.0f;
   constexpr float kInnerR = 3.2f;
@@ -558,10 +959,6 @@ void CompanionModeActivity::renderPage() {
   if (currentPage < 0) currentPage = 0;
   if (currentPage >= totalPages) currentPage = totalPages > 0 ? totalPages - 1 : 0;
 
-  // Title: bold, larger than the body, wraps onto up to kMaxTitleLines lines
-  // (see wrapTitleToLines(), computed in updateTitleLayout() whenever the
-  // title changes), leaving room for the read-later icon at the first
-  // line's right edge.
   const int titleLineHeight = renderer.getLineHeight(cachedTitleFontId);
   int titleY = cachedOrientedMarginTop;
   for (const auto& line : titleLines) {
@@ -585,40 +982,41 @@ void CompanionModeActivity::renderPage() {
 
   if (!mappedInput.hasTouch()) {
     // Battery% (left) / page count (right): each centered in its own
-    // edge-to-button band (not the body-text margin, so a wide string like
-    // "100%" can never run into the button box) and vertically centered on
-    // the button-hint row — both driven by the active theme, since
-    // BaseTheme/LyraTheme/RoundedRaffTheme lay that row out completely
-    // differently (button count/width/padding, flush-to-edge vs. margined).
+    // edge-to-button band and vertically centered on the button-hint row — both
+    // driven by the active theme, since BaseTheme/LyraTheme/RoundedRaffTheme lay
+    // that row out completely differently.
     const int rowCenterY = GUI.getButtonHintsRowCenterY(renderer);
     const int statusTextY = rowCenterY - renderer.getLineHeight(UI_10_FONT_ID) / 2;
     const int leftBandWidth = GUI.getButtonHintsSideBandWidth();
     const int rightBandStart = renderer.getScreenWidth() - leftBandWidth;
-    const int rightBandWidth = leftBandWidth;
 
     char batteryStr[8];
     snprintf(batteryStr, sizeof(batteryStr), "%u%%", powerManager.getBatteryPercentage());
     const int batteryTextWidth = renderer.getTextWidth(UI_10_FONT_ID, batteryStr);
-    const int batteryX = std::max(0, (leftBandWidth - batteryTextWidth) / 2);
-    renderer.drawText(UI_10_FONT_ID, batteryX, statusTextY, batteryStr);
+    renderer.drawText(UI_10_FONT_ID, std::max(0, (leftBandWidth - batteryTextWidth) / 2), statusTextY, batteryStr);
 
-    // Kept even though this device doesn't need to track reading progress —
-    // an empty-looking left/right pair would read as a layout mistake, and
-    // it's a free-standing display of the current page vs. total.
     char pageStr[16];
     snprintf(pageStr, sizeof(pageStr), "%d/%d", currentPage + 1, std::max(totalPages, 1));
     const int pageTextWidth = renderer.getTextWidth(UI_10_FONT_ID, pageStr);
-    const int pageX = rightBandStart + std::max(0, (rightBandWidth - pageTextWidth) / 2);
-    renderer.drawText(UI_10_FONT_ID, pageX, statusTextY, pageStr);
+    renderer.drawText(UI_10_FONT_ID, rightBandStart + std::max(0, (leftBandWidth - pageTextWidth) / 2), statusTextY,
+                      pageStr);
 
-    // PageBack/PageForward hints only appear when that direction is actually
-    // pageable right now (empty string = hidden, the convention drawButtonHints()
-    // itself checks — see e.g. FileBrowserActivity's confirmLabel/dirUp/dirDown).
-    // No side (UP/DOWN) hints are drawn — those buttons still work and still
-    // notify PREV/NEXT over BLE (see loop()), just without an on-screen hint.
-    const char* pageBack = currentPage > 0 ? kPageBackHint : "";
-    const char* pageForward = currentPage < totalPages - 1 ? kPageForwardHint : "";
-    const auto labels = mappedInput.mapLabels(kPlayPauseHint, kReadLaterHint, pageBack, pageForward);
+    // Hints come straight from the app's declared labels. A locally-paging
+    // button's hint is hidden when that direction is not pageable right now
+    // (empty string = hidden, the convention drawButtonHints() checks) — the
+    // firmware knows the page count, the app does not.
+    const char* backLabel = labelFor(companionble::ButtonId::Back);
+    const char* confirmLabel = labelFor(companionble::ButtonId::Confirm);
+    const char* leftLabel = labelFor(companionble::ButtonId::Left);
+    const char* rightLabel = labelFor(companionble::ButtonId::Right);
+    if (routingFor(companionble::ButtonId::Left) == companionble::ButtonRouting::LocalPagePrev && currentPage <= 0) {
+      leftLabel = "";
+    }
+    if (routingFor(companionble::ButtonId::Right) == companionble::ButtonRouting::LocalPageNext &&
+        currentPage >= totalPages - 1) {
+      rightLabel = "";
+    }
+    const auto labels = mappedInput.mapLabels(backLabel, confirmLabel, leftLabel, rightLabel);
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   }
 

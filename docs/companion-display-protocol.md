@@ -199,6 +199,7 @@ HELLO_DENIED reason      0x00 USER_REJECTED     user pressed BACK on the prompt
                          0x02 NO_SESSION_SLOTS  4 sessions already live on this link
                          0x03 MALFORMED         unparseable HELLO
                          0x04 STORAGE           SD unavailable / peer dir could not be created
+                         0x05 BUSY              another pairing prompt is already on screen
 
 BACKGROUND reason        0x00 PREEMPTED         another session acquired the screen
                          0x01 RELEASED          this session released it
@@ -234,6 +235,11 @@ BACK"*. The device notifies `HELLO_PENDING` immediately so the app can show
   16-byte token, and replies `HELLO_OK` carrying it. **Store the token
   durably** (Keychain on iOS); it is what makes every later connect silent.
 - **Rejected, or no input within ~30 seconds** — `HELLO_DENIED`.
+
+Only one prompt is shown at a time. A second unknown peer that says `HELLO`
+while a prompt is up is denied with `BUSY` and should retry once the user has
+dealt with the first — stacking prompts would leave the user confirming an app
+whose name is no longer on screen.
 
 A known peer presenting its correct token gets `HELLO_OK` immediately, with no
 prompt. That is the whole of the "connects automatically" relationship.
