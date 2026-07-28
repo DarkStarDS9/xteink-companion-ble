@@ -27,7 +27,19 @@ constexpr uint32_t XTG_MAGIC = 0x00475458;  // "XTG\0" for 1-bit page data
 // "XTH\0" = 0x58, 0x54, 0x48, 0x00
 constexpr uint32_t XTH_MAGIC = 0x00485458;  // "XTH\0" for 2-bit page data
 
-// XTeink X4 display resolution
+// XTeink X4 display resolution — X4 ONLY, and only correct for the XTC format,
+// which is an X4-native format (see the file header comment above).
+//
+// X3 and X4 build into the same binary, so these constants are wrong for half
+// the devices that run it: the X3's panel is 528x792 (UC8253 glass), not
+// 480x800 (X4, SSD1677). They are named generically, they are the obvious grep
+// hit for "display size", and nothing nearby said which device they described —
+// which is how they ended up quoted as the panel size in unrelated code and
+// documentation more than once.
+//
+// Do not read the panel size from here. The only correct runtime source is the
+// live renderer (GfxRenderer::getScreenWidth() / getScreenHeight()), which
+// reflects the detected device and the current orientation.
 constexpr uint16_t DISPLAY_WIDTH = 480;
 constexpr uint16_t DISPLAY_HEIGHT = 800;
 
