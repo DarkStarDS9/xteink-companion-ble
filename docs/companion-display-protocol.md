@@ -22,9 +22,28 @@ list.
 
 This document is **authoritative** and is written first on purpose: consumer
 apps are built against it while the firmware side lands. Where the firmware and
-this document disagree, the firmware is wrong. Anything not yet flashed and
-verified on hardware is listed at the end of
-`docs/companion-mode-implementation-notes.md`.
+this document disagree, the firmware is wrong.
+
+> ### ⚠ Nothing in v6 has ever executed on the wire
+>
+> As of 2026-07-28, the firmware implements **all** of v6 and **none of it has
+> been exercised by a BLE client.** Not one handshake, content push, image, icon
+> or tag has crossed the link. The device boots, advertises and answers serial
+> commands; that is the whole of what has been confirmed.
+>
+> The cause is environmental, not technical: macOS refuses Bluetooth
+> authorization to the automation process, so the test harness that would
+> exercise all of it has never run. See "Manual verification checklist" at the
+> end of this document — 36 items, all open — and
+> `docs/companion-test-console.md` for how to run them.
+>
+> **Treat every behaviour described here as specified-and-implemented, not
+> proven.** Highest-risk unproven areas: SD access from the NimBLE host task
+> during pairing and image staging (4 KB stack, a crash would look like a
+> pairing failure), the entire image decode and grayscale-settle path (which
+> already yielded one real bug found by reading rather than running — see
+> `renderImage()`'s black/white base), and everything that draws: icon grid,
+> tag chips, pairing prompt.
 
 This is a **BLE peripheral/GATT-server role**, not something upstream
 CrossPoint or this fork's `feat-bluetooth` branch already has — that branch's
@@ -64,6 +83,38 @@ to *both* apps. Nothing at the link layer distinguishes them. That single fact
 is why v6 exists — app identity is declared in-band, as a **session**, and
 every frame in both directions carries the `sessionId` it belongs to. See
 `docs/companion-multi-app-design.md` §2.
+
+---
+
+## Design rule: a display string is never an identifier
+
+Every user-visible string in this protocol — a tag label, a button label, a
+peer's display name — is **presentation only**. Nothing keys on it, compares it,
+sorts by it, deduplicates on it, or derives a path or a directory name from it.
+Identity is always a separate opaque value: a `tagId`, a `buttonId`, an `appId`
+and `installId`.
+
+This is not a style preference; it is what makes localization survivable.
+Display strings change under a running app — the user switches phone language,
+a server-driven label set updates with no app release, an app is renamed in a
+new version. If any of those changed identity, then a user switching to German
+would find their tags replaced by different ones, their saved article unsaved,
+or their paired app suddenly a stranger the device asks them to confirm again.
+
+Concretely, in v6:
+
+| String | Never used for | Identity is |
+|---|---|---|
+| Tag label | tag state, matching, ordering | `tagId` from the UI declaration |
+| Button label | routing, hint placement, matching | `buttonId` (mirrors the HAL) |
+| Peer display name | `peerKey`, directory names, index lookup | `appId` + `installId` |
+
+Labels *are* part of an asset's content, so changing one changes its digest and
+the asset is re-pushed. That is the digest doing its job — deriving a version
+from content — and is the opposite of deriving identity from a label.
+
+**Any field added to this protocol inherits this rule.** If a new string ever
+needs to be matched on, that is the signal it should have had an id.
 
 ---
 
@@ -1070,6 +1121,13 @@ Images:
 24. Push a correctly-sized grayscale PNG using only `{0,85,170,255}`:
     confirm it renders full-screen, the grayscale settle runs, and
     `IMAGE_STATUS(DISPLAYED)` arrives.
+23b. **Bisect the image path with two encoders.** Snap2Ink ships a calibration
+    target (eight bands answering "count the distinct greys", "is this band
+    striped or flat", "is the border one pixel or two") that bypasses its own
+    rasterizer and dither. Push that *and* the harness's own generated PNG
+    (`make_test_png()` in `scripts/companion_e2e_test.py`). If only theirs is
+    wrong the fault is phone-side; if both are wrong it is the firmware's decode
+    or settle. Do this before debugging either side in isolation.
 24. Confirm the staged file lands under `peers/<peerKey>/data/` and that free
     heap during the transfer stays near its idle value (nothing image-sized was
     allocated).

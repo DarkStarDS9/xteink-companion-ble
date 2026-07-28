@@ -32,6 +32,8 @@ Covered:
   tags         app-declared tags: atomic with content, and state-only writes
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import hashlib

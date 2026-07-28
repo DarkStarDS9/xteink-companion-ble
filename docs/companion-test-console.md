@@ -10,6 +10,13 @@ v6 protocol can be tested automatically instead of by hand.
 pio run -e test -t upload --upload-port /dev/cu.usbmodem21201
 ```
 
+> **Status: the console itself is verified on hardware; the harness is not.**
+> Every command below has been exercised on a real X3 over USB serial. The
+> end-to-end harness that uses them alongside BLE has **never run**, because
+> macOS refuses Bluetooth to the automation process. Running it is the single
+> highest-value thing anyone can do to this repository right now — see "The
+> harness" at the end.
+
 ## Why it exists
 
 v6 enrollment requires a **physical CONFIRM press on the device** to accept an
@@ -116,7 +123,28 @@ actually drew something rather than trusting a state string.
 ## The harness
 
 `scripts/companion_e2e_test.py` drives all of the above alongside BLE. See its
-`--help`; it needs `bleak` and a serial port, and covers first-contact
-enrollment with the on-device confirm, token-based silent reconnect, ACQUIRE
-denial for a peer with no button map, preemption between two simulated apps, and
-an image push.
+`--help`; it needs `bleak` and `pyserial`, and covers first-contact enrollment
+with the on-device confirm, token-based silent reconnect, `ACQUIRE` denial for a
+peer with no UI declaration, a held-button round trip, tags (atomic, state-only,
+and undeclared-id rejection), preemption between two simulated apps on one link,
+and an image push.
+
+```bash
+pio run -e test -t upload --upload-port /dev/cu.usbmodem21201
+python scripts/companion_e2e_test.py --port /dev/cu.usbmodem21201
+```
+
+### Run it from a real terminal, not tmux
+
+macOS grants Bluetooth per *responsible process*. A process started inside tmux
+inherits tmux's identity, and a plain binary like tmux generally cannot be
+granted Bluetooth at all — the request fails immediately with
+`BleakBluetoothNotAvailableError … DENIED_BY_UNKNOWN` and no permission prompt
+is ever shown. The same applies to any agent or automation harness.
+
+Open Terminal.app or iTerm directly and run it there, where macOS will prompt.
+An Apple-signed interpreter (`/usr/bin/python3`) prompts more reliably than a
+Homebrew build. The script runs on Python 3.9 upward.
+
+This is why the harness has never been executed: everything in it is written and
+build-verified, and none of it has run.

@@ -48,7 +48,7 @@ apps existed.
 
 ## Planned
 
-### 0. Multi-app / multi-phone platform base — **implemented, awaiting on-wire verification**
+### 0. Multi-app / multi-phone platform base — **implemented; NOTHING verified on the wire**
 
 **Consumer:** every app. This is the platform layer the "serves multiple consumer apps" framing
 above has been asserting without actually having.

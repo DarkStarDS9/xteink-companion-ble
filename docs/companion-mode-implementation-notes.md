@@ -151,6 +151,14 @@ not been observed on hardware.
 
 ### Not yet verified — needs a BLE central
 
+**Everything below is still true, and the list has grown**: protocol v6 is now
+feature-complete (sessions, pairing, per-peer storage, UI declaration, tags,
+icons, image push) and **not one byte of it has crossed a BLE link.** Later
+commits added the tag path and fixed a real bug in `renderImage()` — it never
+displayed the black/white base before overlaying the grayscale planes, found by
+reading `TxtReaderActivity`'s sequence rather than by running anything. Neither
+has executed.
+
 Everything below is build-verified only. The dev-machine pusher
 (`scripts/push_companion_content.py`, rewritten for v6) is the intended path and
 implements all of it, but macOS refused Bluetooth permission to the automation
