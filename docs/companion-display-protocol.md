@@ -178,9 +178,11 @@ is denied with `NO_SESSION_SLOTS`.
 There is one screen, so exactly one session is **foreground** at a time and
 everything else is background.
 
-- Only the foreground session may push content and receive button events.
+- Only the foreground session may push **content** and receive button events.
   Content frames tagged with a background (or unknown) session id are
-  **silently dropped**.
+  **silently dropped**. Assets (`0x05`, `0x06`) are the exception and are
+  accepted from any live session — see "Assets do not require the foreground"
+  below.
 - `ACQUIRE` policy is **last requester wins, unconditionally.** The user just
   brought that app to the foreground on their phone; the firmware has no
   standing to second-guess that. The preempted session gets `BACKGROUND` with
@@ -453,8 +455,21 @@ never inject bytes into another app's in-flight transfer. The apps on this
 protocol are cooperating, not adversarial — but they are written by different
 codebases on different release cycles, which is the same failure mode.
 
-Frames whose `sessionId` is not the current foreground session are dropped
-without effect. A frame arriving with no session in the foreground is dropped.
+**Assets do not require the foreground; content does.**
+
+- Fields `0x05` (UI declaration) and `0x06` (icon) are accepted from **any live
+  session**. They are per-peer state, not screen content — a background app may
+  refresh its labels or its icon without taking the screen. This is also
+  required rather than convenient: `ACQUIRE` is refused until a UI declaration
+  is stored, so if pushing one needed the foreground, a peer could never push
+  the declaration that would let it become foreground. Enrollment would
+  deadlock.
+- Fields `0x01` `0x02` `0x03` `0x04` `0x07` (title, body, content-id, image, tag
+  state) are dropped unless the sending session currently holds the screen.
+
+Frames from an unknown session are always dropped. Pushing a UI declaration
+while another app holds the screen stores it silently; it takes effect for you
+when you next acquire.
 
 A new `START` discards any partial reassembly in progress. Reassembly is also
 discarded on disconnect and on a foreground handover.

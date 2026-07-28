@@ -158,6 +158,22 @@ class Console:
     def ping(self) -> bool:
         return any(r.startswith("pong") for r in self.send("CPING", expect="pong"))
 
+    def await_screen(self, expected: str, timeout: float = 8.0) -> str:
+        """Waits for the device to report `expected`, returning whatever it last said.
+
+        The activity sets its screen under a RenderLock that an in-flight e-ink
+        refresh can hold for the best part of a second, so sampling once right
+        after a notification races the panel rather than testing anything.
+        """
+        deadline = time.time() + timeout
+        last = ""
+        while time.time() < deadline:
+            last = self.state().get("screen", "")
+            if last == expected:
+                return last
+            time.sleep(0.3)
+        return last
+
     def state(self) -> dict:
         for reply in self.send("CSTATE", expect="state"):
             if reply.startswith("state "):
@@ -474,7 +490,10 @@ async def run_tests(args, console: Console, results: Results) -> None:
             except asyncio.TimeoutError:
                 pass
             results.check("unknown peer raises HELLO_PENDING", bool(got_pending))
-            results.check("device shows the pairing prompt", console.state().get("screen") == "pairing")
+            seen = console.await_screen("pairing")
+            results.check("device shows the pairing prompt", seen == "pairing",
+                          f"screen was {seen!r} — if this never reaches 'pairing', a real user "
+                          "has no idea what they are confirming")
 
             console.press(BTN_CONFIRM)  # the press a BLE-only script cannot make
             data = await asyncio.wait_for(hello_future, timeout=10.0)
@@ -500,9 +519,14 @@ async def run_tests(args, console: Console, results: Results) -> None:
                 f"got {outcome}",
             )
 
+            # Pushed while this session is deliberately NOT foreground — the
+            # only order enrollment allows, since ACQUIRE is refused until the
+            # declaration exists. A build that requires foreground for asset
+            # pushes deadlocks here and this times out.
             button_map = encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS)
             result, tag = await link.push_asset(peer_a, FIELD_UI_DECL, button_map)
-            results.check("UI declaration stored", result == 0, f"result {result}")
+            results.check("UI declaration accepted without holding the screen",
+                          result == 0, f"result {result}")
             results.check("stored tag is the one pushed", tag == button_map[:4])
 
             outcome = await link.acquire(peer_a)

@@ -535,11 +535,25 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           LOG_ERR("CBLE", "START packet unknown field 0x%02x", field);
           return;
         }
-        // Frames from a background (or unknown) session are dropped. Without
-        // this, a stray write from a backgrounded app on the same phone lands in
-        // whatever transfer is in flight.
         Session* session = sessionById(sessionId);
-        if (!session || sessionId != g_foreground) return;
+        if (!session) return;
+
+        // Assets are per-peer state, not screen content, so they are accepted
+        // from any live session — a background app may refresh its icon or its
+        // labels without taking the screen.
+        //
+        // This is also load-bearing rather than a nicety: ACQUIRE is refused
+        // until a UI declaration is stored, so requiring foreground to push one
+        // deadlocks enrollment outright. A peer could never push the
+        // declaration that would let it become foreground. Found the first time
+        // the end-to-end harness ran against real hardware.
+        //
+        // Everything that touches the screen still requires the foreground,
+        // which is the case the sessionId check exists for: without it a stray
+        // write from a backgrounded app on the same phone lands in whatever
+        // transfer is in flight.
+        const bool isAsset = field == kFieldUiDeclaration || field == kFieldIcon;
+        if (!isAsset && sessionId != g_foreground) return;
 
         uint32_t totalLen;
         memcpy(&totalLen, data + 3, sizeof(totalLen));  // data may be unaligned
