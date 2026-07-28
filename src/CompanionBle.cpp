@@ -840,6 +840,21 @@ void stop() {
 
 bool isConnected() { return g_begun && g_server && g_server->getConnectedCount() > 0; }
 
+const uint8_t* capabilityValue(size_t& lengthOut) {
+  lengthOut = sizeof(g_capabilityValue);
+  return g_capabilityValue;
+}
+
+uint8_t foregroundSessionId() { return g_foreground; }
+
+uint8_t activeSessionCount() {
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < kMaxSessions; ++i) {
+    if (g_sessions[i].active) ++count;
+  }
+  return count;
+}
+
 const char* foregroundPeerKey() {
   const Session* session = sessionById(g_foreground);
   return session ? session->peerKey : "";

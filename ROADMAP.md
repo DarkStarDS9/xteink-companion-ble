@@ -32,6 +32,18 @@ GATT service `7c9c0000-…0001`, four characteristics (content / button-event / 
 Phone pushes title/body/content-id; device notifies raw button identity plus hold duration. See the
 protocol doc for the full field and framing definition.
 
+### On-target test infrastructure
+
+**Consumer:** this repo, and indirectly every app. Serial remote control
+(`[env:test]` only) plus an end-to-end harness that drives BLE and buttons together —
+[docs/companion-test-console.md](docs/companion-test-console.md),
+`scripts/companion_e2e_test.py`.
+
+Exists because v6 enrollment requires a physical CONFIRM press on the device, so a BLE-only script
+cannot complete a first pairing. Before this the repo had no automated on-target testing at all, and
+the two-apps-on-one-link case — the thing that motivated v6 — had no way to be tested before real
+apps existed.
+
 ---
 
 ## Planned

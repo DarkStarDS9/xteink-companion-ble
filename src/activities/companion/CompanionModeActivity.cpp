@@ -14,6 +14,7 @@
 
 #include "CompanionBle.h"
 #include "CompanionPeerStore.h"
+#include "CompanionTestConsole.h"
 #include "Epub/converters/ImageDecoderFactory.h"
 #include "MappedInputManager.h"
 #include "activities/reader/ReaderUtils.h"
@@ -146,6 +147,13 @@ void onImageStaged(const char* path) {
 
 }  // namespace
 
+#ifdef COMPANION_TEST_CONSOLE
+// The serial console's screen-name provider is a plain function pointer, so the
+// one live activity instance is reachable through this file-scope pointer.
+// Companion Mode is the device's sole activity, so there is never a second one.
+static CompanionModeActivity* g_screenNameActivity = nullptr;
+#endif
+
 void CompanionModeActivity::onEnter() {
   Activity::onEnter();
   connected = false;
@@ -164,6 +172,13 @@ void CompanionModeActivity::onEnter() {
   companionble::setPairingRequestCallback(onPairingRequest);
   companionble::setForegroundChangeCallback(onForegroundChange);
   companionble::setImageStagedCallback(onImageStaged);
+#ifdef COMPANION_TEST_CONSOLE
+  // The console reports the screen without knowing what a screen is.
+  g_screenNameActivity = this;
+  companiontest::setScreenNameProvider([]() -> const char* {
+    return g_screenNameActivity ? g_screenNameActivity->screenName() : "none";
+  });
+#endif
 
   if (!companionble::ensureStarted(renderer, cachedFontId)) {
     LOG_ERR("CMA", "ensureStarted() failed (heap floor or NimBLE init)");
@@ -184,6 +199,10 @@ void CompanionModeActivity::onExit() {
   companionble::setPairingRequestCallback(nullptr);
   companionble::setForegroundChangeCallback(nullptr);
   companionble::setImageStagedCallback(nullptr);
+#ifdef COMPANION_TEST_CONSOLE
+  companiontest::setScreenNameProvider(nullptr);
+  g_screenNameActivity = nullptr;
+#endif
   companionble::stop();
 
   portENTER_CRITICAL(&g_mux);
@@ -657,13 +676,13 @@ void CompanionModeActivity::loop() {
   // the app asking to pair has, by definition, not had a button map accepted
   // yet.
   if (screen == Screen::Pairing) {
-    if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+    if (buttonWasPressed(MappedInputManager::Button::Confirm, companionble::ButtonId::Confirm)) {
       companionble::resolvePairing(/*accept=*/true);
       RenderLock lock;
       pairingAppName.clear();
       screen = Screen::Text;  // the app will ACQUIRE and push next
       requestUpdate();
-    } else if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+    } else if (buttonWasPressed(MappedInputManager::Button::Back, companionble::ButtonId::Back)) {
       companionble::resolvePairing(/*accept=*/false);
       RenderLock lock;
       pairingAppName.clear();
@@ -714,14 +733,14 @@ void CompanionModeActivity::loop() {
         break;
     }
 
-    if (mappedInput.wasReleased(trackedRole)) {
+    if (buttonWasReleased(trackedRole, holdButton)) {
       const uint16_t finalTicks =
-          static_cast<uint16_t>(std::min<unsigned long>(mappedInput.getHeldTime() / kHoldTickMs, 0xFFFFUL));
+          static_cast<uint16_t>(std::min<unsigned long>(buttonHeldTime(holdButton) / kHoldTickMs, 0xFFFFUL));
       companionble::notifyButtonEvent(holdButton, finalTicks, /*isFinal=*/true);
       holdActive = false;
-    } else if (mappedInput.isPressed(trackedRole)) {
+    } else if (buttonIsPressed(trackedRole, holdButton)) {
       const uint16_t heldTicks =
-          static_cast<uint16_t>(std::min<unsigned long>(mappedInput.getHeldTime() / kHoldTickMs, 0xFFFFUL));
+          static_cast<uint16_t>(std::min<unsigned long>(buttonHeldTime(holdButton) / kHoldTickMs, 0xFFFFUL));
       if (heldTicks > holdTicksSent) {
         companionble::notifyButtonEvent(holdButton, heldTicks, /*isFinal=*/false);
         holdTicksSent = heldTicks;
@@ -730,10 +749,65 @@ void CompanionModeActivity::loop() {
   }
 }
 
+bool CompanionModeActivity::buttonWasPressed(MappedInputManager::Button role, companionble::ButtonId id) const {
+#ifdef COMPANION_TEST_CONSOLE
+  if (companiontest::wasPressed(id)) return true;
+#else
+  (void)id;
+#endif
+  return mappedInput.wasPressed(role);
+}
+
+bool CompanionModeActivity::buttonIsPressed(MappedInputManager::Button role, companionble::ButtonId id) const {
+#ifdef COMPANION_TEST_CONSOLE
+  if (companiontest::isPressed(id)) return true;
+#else
+  (void)id;
+#endif
+  return mappedInput.isPressed(role);
+}
+
+bool CompanionModeActivity::buttonWasReleased(MappedInputManager::Button role, companionble::ButtonId id) const {
+#ifdef COMPANION_TEST_CONSOLE
+  if (companiontest::wasReleased(id)) return true;
+#else
+  (void)id;
+#endif
+  return mappedInput.wasReleased(role);
+}
+
+unsigned long CompanionModeActivity::buttonHeldTime(companionble::ButtonId id) const {
+#ifdef COMPANION_TEST_CONSOLE
+  (void)id;
+  if (companiontest::holdInProgress()) return companiontest::heldTimeMs();
+#else
+  (void)id;
+#endif
+  return mappedInput.getHeldTime();
+}
+
+const char* CompanionModeActivity::screenName() const {
+  switch (screen) {
+    case Screen::StartFailed:
+      return "start_failed";
+    case Screen::Waiting:
+      return "waiting";
+    case Screen::IconGrid:
+      return "icon_grid";
+    case Screen::Pairing:
+      return "pairing";
+    case Screen::Text:
+      return haveContent ? "text" : "waiting_app";
+    case Screen::Image:
+      return "image";
+  }
+  return "?";
+}
+
 // Applies one button press according to the foreground app's map. Returns true
 // if the press was consumed.
 bool CompanionModeActivity::handleMappedButton(MappedInputManager::Button role, companionble::ButtonId id) {
-  if (!mappedInput.wasPressed(role)) return false;
+  if (!buttonWasPressed(role, id)) return false;
 
   switch (routingFor(id)) {
     case companionble::ButtonRouting::None:

@@ -49,6 +49,13 @@ scratch file precisely because a RAM buffer will not fit.
   one consumer app could plausibly use.
 * **Memory, flash, and code quality.** Refactors that reduce resource use or ease upstream merges,
   even with no user-visible change.
+* **On-target test infrastructure.** A debug-build-only serial surface that lets a host drive the
+  device alongside BLE ([docs/companion-test-console.md](docs/companion-test-console.md)), and the
+  harness built on it. In scope because v6 enrollment needs a physical button press, so without it
+  the protocol's most important path cannot be tested by any consumer app either — this is shared
+  infrastructure, not one app's convenience. It is compiled out of every shipping build and may
+  never expose an action a phone cannot perform over BLE; the moment it does, the tested path stops
+  being the shipped path.
 
 ### Out-of-Scope
 

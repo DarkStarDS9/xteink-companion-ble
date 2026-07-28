@@ -131,6 +131,19 @@ void touch(const char* peerKey);
 // Returns how many were written.
 size_t listIconTiles(char keysOut[][kPeerKeyLen], size_t maxTiles);
 
+// Fills `keysOut` with every enrolled peerKey, most recently seen first.
+// Returns how many were written. Unlike listIconTiles() this does not group by
+// appId or require an icon — it is the raw index, for diagnostics.
+size_t listPeers(char keysOut[][kPeerKeyLen], size_t maxPeers);
+
+// True if this peer has a stored sleep-screen icon.
+bool hasIcon(const char* peerKey);
+
+// Deletes every peer directory and the index. Returns the device to its
+// never-paired state so a first-contact enrollment can be re-tested without
+// physically clearing the SD card between runs.
+void forgetAllPeers();
+
 // True if any peer is enrolled at all. Drives "Waiting for phone" vs the icon
 // grid on an idle device.
 bool anyEnrolled();

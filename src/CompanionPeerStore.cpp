@@ -333,6 +333,46 @@ size_t listIconTiles(char keysOut[][kPeerKeyLen], size_t maxTiles) {
   return written;
 }
 
+size_t listPeers(char keysOut[][kPeerKeyLen], size_t maxPeers) {
+  JsonDocument doc;
+  if (!loadIndex(doc)) return 0;
+  JsonArray peers = doc["peers"].as<JsonArray>();
+
+  size_t written = 0;
+  uint32_t previousSeq = UINT32_MAX;
+  while (written < maxPeers) {
+    int bestIndex = -1;
+    uint32_t bestSeq = 0;
+    for (size_t i = 0; i < peers.size(); ++i) {
+      const uint32_t seq = peers[i]["seq"] | 0u;
+      if (seq >= previousSeq) continue;
+      if (bestIndex < 0 || seq > bestSeq) {
+        bestIndex = static_cast<int>(i);
+        bestSeq = seq;
+      }
+    }
+    if (bestIndex < 0) break;
+    snprintf(keysOut[written++], kPeerKeyLen, "%s", peers[bestIndex]["key"] | "");
+    previousSeq = bestSeq;
+  }
+  return written;
+}
+
+bool hasIcon(const char* peerKey) { return Storage.exists(assetPath(peerKey, kAssetIcon).c_str()); }
+
+void forgetAllPeers() {
+  JsonDocument doc;
+  if (loadIndex(doc)) {
+    for (JsonObject entry : doc["peers"].as<JsonArray>()) {
+      const char* key = entry["key"] | "";
+      if (key[0] != '\0') removePeerDir(key);
+    }
+  }
+  Storage.remove(kIndexPath);
+  Storage.rmdir(kPeersDir);
+  LOG_INF("CPEER", "all peers forgotten");
+}
+
 bool anyEnrolled() {
   JsonDocument doc;
   if (!loadIndex(doc)) return false;

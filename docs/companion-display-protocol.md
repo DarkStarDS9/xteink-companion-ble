@@ -472,9 +472,28 @@ dithered pixel as one of the four values `{0, 85, 170, 255}`** — not merely
 "some value inside each bucket". Anything else re-quantizes unpredictably at
 the boundaries.
 
-**Format.** 8-bit grayscale PNG (colour type 0). Not interlaced. Any bit depth
-other than 8 or any colour type other than 0 may decode, but only colour type 0
-at depth 8 is contract.
+**Format.** Grayscale PNG (colour type 0), not interlaced. **Bit depth 2 is
+recommended**; depths 1, 4 and 8 also decode. Colour type 0 is the contract —
+anything else may work and may stop working.
+
+Use 2 bits per pixel unless you have a reason not to. It is exact and roughly
+four times smaller:
+
+- **Exact.** The decoder expands a packed sample with `sample * 255 / maxSample`,
+  which for a 2-bit sample is `s * 255 / 3` = `{0, 85, 170, 255}` — precisely the
+  values the subsequent `gray / 85` bucketing maps back to levels 0–3. There is
+  no rounding anywhere on the round trip. Feeding 8-bit samples of the same four
+  values is equally exact but says the same thing in four times the space.
+- **Smaller, and that is what decides whether a print transfers quickly.** A full
+  panel at 2 bpp is 96,000 bytes before compression against 384,000 at 8 bpp, and
+  dithered noise is close to incompressible, so the ratio largely survives
+  deflate. Measured on real dithered 480x800 prints: Atkinson 28.5 KB,
+  Floyd–Steinberg 34.9 KB, ordered Bayer 5.3 KB. At 8 bpp the error-diffusion
+  cases are several times that, which is minutes of extra BLE transfer for no
+  gain in fidelity.
+
+The device validates bit depth in exactly one place and accepts 1/2/4/8 for
+grayscale; there is no second check to trip over.
 
 **Dimensions.** Encode at exactly the pixel size the capability characteristic
 advertises (bytes 17..20). The device centres the image and, if it is larger
@@ -544,9 +563,16 @@ bytes 4..N   1-bpp bitmap, row-major, MSB-first within each byte,
 ```
 
 Exactly `iconWidth x iconHeight / 8` bitmap bytes for the dimensions advertised
-in the capability characteristic (64x64 = 512 bytes today). A set bit is ink
-(black); a clear bit is paper. Any other length is rejected with
-`ASSET_ACK(REJECTED_SIZE)`.
+in the capability characteristic (64x64 = 512 bytes today). **A set bit is ink
+(black); a clear bit is paper** — matching the 1-bpp framebuffer, so an icon
+authored as a black-on-white bitmap needs no inversion. Any other length is
+rejected with `ASSET_ACK(REJECTED_SIZE)`.
+
+**The advertised icon width is always a multiple of 8**, and that is a
+guarantee, not an accident of the current 64x64 value. It means the packed size
+is exactly `width * height / 8` with no row padding, and a client never has to
+invent a padding convention. If a future device ever wants a non-aligned width,
+that is a protocol revision with an explicit padding rule, not a silent change.
 
 Drawn on the sleep screen in a grid of every enrolled app, **grouped by
 `appId`** — the same app paired from two phones is one tile, not two, and the

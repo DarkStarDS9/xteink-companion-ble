@@ -33,8 +33,14 @@ If this package and that document disagree, the document is right.
 
 **Image encoding and dithering.** `pushImage(_:)` takes PNG bytes you produced. The whole point of
 the image field is that the phone owns the aesthetic — the device disables its own dither and shows
-your bit pattern as-is. Bake your dither, encode an 8-bit grayscale PNG using only the values
-`{0, 85, 170, 255}` at exactly the device's advertised pixel size, and hand it over.
+your bit pattern as-is. Bake your dither and hand over a grayscale PNG at exactly the device's
+advertised pixel size.
+
+Encode it at **2 bits per pixel**. The decoder expands a 2-bit sample as `s * 255 / 3` =
+`{0, 85, 170, 255}`, which is exactly what its `gray / 85` bucketing maps back to levels 0–3 — no
+rounding on the round trip — and it is about four times smaller than the same image at 8 bpp, which
+on BLE is minutes of transfer time. 8-bit grayscale using only those four values is equally exact,
+just larger.
 
 ## Requirements
 

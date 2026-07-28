@@ -28,6 +28,7 @@
 #include "RecentBooksStore.h"
 #include "SdCardFontSystem.h"
 #include "activities/Activity.h"
+#include "CompanionTestConsole.h"
 #include "activities/ActivityManager.h"
 #include "activities/companion/CompanionModeActivity.h"
 #include "activities/settings/SdFirmwareUpdateActivity.h"
@@ -462,6 +463,10 @@ void loop() {
     lastMemPrint = millis();
   }
 
+#ifdef COMPANION_TEST_CONSOLE
+  companiontest::update();  // advances any injected button hold
+#endif
+
   // Handle incoming serial commands,
   // nb: we use logSerial from logging to avoid deprecation warnings
   if (logSerial.available() > 0) {
@@ -501,6 +506,11 @@ void loop() {
                   bufferSize);
         }
         logSerial.printf("SCREENSHOT_END\n");
+#ifdef COMPANION_TEST_CONSOLE
+      } else if (companiontest::handleCommand(cmd)) {
+        // Companion Mode's serial test surface — see CompanionTestConsole.h.
+        // Compiled out of every shipping build; only [env:test] defines it.
+#endif
       } else if (cmd == "CRASHREPORT") {
         logSerial.printf("CRASHREPORT_START\n");
         if (!Storage.readFileToStream("/crash_report.txt", logSerial)) {

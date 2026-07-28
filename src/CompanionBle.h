@@ -192,6 +192,17 @@ void stop();
 
 bool isConnected();
 
+// The capability characteristic's bytes, for diagnostics and for a test host
+// that wants to assert on them without a BLE read. Never mutated after
+// ensureStarted().
+const uint8_t* capabilityValue(size_t& lengthOut);
+
+// sessionId of the session that currently owns the screen, or kNoSession.
+uint8_t foregroundSessionId();
+
+// How many sessions are live on the current link.
+uint8_t activeSessionCount();
+
 // peerKey of the session that currently owns the screen, or an empty string.
 // Valid until the next foreground change; copy it if you need to keep it.
 const char* foregroundPeerKey();

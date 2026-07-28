@@ -107,10 +107,12 @@ Two options were considered:
    for a dithered 800×480 image (dithered images compress worse than photos
    — budget isn't as low as JPEG, but well under raw).
 
-**Proposed: (2).** Client encodes the pre-dithered image as an 8-bit
-grayscale PNG using only the four values `{0, 85, 170, 255}`, pushes it as
-field `0x04` with the existing chunked framing, firmware decodes with
-`useDithering = false`.
+**Adopted: (2), at 2 bits per pixel rather than 8.** The sketch proposed 8-bit
+grayscale restricted to `{0, 85, 170, 255}`; implementation found the packed
+2-bit path is exactly equivalent and four times smaller. `expandSampleToByte`
+turns a 2-bit sample into precisely those four values, and `isSupportedBitDepth`
+already accepted depths 1/2/4 for grayscale, so this used the decoder as it
+stood. See the protocol doc's "Image field" for the committed contract.
 
 ### Integration snag: `PngToFramebufferConverter` reads from `HalFile`, not RAM
 

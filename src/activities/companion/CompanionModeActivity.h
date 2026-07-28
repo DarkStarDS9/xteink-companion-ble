@@ -109,6 +109,16 @@ class CompanionModeActivity final : public Activity {
   uint16_t holdTicksSent = 0;
   static constexpr unsigned long kHoldTickMs = 100;
 
+  // Input seams. Each is `MappedInputManager` ORed with the serial test
+  // console's injected state, so an automated test drives the *real* routing,
+  // hold-tick and notify paths rather than a parallel one. Without the console
+  // compiled in these are one-line forwards.
+  bool buttonWasPressed(MappedInputManager::Button role, companionble::ButtonId id) const;
+  bool buttonIsPressed(MappedInputManager::Button role, companionble::ButtonId id) const;
+  bool buttonWasReleased(MappedInputManager::Button role, companionble::ButtonId id) const;
+  unsigned long buttonHeldTime(companionble::ButtonId id) const;
+  const char* screenName() const;
+
   void notifyHeldButton(companionble::ButtonId button);
   void loadButtonMap();
   void clearButtonMap();
