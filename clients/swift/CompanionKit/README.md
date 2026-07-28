@@ -18,7 +18,13 @@ If this package and that document disagree, the document is right.
 - `appId` / `installId` management, with the install id minted once into `UserDefaults`.
 - Asset digests: compares the tags the device reports against your button map and icon, and pushes
   only what changed.
-- `ACQUIRE` / `RELEASE`, driven by the app's own foreground state.
+- `ACQUIRE` / `RELEASE` as explicit calls — see "Screen ownership is not app
+  lifecycle" below.
+- An observable session state, including the one state with real UI attached
+  (`awaitingUserConfirmation` → "confirm on your reader").
+- Push gating: a push before the screen is owned throws instead of vanishing.
+- The content-id staleness filter, so a button press for an article you have
+  since replaced is dropped rather than acted on.
 - The START/CHUNK/END framer, with `sessionId` on every packet.
 - Button-event decoding, filtered to your session.
 - Image plumbing — chunking, progress, and the device's decode result.

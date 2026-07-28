@@ -135,6 +135,10 @@ struct PendingPairing {
 };
 PendingPairing g_pendingPairing;
 
+// Defined with the reassembly state below; needed here because a foreground
+// handover has to drop whatever the outgoing session had in flight.
+void resetReassembly();
+
 Session* sessionById(uint8_t id) {
   if (id == kNoSession || id > kMaxSessions) return nullptr;
   Session& session = g_sessions[id - 1];
@@ -217,6 +221,11 @@ void notifyAssetAck(uint8_t sessionId, uint8_t assetId, companionpeer::AssetStor
 void setForeground(uint8_t sessionId) {
   if (g_foreground == sessionId) return;
   if (sessionById(g_foreground) != nullptr) notifyBackground(g_foreground, BackgroundReason::Preempted);
+  // A transfer in flight belonged to the session that just lost the screen. Its
+  // remaining CHUNKs will be dropped by the sessionId check anyway, so keeping
+  // the partial field would only leave the buffer (or a half-written staged
+  // image) lying around until the next START.
+  resetReassembly();
   g_foreground = sessionId;
 
   const Session* session = sessionById(sessionId);
@@ -639,9 +648,11 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
 class StatusCharCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo& /*connInfo*/) override {
     const NimBLEAttValue& value = characteristic->getValue();
-    if (value.size() < 2) return;
-    if (value.data()[0] != g_foreground) return;  // not the app that owns the screen
-    if (g_statusCb) g_statusCb(value.data()[1]);
+    if (value.size() < 3) return;
+    const uint8_t* data = value.data();
+    if (data[0] != g_foreground) return;  // not the app that owns the screen
+    if (data[1] >= kMaxIndicators) return;
+    if (g_statusCb) g_statusCb(data[1], data[2]);
   }
 };
 

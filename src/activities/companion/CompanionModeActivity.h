@@ -44,10 +44,16 @@ class CompanionModeActivity final : public Activity {
 
   bool connected = false;
   bool haveContent = false;
-  bool readLaterSaved = false;  // toggled by the Status characteristic's READ_LATER_SAVED write
+
+  // Indicator slots set by the foreground app over the Status characteristic.
+  // The device draws a mark per slot and knows nothing about what any of them
+  // mean — "saved", "playing", "unread" are all phone-side semantics. Not reset
+  // by a content push: when an indicator should clear is app meaning too.
+  uint8_t indicators[companionble::kMaxIndicators] = {0};
+
   // Set when a Status write lands, so the next renderPage() flips the E-ink
   // panel with FAST_REFRESH regardless of the normal per-page-turn refresh
-  // cadence (pagesUntilFullRefresh) — the icon flip should never trigger a
+  // cadence (pagesUntilFullRefresh) — an indicator flip should never trigger a
   // full flashing refresh.
   bool forceFastRefreshNextRender = false;
 
@@ -122,7 +128,7 @@ class CompanionModeActivity final : public Activity {
   void renderStartFailed();
   void renderPage();
   void renderImage();
-  void renderReadLaterIcon(int x, int y) const;
+  void renderIndicators(int rightEdgeX, int centerY) const;
   void checkIdleTimers();
 
  public:

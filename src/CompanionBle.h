@@ -121,9 +121,19 @@ enum class ButtonEventType : uint8_t {
   ButtonPress = 0x01,
 };
 
-// Status characteristic values, phone -> device.
-enum class StatusEvent : uint8_t {
-  ReadLaterSaved = 0x01,
+// Indicator slots the Status characteristic can set. The device draws a small
+// mark per slot and has NO idea what any of them mean — "saved", "playing",
+// "unread" are all phone-side semantics. This deliberately replaces v5's named
+// READ_LATER_SAVED, which baked one app's vocabulary into firmware: the device
+// stores and renders what an app declared, forwards raw events, and interprets
+// nothing.
+inline constexpr uint8_t kMaxIndicators = 4;
+
+// Indicator states, phone -> device. Deliberately visual, not semantic.
+enum class IndicatorState : uint8_t {
+  Hidden = 0x00,
+  Outline = 0x01,
+  Filled = 0x02,
 };
 
 // Content characteristic field identifiers, matching docs/companion-display-protocol.md.
@@ -229,9 +239,11 @@ void resolvePairing(bool accept, bool timedOut = false);
 using ContentFieldCallback = void (*)(uint8_t field, const uint8_t* data, size_t len, bool final);
 void setContentFieldCallback(ContentFieldCallback cb);
 
-// Callback for a Status characteristic write from the foreground session. Same
-// task-boundary rules as ContentFieldCallback.
-using StatusCallback = void (*)(uint8_t status);
+// Callback for a Status characteristic write from the foreground session: set
+// indicator slot `indicatorId` to `state`. Same task-boundary rules as
+// ContentFieldCallback. Indicators are NOT reset by a subsequent content push —
+// when one should clear is app meaning, and the app is the one that knows.
+using StatusCallback = void (*)(uint8_t indicatorId, uint8_t state);
 void setStatusCallback(StatusCallback cb);
 
 // An unknown peer (or one with a bad token) wants to pair. The activity shows a

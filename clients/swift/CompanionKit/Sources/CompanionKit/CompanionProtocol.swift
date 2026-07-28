@@ -116,9 +116,18 @@ public enum ImageResult: UInt8, Sendable {
     init(wire: UInt8) { self = ImageResult(rawValue: wire) ?? .unknown }
 }
 
-/// Status characteristic values, phone -> device.
-public enum CompanionStatus: UInt8, Sendable {
-    case readLaterSaved = 0x01
+/// How an indicator slot is drawn. Deliberately visual, not semantic: the device
+/// knows "slot 2 is filled" and nothing else. "Saved", "playing", "unread" are
+/// your app's vocabulary — map them onto slots yourself.
+public enum IndicatorState: UInt8, Sendable {
+    case hidden = 0x00
+    case outline = 0x01
+    case filled = 0x02
+}
+
+/// Indicator slots the device draws along the right edge of the title row.
+public enum CompanionIndicator {
+    public static let count = 4
 }
 
 /// Raw physical buttons. These mirror the firmware's own HAL indices; they are
@@ -155,6 +164,10 @@ public enum CompanionError: Error, Sendable {
     case bluetoothUnavailable
     case notConnected
     case noSession
+    /// A push was attempted before the session owned the screen. The device
+    /// would have dropped those frames with no diagnostic, so this fails loudly
+    /// instead of letting the app watch a blank reader.
+    case noScreen
     /// The device advertised a protocol version this package does not speak.
     case unsupportedProtocolVersion(UInt8)
     case malformedCapabilities

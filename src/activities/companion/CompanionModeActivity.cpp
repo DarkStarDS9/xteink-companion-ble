@@ -27,9 +27,12 @@ namespace {
 constexpr int kCompanionFontId = NOTOSANS_14_FONT_ID;       // body
 constexpr int kCompanionTitleFontId = NOTOSANS_16_FONT_ID;  // title: larger + bold
 
-// Width reserved at the title line's right edge for the read-later star icon
-// — shared by the title-wrap width budget and the icon's own x position.
-constexpr int kReadLaterIconAreaWidth = 24;
+// Width reserved at the title line's right edge for the app's indicator slots —
+// shared by the title-wrap width budget and the slots' own x positions.
+constexpr int kIndicatorSlotSize = 12;
+constexpr int kIndicatorSlotGap = 6;
+constexpr int kIndicatorAreaWidth =
+    companionble::kMaxIndicators * (kIndicatorSlotSize + kIndicatorSlotGap) + kIndicatorSlotGap;
 
 // Title wraps onto at most this many lines before falling back to
 // ellipsis-truncating the last line (see wrapTitleToLines()).
@@ -61,7 +64,8 @@ volatile bool g_pendingTitleReady = false;
 uint8_t g_pendingBodyBuf[companionble::kMaxFieldLen];
 uint16_t g_pendingBodyLen = 0;
 volatile bool g_pendingBodyReady = false;
-uint8_t g_pendingStatusValue = 0;
+uint8_t g_pendingIndicatorId = 0;
+uint8_t g_pendingIndicatorState = 0;
 volatile bool g_pendingStatusReady = false;
 
 // Foreground handover and pairing requests are also host-task events. Paths and
@@ -110,9 +114,10 @@ void onContentField(uint8_t field, const uint8_t* data, size_t len, bool final) 
   portEXIT_CRITICAL(&g_mux);
 }
 
-void onStatus(uint8_t status) {
+void onStatus(uint8_t indicatorId, uint8_t state) {
   portENTER_CRITICAL(&g_mux);
-  g_pendingStatusValue = status;
+  g_pendingIndicatorId = indicatorId;
+  g_pendingIndicatorState = state;
   g_pendingStatusReady = true;
   portEXIT_CRITICAL(&g_mux);
 }
@@ -145,7 +150,7 @@ void CompanionModeActivity::onEnter() {
   Activity::onEnter();
   connected = false;
   haveContent = false;
-  readLaterSaved = false;
+  memset(indicators, 0, sizeof(indicators));
   forceFastRefreshNextRender = false;
   currentPage = 0;
   totalPages = 0;
@@ -291,7 +296,7 @@ void CompanionModeActivity::updateTitleLayout() {
 }
 
 std::vector<std::string> CompanionModeActivity::wrapTitleToLines(const std::string& text) const {
-  const int maxWidth = viewportWidth - kReadLaterIconAreaWidth;
+  const int maxWidth = viewportWidth - kIndicatorAreaWidth;
   std::vector<std::string> lines;
   std::string remaining = text;
 
@@ -459,7 +464,9 @@ void CompanionModeActivity::applyForegroundChange() {
     totalPages = 0;
     currentPage = 0;
     haveContent = false;
-    readLaterSaved = false;
+    // A different app owns the screen now: its indicators start clear, since
+    // they carry the previous app's meaning, not this one's.
+    memset(indicators, 0, sizeof(indicators));
     displayedImagePath.clear();
     updateTitleLayout();
     screen = Screen::Text;
@@ -539,7 +546,8 @@ void CompanionModeActivity::loop() {
   bool gotImage = false;
   std::string newTitle;
   std::string newBody;
-  uint8_t newStatus = 0;
+  uint8_t newIndicatorId = 0;
+  uint8_t newIndicatorState = 0;
   char newForegroundKey[companionpeer::kPeerKeyLen] = {0};
   char newForegroundName[companionpeer::kMaxNameLen + 1] = {0};
   char newPairingName[companionpeer::kMaxNameLen + 1] = {0};
@@ -572,7 +580,8 @@ void CompanionModeActivity::loop() {
     g_pendingBatchStartMs = 0;
   }
   if (g_pendingStatusReady) {
-    newStatus = g_pendingStatusValue;
+    newIndicatorId = g_pendingIndicatorId;
+    newIndicatorState = g_pendingIndicatorState;
     g_pendingStatusReady = false;
     gotStatus = true;
   }
@@ -627,7 +636,6 @@ void CompanionModeActivity::loop() {
       body = newBody;
       paginate();
       haveContent = true;
-      readLaterSaved = false;  // new article: reset any previous save-state indicator
     }
     // Text replaces an image, and vice versa. There is no compositing and no
     // mode to enter: the last completed push owns the screen.
@@ -636,9 +644,9 @@ void CompanionModeActivity::loop() {
     requestUpdate();
   }
 
-  if (gotStatus && newStatus == static_cast<uint8_t>(companionble::StatusEvent::ReadLaterSaved)) {
+  if (gotStatus && newIndicatorId < companionble::kMaxIndicators) {
     RenderLock lock;
-    readLaterSaved = true;
+    indicators[newIndicatorId] = newIndicatorState;
     forceFastRefreshNextRender = true;
     requestUpdate();
   }
@@ -927,31 +935,25 @@ void CompanionModeActivity::renderImage() {
   companionble::notifyImageStatus(companionble::ImageResult::Displayed);
 }
 
-void CompanionModeActivity::renderReadLaterIcon(int x, int y) const {
-  // Small hand-drawn 5-point star (the built-in font has no U+2605/U+2606 star
-  // glyphs). Filled when readLaterSaved, outline otherwise.
-  constexpr int kPoints = 10;
-  constexpr float kOuterR = 8.0f;
-  constexpr float kInnerR = 3.2f;
-  constexpr float kStepRad = 0.6283185307f;    // 2*PI/10 = 36 degrees
-  constexpr float kStartRad = -1.5707963268f;  // -90 degrees: first point straight up
-
-  int xs[kPoints];
-  int ys[kPoints];
-  for (int i = 0; i < kPoints; ++i) {
-    const float angle = kStartRad + static_cast<float>(i) * kStepRad;
-    const float r = (i % 2 == 0) ? kOuterR : kInnerR;
-    xs[i] = x + static_cast<int>(std::lround(r * std::cos(angle)));
-    ys[i] = y + static_cast<int>(std::lround(r * std::sin(angle)));
-  }
-
-  if (readLaterSaved) {
-    renderer.fillPolygon(xs, ys, kPoints, true);
-  } else {
-    for (int i = 0; i < kPoints; ++i) {
-      const int next = (i + 1) % kPoints;
-      renderer.drawLine(xs[i], ys[i], xs[next], ys[next], true);
+// Draws the foreground app's indicator slots: an outline or filled mark per
+// slot. Deliberately a neutral shape rather than the v5 star — a star reads as
+// "favourite", which is exactly the app-level meaning the firmware is not
+// allowed to hold. The app decides what each slot means and when it lights.
+void CompanionModeActivity::renderIndicators(int rightEdgeX, int centerY) const {
+  int x = rightEdgeX - kIndicatorSlotSize;
+  const int y = centerY - kIndicatorSlotSize / 2;
+  for (int slot = companionble::kMaxIndicators - 1; slot >= 0; --slot) {
+    switch (static_cast<companionble::IndicatorState>(indicators[slot])) {
+      case companionble::IndicatorState::Filled:
+        renderer.fillRect(x, y, kIndicatorSlotSize, kIndicatorSlotSize, true);
+        break;
+      case companionble::IndicatorState::Outline:
+        renderer.drawRect(x, y, kIndicatorSlotSize, kIndicatorSlotSize, true);
+        break;
+      case companionble::IndicatorState::Hidden:
+        break;  // nothing drawn, and the slot still holds its place in the row
     }
+    x -= kIndicatorSlotSize + kIndicatorSlotGap;
   }
 }
 
@@ -966,8 +968,7 @@ void CompanionModeActivity::renderPage() {
     titleY += titleLineHeight;
   }
 
-  renderReadLaterIcon(cachedOrientedMarginLeft + viewportWidth - kReadLaterIconAreaWidth / 2,
-                      cachedOrientedMarginTop + titleLineHeight / 2);
+  renderIndicators(cachedOrientedMarginLeft + viewportWidth, cachedOrientedMarginTop + titleLineHeight / 2);
 
   const int lineHeight = renderer.getLineHeight(cachedFontId);
   int y = cachedOrientedMarginTop + cachedTitleBlockHeight;
@@ -1021,7 +1022,7 @@ void CompanionModeActivity::renderPage() {
   }
 
   if (forceFastRefreshNextRender) {
-    // Status-triggered redraw (read-later icon flip): always no-flash,
+    // Status-triggered redraw (an indicator flip): always no-flash,
     // independent of the periodic full-refresh cadence below.
     forceFastRefreshNextRender = false;
     renderer.displayBuffer(HalDisplay::FAST_REFRESH);

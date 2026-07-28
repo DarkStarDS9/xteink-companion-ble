@@ -11,23 +11,49 @@ public struct CompanionDevice: Identifiable, Equatable, @unchecked Sendable {
     public static func == (lhs: CompanionDevice, rhs: CompanionDevice) -> Bool { lhs.id == rhs.id }
 }
 
+/// Where the client is in the session lifecycle. Poll ``CompanionClient/state``
+/// for a snapshot, or drive UI off the ``CompanionEvent/stateChanged`` events —
+/// `awaitingUserConfirmation` in particular has real UI attached ("confirm on
+/// your reader").
+public enum CompanionSessionState: Equatable, Sendable {
+    case disconnected
+    case connecting
+    /// Connected and capability read; the handshake is in flight.
+    case handshaking
+    /// The device is showing a pairing prompt. Tell the user to look at it.
+    case awaitingUserConfirmation
+    case denied(HelloDeniedReason)
+    /// Session established; assets are being reconciled.
+    case reconcilingAssets
+    /// Session established and assets current, but this session does not own the
+    /// screen. Pushes will throw ``CompanionError/noScreen``.
+    case idle
+    /// This session owns the screen. Pushes are legal.
+    case hasScreen
+}
+
 /// Everything the device tells the app, in one stream.
 public enum CompanionEvent: Sendable {
     case bluetoothStateChanged(isAvailable: Bool)
     case discovered(CompanionDevice)
+    case stateChanged(CompanionSessionState)
     /// Link is up and the capability characteristic has been read. The handshake
     /// starts automatically after this.
     case connected(CompanionCapabilities)
     /// The device is showing a pairing prompt. Tell the user to look at it.
     case pairingPending
     case pairingDenied(HelloDeniedReason)
+    /// The screen was granted — on the first `acquireScreen()` and again after
+    /// every preemption. **Re-push everything here**: the device retains nothing
+    /// for a session that was not foreground, and any push that was in flight
+    /// when the screen was lost was discarded.
+    case gainedScreen
     /// Handshake complete; assets are being synced and, if requested, the screen
     /// acquired. Content pushes are legal from here on but will be dropped until
     /// ``CompanionEvent/foreground`` arrives.
     case sessionEstablished(sessionId: UInt8)
     case assetSynced(field: CompanionField, result: AssetResult)
-    case foreground
-    case background(BackgroundReason)
+    case lostScreen(BackgroundReason)
     case acquireDenied(AcquireDeniedReason)
     case buttonEvent(CompanionButtonEvent)
     case imageStatus(ImageResult)
@@ -82,9 +108,10 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     private let identity: CompanionIdentity
     private let tokenStore: CompanionTokenStore
     private let assets: CompanionAssetProvider
-    /// Whether to `ACQUIRE` the screen as soon as a session exists. Mirrors the
-    /// app being in the foreground on the phone; see ``setForeground(_:)``.
-    private var wantsForeground = true
+    private let log: @Sendable (String) -> Void
+    /// Whether the handshake should end by asking for the screen. This is an
+    /// app-intent flag, never a lifecycle mirror — see ``acquireScreen()``.
+    private var wantsScreen: Bool
 
     // MARK: Bluetooth state
 
@@ -100,8 +127,13 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     private let lock = StateLock()
     private var capabilities: CompanionCapabilities?
     private var sessionId: UInt8 = CompanionProtocol.noSession
-    private var isForeground = false
+    private var ownsScreen = false
+    private var assetsReconciled = false
+    private var sessionState: CompanionSessionState = .disconnected
     private var helloTag: UInt16 = 0
+    /// The most recent content-id pushed on this session, for the staleness
+    /// filter — see ``CompanionButtonEvent`` delivery in ``handleButtonEvent``.
+    private var lastContentId: Data?
 
     /// Serializes every multi-packet operation. Two overlapping pushes would
     /// interleave their frames on one characteristic and reassemble as garbage —
@@ -120,12 +152,24 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
 
     // MARK: Lifecycle
 
+    /// - Parameters:
+    ///   - acquireScreenOnConnect: whether the handshake should end by asking for
+    ///     the screen. `true` suits an app that connects because it wants to
+    ///     display something. Pass `false` if the app connects for other reasons
+    ///     and will call ``acquireScreen()`` later; you can also change it at any
+    ///     time with ``acquireScreen()`` / ``releaseScreen()`` before connecting.
+    ///   - log: diagnostics sink. Defaults to dropping them — apps with their own
+    ///     event log should pass a closure rather than hunting in os_log.
     public init(identity: CompanionIdentity,
                 tokenStore: CompanionTokenStore = KeychainTokenStore(),
-                assets: CompanionAssetProvider) {
+                assets: CompanionAssetProvider,
+                acquireScreenOnConnect: Bool = true,
+                log: @escaping @Sendable (String) -> Void = { _ in }) {
         self.identity = identity
         self.tokenStore = tokenStore
         self.assets = assets
+        self.wantsScreen = acquireScreenOnConnect
+        self.log = log
 
         var continuation: AsyncStream<CompanionEvent>.Continuation!
         self.events = AsyncStream { continuation = $0 }
@@ -141,10 +185,22 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     }
 
     /// True while this session owns the screen. Content pushed at any other time
-    /// is silently dropped by the device.
+    /// is dropped by the device, so ``push(title:body:contentId:)`` throws rather
+    /// than let that happen silently.
+    ///
+    /// Named after the screen, not after a lifecycle: the protocol's "background"
+    /// and the phone OS's "app is backgrounded" are unrelated states, and an app
+    /// can be in either without the other.
     public var hasScreen: Bool {
         lock.lock(); defer { lock.unlock() }
-        return isForeground
+        return ownsScreen
+    }
+
+    /// Snapshot of the session lifecycle. Also delivered as
+    /// ``CompanionEvent/stateChanged`` for UI that wants to observe it.
+    public var state: CompanionSessionState {
+        lock.lock(); defer { lock.unlock() }
+        return sessionState
     }
 
     // MARK: Discovery
@@ -164,6 +220,7 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         peripheral = device.peripheral
         lock.unlock()
         device.peripheral.delegate = self
+        transition(to: .connecting)
         central.connect(device.peripheral, options: nil)
     }
 
@@ -174,22 +231,39 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         if let target { central.cancelPeripheralConnection(target) }
     }
 
-    /// Call with `true` when the app comes to the foreground on the phone and
-    /// `false` when it leaves. The device's policy is last-requester-wins, so
-    /// this is the only arbitration there is — and it is deliberately phone-side.
-    public func setForeground(_ wants: Bool) {
+    /// Ask for the screen.
+    ///
+    /// **Call this when your app wants the display, not when it comes to the
+    /// phone's foreground.** This package deliberately does not observe
+    /// `UIApplication` or `scenePhase`: an audio app playing in a pocket, a
+    /// navigation app, anything that keeps doing useful work while
+    /// OS-backgrounded should keep holding the screen, and wiring ownership to
+    /// the app lifecycle would break exactly that case.
+    ///
+    /// The device's policy is last-requester-wins, unconditionally. Safe to call
+    /// before connecting — it is remembered and applied after the handshake.
+    public func acquireScreen() {
         lock.lock()
-        wantsForeground = wants
+        wantsScreen = true
         let session = sessionId
-        let holding = isForeground
+        let holding = ownsScreen
         lock.unlock()
 
-        guard session != CompanionProtocol.noSession else { return }
-        if wants && !holding {
-            Task { try? await acquire() }
-        } else if !wants && holding {
-            writeSession(SessionCodec.encodeRelease(sessionId: session))
-        }
+        guard session != CompanionProtocol.noSession, !holding else { return }
+        Task { try? await acquire() }
+    }
+
+    /// Give up the screen. Call it when you no longer want the display — not
+    /// because the phone backgrounded your app. See ``acquireScreen()``.
+    public func releaseScreen() {
+        lock.lock()
+        wantsScreen = false
+        let session = sessionId
+        let holding = ownsScreen
+        lock.unlock()
+
+        guard session != CompanionProtocol.noSession, holding else { return }
+        writeSession(SessionCodec.encodeRelease(sessionId: session))
     }
 
     // MARK: Content
@@ -211,6 +285,7 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
 
         try await serialized { [self] in
             let session = try requireSession()
+            self.lock.lock(); self.lastContentId = contentId; self.lock.unlock()
             for (index, field) in fields.enumerated() {
                 try await sendField(field.0, payload: field.1,
                                     sessionId: session,
@@ -266,16 +341,23 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         }
     }
 
-    /// Acknowledges, to the device, that whatever the app decided a button press
-    /// meant has been durably saved. Flips the on-screen indicator.
-    public func sendStatus(_ status: CompanionStatus) {
+    /// Sets one of the device's indicator slots.
+    ///
+    /// The device draws a mark and knows nothing about what it means — "saved",
+    /// "playing", "unread" are your app's vocabulary, mapped onto a slot index.
+    /// Slots do **not** clear themselves when you push new content; set them to
+    /// ``IndicatorState/hidden`` yourself when they no longer apply.
+    public func setIndicator(_ slot: Int, _ state: IndicatorState) {
+        guard slot >= 0, slot < CompanionIndicator.count else { return }
         lock.lock()
         let session = sessionId
         let characteristic = statusChar
         let target = peripheral
         lock.unlock()
         guard session != CompanionProtocol.noSession, let characteristic, let target else { return }
-        target.writeValue(Data([session, status.rawValue]), for: characteristic, type: .withoutResponse)
+        target.writeValue(Data([session, UInt8(slot), state.rawValue]),
+                          for: characteristic,
+                          type: .withoutResponse)
     }
 
     // MARK: Handshake
@@ -293,6 +375,7 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     }
 
     private func handshake() async throws {
+        transition(to: .handshaking)
         guard let capabilities = deviceCapabilities else { throw CompanionError.malformedCapabilities }
         let deviceKey = capabilities.deviceIdHex
         let storedToken = tokenStore.token(forDeviceId: deviceKey)
@@ -310,6 +393,7 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
 
         guard case let .helloOK(_, session, token, assetTags) = reply else {
             if case let .helloDenied(_, reason) = reply {
+                log("pairing denied: \(reason)")
                 // A denied token is the interesting case: the device forgot us
                 // (peer directory deleted, or evicted). Drop it so the next
                 // attempt asks for a fresh pairing instead of re-presenting a
@@ -317,6 +401,7 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
                 if reason == .userRejected || reason == .timeout {
                     tokenStore.setToken(nil, forDeviceId: deviceKey)
                 }
+                transition(to: .denied(reason))
                 emit(.pairingDenied(reason))
                 throw CompanionError.pairingDenied(reason)
             }
@@ -324,12 +409,16 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         }
 
         tokenStore.setToken(token, forDeviceId: deviceKey)
-        lock.lock(); sessionId = session; lock.unlock()
+        lock.lock(); sessionId = session; assetsReconciled = false; lock.unlock()
         emit(.sessionEstablished(sessionId: session))
 
+        transition(to: .reconcilingAssets)
         try await syncAssets(reported: assetTags, capabilities: capabilities, sessionId: session)
+        lock.lock(); assetsReconciled = true; let wants = wantsScreen; lock.unlock()
+        transition(to: .idle)
 
-        lock.lock(); let wants = wantsForeground; lock.unlock()
+        // Only now is ACQUIRE legal: the device refuses it from a peer with no
+        // stored button map.
         if wants { try await acquire() }
     }
 
@@ -369,10 +458,21 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
 
     // MARK: Sending
 
-    private func requireSession() throws -> UInt8 {
+    /// The session id to stamp on outgoing frames, or a thrown error explaining
+    /// why the push would have gone nowhere.
+    ///
+    /// Both gates matter. The device silently drops a frame from a session that
+    /// does not own the screen, and it refuses `ACQUIRE` from a peer whose assets
+    /// have not landed — so an app that pushes a beat early gets a blank reader
+    /// and no diagnostic at all. Failing here turns that into a thrown error at
+    /// the call site.
+    private func requireSession(needsScreen: Bool = true) throws -> UInt8 {
         lock.lock(); defer { lock.unlock() }
         guard peripheral != nil, contentChar != nil else { throw CompanionError.notConnected }
         guard sessionId != CompanionProtocol.noSession else { throw CompanionError.noSession }
+        if needsScreen {
+            guard assetsReconciled, ownsScreen else { throw CompanionError.noScreen }
+        }
         return sessionId
     }
 
@@ -405,6 +505,8 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         }
     }
 
+    /// Assets are pushed *before* `ACQUIRE` is legal, so they deliberately skip
+    /// the screen-ownership gate in ``requireSession(needsScreen:)``.
     private func sendAsset(_ field: CompanionField, payload: Data, sessionId: UInt8) async throws -> AssetResult {
         try await withPendingAssetAck(field) {
             try await self.sendField(field, payload: payload, sessionId: sessionId, isFinal: false)
@@ -505,6 +607,16 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         eventContinuation?.yield(event)
     }
 
+    private func transition(to newState: CompanionSessionState) {
+        lock.lock()
+        let changed = sessionState != newState
+        sessionState = newState
+        lock.unlock()
+        guard changed else { return }
+        log("state -> \(newState)")
+        emit(.stateChanged(newState))
+    }
+
     // MARK: Session notification handling
 
     private func handleSessionMessage(_ message: SessionMessage) {
@@ -523,23 +635,35 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
 
         case let .helloPending(tag):
             guard tag == expectedTag else { return }
+            transition(to: .awaitingUserConfirmation)
             emit(.pairingPending)
 
         case let .foreground(session):
             guard session == currentSession else { return }
-            lock.lock(); isForeground = true; let pending = pendingAcquire; pendingAcquire = nil; lock.unlock()
+            lock.lock(); ownsScreen = true; let pending = pendingAcquire; pendingAcquire = nil; lock.unlock()
             pending?.resume(())
-            emit(.foreground)
+            transition(to: .hasScreen)
+            // Fires on the first grant and on every re-grant after preemption.
+            // The device retains nothing for a session that lost the screen, so
+            // this is always "push everything again", not just the first time.
+            emit(.gainedScreen)
 
         case let .background(session, reason):
             guard session == currentSession else { return }
-            lock.lock(); isForeground = false; lock.unlock()
-            emit(.background(reason))
+            // Deliberately does NOT re-acquire. Two apps that both auto-reacquire
+            // on preemption ping-pong the screen forever; last-requester-wins only
+            // works if the losing side accepts the loss. Whether to ask again is
+            // the app's call.
+            lock.lock(); ownsScreen = false; lastContentId = nil; lock.unlock()
+            log("lost the screen: \(reason)")
+            transition(to: .idle)
+            emit(.lostScreen(reason))
 
         case let .acquireDenied(session, reason):
             guard session == currentSession else { return }
             lock.lock(); let pending = pendingAcquire; pendingAcquire = nil; lock.unlock()
             pending?.fail(CompanionError.acquireDenied(reason))
+            log("ACQUIRE denied: \(reason)")
             emit(.acquireDenied(reason))
 
         case let .assetAck(session, assetId, result, _):
@@ -589,7 +713,9 @@ extension CompanionClient: CBCentralManagerDelegate {
                                error: Error?) {
         lock.lock()
         sessionId = CompanionProtocol.noSession
-        isForeground = false
+        ownsScreen = false
+        assetsReconciled = false
+        lastContentId = nil
         capabilities = nil
         contentChar = nil; buttonChar = nil; capabilityChar = nil; statusChar = nil; sessionChar = nil
         let writes = writeContinuations
@@ -598,6 +724,7 @@ extension CompanionClient: CBCentralManagerDelegate {
 
         writes.forEach { $0.resume(throwing: CompanionError.disconnected) }
         failPending(with: CompanionError.disconnected)
+        transition(to: .disconnected)
         emit(.disconnected(reason: error?.localizedDescription))
     }
 }
@@ -670,8 +797,20 @@ extension CompanionClient: CBPeripheralDelegate {
 
         case CompanionProtocol.buttonCharacteristicUUID:
             guard let event = CompanionButtonEvent(value) else { return }
-            lock.lock(); let session = sessionId; lock.unlock()
+            lock.lock()
+            let session = sessionId
+            let expectedContentId = lastContentId
+            lock.unlock()
             guard event.sessionId == session else { return }
+            // Staleness filter. The device echoes the content-id that was on
+            // screen when the button was pressed; if it is not the one we last
+            // pushed, the press was for content we have since replaced (a
+            // reconnect race, a fast skip) and acting on it would apply the
+            // user's intent to the wrong article.
+            if let expectedContentId, !event.contentId.isEmpty, event.contentId != expectedContentId {
+                log("dropping stale button event (content-id mismatch)")
+                return
+            }
             emit(.buttonEvent(event))
 
         default:

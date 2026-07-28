@@ -83,6 +83,15 @@ A **peer** is the pair `(appId, installId)` — one phone's copy of one app. All
 per-peer state on the device (auth token, button map, icon, staging files) is
 keyed by it.
 
+**Store `installId` somewhere that dies with the app, not somewhere that
+outlives it** — `UserDefaults` on iOS, not the Keychain. Keychain items survive
+app deletion, so a user who deletes and reinstalls would silently re-attach to
+the peer directory of an install that no longer exists, inheriting assets and a
+token it never pushed. A fresh install *should* become a fresh peer and re-pair;
+that is one prompt, once, and it is the honest outcome. (The pairing **token**
+is the opposite case and does belong in the Keychain: it is per-device, and
+losing it costs the user a prompt for no reason.)
+
 ### Session lifecycle
 
 ```
@@ -129,9 +138,54 @@ everything else is background.
   content would cost one reassembly buffer per session on a part with no room
   for a second one.)
 
-An app should `ACQUIRE` when it comes to the foreground on the phone and
-`RELEASE` when it goes to the background. `RELEASE` from a session that is not
-foreground is a no-op.
+#### `ACQUIRE` is asynchronous
+
+`ACQUIRE` is a request, not a state change. **Wait for the reply before pushing
+anything**; content sent between the request and the reply is dropped with no
+diagnostic.
+
+- Granted → `FOREGROUND` with your `sessionId`.
+- Refused → `ACQUIRE_DENIED` with a reason. Today the only recoverable one is
+  `NO_BUTTON_MAP`: push field `0x05`, then retry.
+
+A `FOREGROUND` notification is also how you learn you got the screen *back*
+after being preempted. The device retains nothing for a background session, so
+**every `FOREGROUND` means re-push everything you want on screen**, not just the
+first one.
+
+#### Screen ownership is app intent, not app lifecycle
+
+Do **not** wire `ACQUIRE`/`RELEASE` to the phone OS's foreground/background
+notifications. Owning the screen means "I want the display to be showing my
+content", which is a decision only the app can make:
+
+- A reader that is only useful while you are looking at your phone can
+  reasonably acquire and release with its own UI.
+- An audio app whose entire point is the phone in a pocket, playing, with the
+  article on the reader **should hold the screen while OS-backgrounded**.
+  Releasing there would break the feature at exactly the moment it matters.
+- A navigation app, a timer, anything that keeps doing useful work unattended:
+  same.
+
+`RELEASE` when you no longer want the display, and not before. `RELEASE` from a
+session that is not foreground is a no-op.
+
+> **Naming warning.** The protocol's `BACKGROUND` (this session no longer owns
+> the screen) and the phone OS's "app is backgrounded" are unrelated concepts
+> that will both want the name `isBackgrounded` in client code. They are not the
+> same state and an app can be in either without the other. Name the protocol
+> one after the screen — `hasScreen`, `screenState` — not after the lifecycle.
+
+#### Preemption mid-transfer
+
+If another session acquires the screen while you are partway through a
+multi-frame push, **the partial field is discarded** — the device drops its
+reassembly buffer (and deletes any partially staged image) at the moment of
+handover, and your remaining `CHUNK`s are dropped by the `sessionId` check.
+
+There is no separate notification for this: the `BACKGROUND` you receive *is*
+the signal. Treat any in-flight push as lost when `BACKGROUND` arrives, and
+re-push from the start on the next `FOREGROUND`.
 
 ### Handshake correlation (`helloTag`)
 
@@ -272,10 +326,15 @@ prefixed with its 4-byte tag. **The device performs no comparison and computes
 no hash** — it stores the bytes an app handed it and reads them back. Which
 asset is stale is the app's conclusion, not the firmware's.
 
-The tag is opaque, so a counter *works*, but **a content hash is
-recommended** — the first 4 bytes of a SHA-256 over the asset body is fine. A
-counter breaks on app downgrade, where the device holds a tag the older build
-will never produce again; a hash is correct in both directions.
+The tag is opaque, so a counter *works*, but **the recommended construction is
+the first 4 bytes of SHA-256 over the asset body** (the bytes after the tag, not
+including it). Every client in this repo uses exactly that, and an app that
+follows it gets correct behaviour without thinking about it.
+
+A counter breaks on app downgrade: the device holds a tag the older build will
+never produce again, so it never re-pushes and the user is left on a control
+scheme their app no longer implements. A content hash is correct in both
+directions.
 
 A tag of `00 00 00 00` on the wire means "no asset stored". Do not use it as a
 real tag value; if your hash lands on it, push anything else (e.g. flip the low
@@ -604,39 +663,64 @@ byte 21       max content-id length (32)
 byte 22       image grey levels (4)
 ```
 
-Read it before doing anything else. Byte 0 is the version gate: a client
-written against v6 should refuse to proceed against any other value rather than
-guess. The layout is **not** backward compatible with v5's 5-byte value —
-bytes 5.. did not exist there, and a v5 client reading bytes 0..4 would find
-version 6 and stop.
+### Readable before the handshake — a compatibility guarantee
+
+**This characteristic is unconditionally readable with no session.** It carries
+no per-app state, it is never gated on `HELLO`, and that will not change in any
+future revision. It is the one thing a client can rely on before it knows
+whether it can talk to the device at all.
+
+That makes it the graceful-degradation path across the v5 break, which is the
+whole reason to guarantee it. A v6 client should:
+
+1. Read the characteristic immediately after connecting.
+2. Check byte 0. If it is not 6, tell the user *"this reader's firmware is too
+   old for this version of <app>"* (or too new) and stop. Do not attempt the
+   handshake, and do not guess at the layout — v6's 23-byte value shares nothing
+   past byte 4 with v5's 5-byte one.
+
+The reverse direction fails quietly, and clients should know it: a **v5 client
+talking to a v6 device gets no error**. Its content writes are dropped (no
+session), its Session characteristic does not exist to it, and the screen simply
+never changes. There is no notification, because there is no session to notify.
+Version-check first; it is the only signal there is.
 
 Screen pixel dimensions (bytes 17..20) are orientation-corrected, i.e. exactly
 the pixel canvas an image push should target.
 
 ---
 
-## Status characteristic — acknowledgements from the phone
+## Status characteristic — indicator slots
 
-Phone → device. Two bytes in v6:
+Phone → device. Three bytes:
 
 ```
 byte 0:  sessionId
-byte 1:  status value
+byte 1:  indicatorId   (0..3)
+byte 2:  state         (0 hidden, 1 outline, 2 filled)
 ```
 
-```
-0x01  READ_LATER_SAVED
-```
+The device draws a small mark per slot along the right edge of the title row,
+and **has no idea what any of them mean.** "Saved", "playing", "unread",
+"synced" are all app vocabulary; the firmware knows only "slot 2 is filled".
 
-Sent by the client after it has durably saved whatever it interprets a
-button-press notification as meaning (e.g. "article queued for later" — a
-client-side decision, not a firmware one). The device flips its on-screen
-read-later indicator from outline to filled and redraws with a no-flash
-differential refresh. The indicator resets to outline whenever a new body is
-pushed — it reflects the currently-displayed article's save state, not a
-running total. Writes from a non-foreground session are ignored.
+This is the same principle as the button map: the app declares what exists, the
+device renders it, and interpretation stays on the phone. There is no
+`READ_LATER_SAVED` any more — see the v6 migration list.
 
----
+Notes:
+
+- **Indicators are not reset by a content push.** When an indicator should clear
+  is app meaning, and only the app knows it. Set it to `hidden` yourself. (v5's
+  read-later flag auto-cleared on a new body; that behaviour encoded one app's
+  article model into the firmware and is gone.)
+- They *are* cleared on a foreground handover, since they carry the outgoing
+  app's meaning and not the incoming one's.
+- Writes from a non-foreground session are ignored.
+- A change redraws with a no-flash differential refresh, never a full flash.
+- The mark is a deliberately neutral square rather than v5's star: a star reads
+  as "favourite", which is exactly the app-level meaning the device is not
+  allowed to hold.
 
 ## On-screen behaviour
 
@@ -689,7 +773,10 @@ Migration checklist for a v5 client:
    now 7 bytes, not 4.
 4. **Button-event payload gained a leading `sessionId` byte**; header and
    duration shifted by one, content-id now starts at byte 4.
-5. **Status characteristic writes are now 2 bytes** (`sessionId`, value), not 1.
+5. **The Status characteristic is now generic indicator slots**, 3 bytes
+   (`sessionId`, `indicatorId`, `state`), not a 1-byte `READ_LATER_SAVED`. Map
+   your own meaning onto a slot; the device holds none. Note that indicators no
+   longer auto-clear on a body push — clear them yourself.
 6. **Capability characteristic grew from 5 bytes to 23** with a new layout past
    byte 4.
 7. **Push a button map (field `0x05`) before `ACQUIRE`.** There is no default
@@ -698,13 +785,18 @@ Migration checklist for a v5 client:
    the sleep screen.
 9. New fields available: `0x04` image, `0x05` button map, `0x06` icon.
 10. `deviceId` and screen pixel dimensions are now readable from the capability
-    characteristic.
+    characteristic, which is guaranteed readable *before* the handshake — check
+    byte 0 and refuse a non-6 device with a real message, because a v6 device
+    ignores a v5 client silently.
+11. `ACQUIRE` is asynchronous — wait for `FOREGROUND`, and re-push everything on
+    every `FOREGROUND`, not just the first.
 
 Design decisions made during implementation, beyond
 `docs/companion-multi-app-design.md` §9: the `helloTag` correlation field, the
 `ACQUIRE_DENIED` / `ASSET_ACK` / `IMAGE_STATUS` notifications, `sessionId` on
-button events and Status writes, the uint32 START length, and the capability
-block's screen-pixel and content-id-cap entries. Each is recorded in place
+button events and Status writes, the uint32 START length, the capability block's
+screen-pixel and content-id-cap entries, and the replacement of the named
+`READ_LATER_SAVED` status byte with anonymous indicator slots. Each is recorded in place
 above with its rationale; §12 of the design doc records the resolutions of its
 open questions.
 
@@ -800,7 +892,9 @@ Content and sessions:
     `sessionId` and the pushed content-id.
 18. Push a *different* content-id and confirm a stale client-side comparison
     would reject the next press.
-19. Write Status `[sessionId, 0x01]` and confirm the star flips with no flash.
+19. Write Status `[sessionId, 0, 2]` and confirm indicator slot 0 fills with no
+    flash; `[sessionId, 0, 1]` for outline, `[sessionId, 0, 0]` to clear. Push a
+    new body afterwards and confirm the indicator does **not** reset itself.
 20. With two sessions live, push content from the background session: nothing on
     screen changes. `ACQUIRE` from it: the other session gets
     `BACKGROUND(PREEMPTED)` and the screen clears to the new session's content.

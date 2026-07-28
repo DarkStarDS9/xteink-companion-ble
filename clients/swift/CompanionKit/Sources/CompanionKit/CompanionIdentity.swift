@@ -9,6 +9,13 @@ import Foundation
 /// `installId` identifies this copy on this phone. It is generated randomly on
 /// first run and **must be persisted** — regenerating it makes a brand new peer
 /// on the device, which means a new pairing prompt and a fresh set of assets.
+///
+/// It is stored in `UserDefaults` rather than the Keychain, deliberately.
+/// Keychain items survive app deletion, so a delete-and-reinstall would silently
+/// re-attach to the peer directory of an install that no longer exists,
+/// inheriting assets and a token it never pushed. A fresh install *should* be a
+/// fresh peer. (The pairing token is the opposite case and does belong in the
+/// Keychain — see ``CompanionTokenStore``.)
 public struct CompanionIdentity: Equatable, Sendable {
     public let appId: Data
     public let installId: Data
@@ -74,6 +81,19 @@ extension UUID {
 public protocol CompanionTokenStore: AnyObject {
     func token(forDeviceId deviceId: String) -> Data?
     func setToken(_ token: Data?, forDeviceId deviceId: String)
+}
+
+public extension CompanionTokenStore {
+    /// Drops the stored token for one device, so the next connect goes through
+    /// the on-screen pairing prompt again. Backs a "forget this reader" control.
+    ///
+    /// Note this is only half of an unpairing: the device keeps its own peer
+    /// directory, and unpairing there is on-device only — the protocol has no
+    /// opcode for it. The user will be asked to confirm again, which is the
+    /// visible effect they expect.
+    func forget(deviceId: String) {
+        setToken(nil, forDeviceId: deviceId)
+    }
 }
 
 /// Keychain-backed storage. The default, and the right choice on iOS: it

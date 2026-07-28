@@ -323,8 +323,11 @@ class Session:
         print(f"  image: {IMAGE_RESULTS.get(result, result)}")
         return result
 
-    async def send_status(self, value: int) -> None:
-        await self.client.write_gatt_char(STATUS_CHAR_UUID, bytes([self.session_id, value]), response=True)
+    async def set_indicator(self, slot: int, state: int) -> None:
+        """Indicator slots are anonymous: the device draws a mark and knows nothing."""
+        await self.client.write_gatt_char(
+            STATUS_CHAR_UUID, bytes([self.session_id, slot, state]), response=True
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -455,9 +458,10 @@ async def run(args) -> None:
             await session.push_field(FIELD_CONTENT_ID, args.content_id.encode("utf-8")[:32], final=True)
             print("  Pushed.")
 
-        if args.read_later:
-            await session.send_status(0x01)
-            print("  Sent READ_LATER_SAVED.")
+        if args.indicator is not None:
+            slot, state = args.indicator
+            await session.set_indicator(slot, state)
+            print(f"  Set indicator slot {slot} to state {state}.")
 
         if args.listen:
             print("Listening for button events. Ctrl-C to stop.")
@@ -480,7 +484,14 @@ def main() -> None:
     parser.add_argument("--image-from", default=None, help="Dither this image here, then push it (needs Pillow)")
     parser.add_argument("--icon", default=None, help="Encode this image as the 1-bpp sleep-screen icon (needs Pillow)")
     parser.add_argument("--no-text", action="store_true", help="Handshake and push assets, but push no content")
-    parser.add_argument("--read-later", action="store_true", help="Send READ_LATER_SAVED after pushing")
+    parser.add_argument(
+        "--indicator",
+        nargs=2,
+        type=int,
+        metavar=("SLOT", "STATE"),
+        default=None,
+        help="Set indicator SLOT (0-3) to STATE (0 hidden, 1 outline, 2 filled) after pushing",
+    )
     parser.add_argument("--listen", action="store_true", help="Stay connected and print button events")
     parser.add_argument("--forget", action="store_true", help="Present no token, forcing a fresh pairing prompt")
     args = parser.parse_args()
