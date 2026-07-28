@@ -71,6 +71,9 @@ public enum HelloDeniedReason: UInt8, Sendable {
     case noSessionSlots = 0x02
     case malformed = 0x03
     case storage = 0x04
+    /// Another pairing prompt is already on the device's screen. Retry once the
+    /// user has dealt with it — this one is worth retrying, unlike a rejection.
+    case busy = 0x05
     case unknown = 0xFF
 
     init(wire: UInt8) { self = HelloDeniedReason(rawValue: wire) ?? .unknown }
