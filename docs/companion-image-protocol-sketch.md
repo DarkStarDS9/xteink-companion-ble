@@ -1,10 +1,17 @@
 # Companion Image Protocol — Design Sketch
 
-**STATUS: PROPOSAL — not implemented.** This is a design sketch for extending
-`docs/companion-display-protocol.md` (v5) with an image field, so a phone app
-can push a dithered photo to the screen instead of (or alongside) title/body
-text. Nothing here is wired up yet; treat every wire-format detail as a
-starting point for review, not a committed contract.
+**STATUS: superseded — adopted as field `0x04` in protocol v6.** The committed
+wire contract is `docs/companion-display-protocol.md` (see "Image field"); this
+sketch is kept for the reasoning that led there, not as a specification. Where
+the two differ, the protocol doc wins.
+
+Resolutions of this sketch's own open questions: staging goes to
+`peers/<peerKey>/data/` per peer (option (a), streamed, never a RAM buffer);
+there is no distinct "image mode" — the last completed push of either kind owns
+the screen; button hints come from the peer's declared button map; the length
+cap moved from uint16 to a uint32 START length; and a truncated staged file is
+discarded on disconnect rather than decoded. Outcome reporting, which this
+sketch did not have, is the `IMAGE_STATUS` notification.
 
 ## Motivating use case
 

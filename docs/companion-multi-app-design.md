@@ -1,8 +1,10 @@
 # Multi-App / Multi-Phone Companion Platform — Design
 
-**STATUS: DESIGN, not implemented.** This is the platform base that the Polaroid roadmap item
-(and everything after it) needs. It supersedes nothing yet — `docs/companion-display-protocol.md`
-v5 remains the shipped contract until this lands as v6.
+**STATUS: adopted as protocol v6.** This is the platform base the Polaroid roadmap item (and
+everything after it) needs. The authoritative wire contract is now
+`docs/companion-display-protocol.md` v6; this document is the reasoning behind it and stays the
+place to look for *why*, not *what*. Where the two differ, the protocol doc wins. §12 records how
+this design's open questions were closed and which wire decisions were added beyond §9.
 
 Everything here follows the fork's guiding principle: **dumb firmware, smart phone**. The device
 stores per-app state and renders what it is told; it never interprets what an app or a button
@@ -308,22 +310,49 @@ Called out explicitly so it does not get over-built. Nothing else here is for it
 Net new steady-state RAM: **under 1 KB.** No new large allocation, which is what §3 actually asks.
 The design deliberately pushes every per-app structure to SD for this reason.
 
-## 12. Open questions
+## 12. Open questions — resolved
 
-- **What is on screen when the foreground app disconnects?** Options: hold the last content, blank
-  with a "waiting for <app>" line, or go to the icon sleep screen. Leaning "hold last content, then
-  sleep screen on the existing idle timeout" — but this is UX, not protocol, and can be decided at
-  implementation.
-- **Icon dimensions.** 64×64 proposed; needs a look at the real sleep-screen layout and how many
-  tiles should fit.
-- **Token replay.** Accepted as a known limitation of the unencrypted-link decision (§5). If it
-  ever matters, LE Secure Connections replaces the token *without* changing the session layer — the
-  handshake shape is unchanged, only how trust is established. That is why §5 is isolated.
-- **Enrolled-peer ceiling.** Unbounded peer directories on SD are fine for space but the sleep-screen
-  grid needs a cap. Probably a display cap, not a storage cap.
-- **`upstream/feat-bluetooth` collision.** That branch adds a BLE *central* role. If it merges to
-  `develop` we get central + peripheral on one C3. Check its state before implementing §9 — see
-  `ROADMAP.md` § Watch.
+All five were closed during the v6 implementation. Resolutions below; the wire-visible ones are
+written up in `docs/companion-display-protocol.md`, which is authoritative.
+
+- **What is on screen when the foreground app disconnects?** **Resolved: hold the last content**,
+  then fall through to the sleep/icon screen on the existing 5-minute idle timeout. No blanking on
+  disconnect — a photo stays a photo and an article stays readable after the phone walks away, which
+  is the whole point of an e-ink second screen. Blanking would also make a brief BLE dropout look
+  like a device fault.
+- **Icon dimensions.** **Resolved: 64×64, 1-bpp, 512 bytes.** On the 800×480 panel that tiles as
+  6 × 3 = 18 with comfortable gutters, which is well past any plausible number of paired apps.
+- **Token replay.** **Resolved: accepted**, as §5 anticipated. Restated in the protocol doc as an
+  explicit "do not push anything confidential over this protocol" so it cannot be missed by a
+  client author.
+- **Enrolled-peer ceiling.** **Resolved: 32 stored peers, LRU-evicted by `lastSeenMs`; 18 drawn.**
+  A display cap alone is not enough — `peers.json` is parsed into RAM, so unbounded storage is an
+  unbounded allocation, which §11 forbids. 32 peers is ~2 KB of JSON.
+- **`upstream/feat-bluetooth` collision.** **Resolved: no collision today.** That branch has not
+  merged to `develop`; the fork carries no BLE central role. If it ever merges, the conflict is
+  NimBLE init/teardown ownership, not the session layer.
+
+### Wire decisions made during implementation, beyond §9
+
+Each is argued in place in the protocol doc; listed here so §9 is not read as complete.
+
+- **`helloTag`** — a 2-byte client nonce on `HELLO`, echoed on all three `HELLO_*` replies. Without
+  it, two apps handshaking concurrently on one link cannot tell whose `HELLO_OK` is whose: they have
+  no `sessionId` yet, and notifications reach both. Same class of problem as §9's argument for
+  `sessionId` on `CHUNK`.
+- **`ACQUIRE_DENIED` (0x86)** — §5 gates `ACQUIRE` on a stored button map but gave no way to say so.
+  A silent rejection would strand an app with no idea why nothing renders.
+- **`ASSET_ACK` (0x87) and `IMAGE_STATUS` (0x88)** — whether an asset stored and whether an image
+  decoded are the two outcomes a phone genuinely cannot reconstruct. Everything else about rendering
+  follows deterministically from what was pushed.
+- **START length widened to uint32.** §9 kept v5's uint16, which caps a push at 65,535 bytes — too
+  close to a real dithered 800×480 grayscale PNG for comfort. Two bytes per START, once per field,
+  removes the ceiling entirely; the actual cap is now `kMaxImageFieldLen` and SD space.
+- **`sessionId` on button events and Status writes.** §9 covered the content direction only.
+  Notifications are delivered to every app on the shared link, so the reverse direction has the same
+  ambiguity and needs the same tag.
+- **Capability block additions** — screen pixel dimensions (an image pusher must know the target
+  canvas), max content-id length, and grey-level count. The block is 23 bytes.
 
 ## 13. Sequencing
 
