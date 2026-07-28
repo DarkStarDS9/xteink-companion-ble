@@ -320,8 +320,9 @@ written up in `docs/companion-display-protocol.md`, which is authoritative.
   disconnect — a photo stays a photo and an article stays readable after the phone walks away, which
   is the whole point of an e-ink second screen. Blanking would also make a brief BLE dropout look
   like a device fault.
-- **Icon dimensions.** **Resolved: 64×64, 1-bpp, 512 bytes.** On the 800×480 panel that tiles as
-  6 × 3 = 18 with comfortable gutters, which is well past any plausible number of paired apps.
+- **Icon dimensions.** **Resolved: 64×64, 1-bpp, 512 bytes.** On the measured panel (528×792 — see
+  below) that tiles as 6 × 3 = 18 with comfortable gutters, which is well past any plausible number
+  of paired apps.
 - **Token replay.** **Resolved: accepted**, as §5 anticipated. Restated in the protocol doc as an
   explicit "do not push anything confidential over this protocol" so it cannot be missed by a
   client author.
@@ -346,13 +347,21 @@ Each is argued in place in the protocol doc; listed here so §9 is not read as c
   decoded are the two outcomes a phone genuinely cannot reconstruct. Everything else about rendering
   follows deterministically from what was pushed.
 - **START length widened to uint32.** §9 kept v5's uint16, which caps a push at 65,535 bytes — too
-  close to a real dithered 800×480 grayscale PNG for comfort. Two bytes per START, once per field,
+  close to a real dithered full-panel grayscale PNG for comfort. Two bytes per START, once per field,
   removes the ceiling entirely; the actual cap is now `kMaxImageFieldLen` and SD space.
 - **`sessionId` on button events and Status writes.** §9 covered the content direction only.
   Notifications are delivered to every app on the shared link, so the reverse direction has the same
   ambiguity and needs the same tag.
 - **Capability block additions** — screen pixel dimensions (an image pusher must know the target
   canvas), max content-id length, and grey-level count. The block is 23 bytes.
+
+### Panel size: measured, not assumed
+
+An X3 in Companion Mode reports **528 x 792** pixels with a **52,272-byte** framebuffer, read off
+the live renderer and confirmed against `display.getBufferSize()`. Several inherited notes in this
+repo (and this document's own first draft) say 800 x 480 / 48,000 bytes; that is wrong for this
+hardware. Nothing should hardcode either number — the capability characteristic carries the live
+value for exactly this reason.
 
 ## 13. Sequencing
 

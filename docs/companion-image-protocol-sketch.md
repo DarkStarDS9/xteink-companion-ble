@@ -95,8 +95,8 @@ were additive).
 
 Two options were considered:
 
-1. **Raw packed pixels** — 2 bits/pixel × 800×480 = 96,000 bytes (or 1
-   bit/pixel = 48,000 bytes if collapsed to true B/W), no decode step, but
+1. **Raw packed pixels** — 2 bits/pixel × the panel (measured 528×792 on a real
+   X3) = 104,544 bytes, no decode step, but
    too large for the `uint16` length field as 2bpp, and no compression at
    all — worse transfer time than the alternative for no code-size win, since
    a decoder already exists (next point).
@@ -104,7 +104,7 @@ Two options were considered:
    `PngToFramebufferConverter`** — reuses a decoder this firmware already
    ships and has running on real hardware for EPUB art, gets deflate
    compression for free, and fits comfortably under the `uint16` length cap
-   for a dithered 800×480 image (dithered images compress worse than photos
+   for a dithered full-panel image (dithered images compress worse than photos
    — budget isn't as low as JPEG, but well under raw).
 
 **Adopted: (2), at 2 bits per pixel rather than 8.** The sketch proposed 8-bit

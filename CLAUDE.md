@@ -29,7 +29,8 @@ deliberately replaced semantic button actions with raw button identity for this 
 
 ## Memory reality
 
-NimBLE costs ~63 KB on top of the 48 KB framebuffer, on a 380 KB no-PSRAM part. The budget is
+NimBLE costs ~63 KB on top of the ~51 KB framebuffer (52,272 bytes; the panel measures 528x792, not
+the 800x480 some inherited notes assume), on a 380 KB no-PSRAM part. The budget is
 tighter here than upstream's guide assumes. Any proposal involving a new buffer must say where the
 memory comes from — streaming to an SD scratch file is usually the answer.
 

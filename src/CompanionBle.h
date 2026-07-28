@@ -56,8 +56,8 @@ inline constexpr uint16_t kMaxFieldLen = 4096;
 // time rather than heap. That is the whole reason it can be this large on a
 // part with no room for a third big allocation — see the memory discussion in
 // docs/companion-image-protocol-sketch.md. Comfortably above a real dithered
-// 800x480 8-bit grayscale PNG, which is why v6 widened the START length field
-// from uint16 to uint32.
+// full-panel dithered grayscale PNG, which is why v6 widened the START length
+// field from uint16 to uint32.
 inline constexpr uint32_t kMaxImageFieldLen = 128 * 1024;
 
 // Sleep-screen icon dimensions, 1 bit per pixel. Advertised in the capability

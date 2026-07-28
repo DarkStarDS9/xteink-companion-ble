@@ -31,7 +31,8 @@ Applied consistently, this means:
 ## 3. The Hard Constraint
 
 ESP32-C3, single-core RISC-V, **~380 KB RAM, no PSRAM**. The budget is already largely committed:
-NimBLE ~63 KB, framebuffer 48 KB. There is no room for a third large allocation.
+NimBLE ~63 KB (measured), framebuffer ~51 KB (52,272 bytes for the measured 528x792 panel — not the
+48 KB some inherited notes assume). There is no room for a third large allocation.
 
 Every proposal must answer: **where does the memory come from?** "Stream it to SD" is usually the
 right answer — see the image-push design in [ROADMAP.md](ROADMAP.md), which streams BLE chunks to a

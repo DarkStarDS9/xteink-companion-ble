@@ -487,7 +487,7 @@ four times smaller:
 - **Smaller, and that is what decides whether a print transfers quickly.** A full
   panel at 2 bpp is 96,000 bytes before compression against 384,000 at 8 bpp, and
   dithered noise is close to incompressible, so the ratio largely survives
-  deflate. Measured on real dithered 480x800 prints: Atkinson 28.5 KB,
+  deflate. Measured on real dithered full-panel prints: Atkinson 28.5 KB,
   Floyd–Steinberg 34.9 KB, ordered Bayer 5.3 KB. At 8 bpp the error-diffusion
   cases are several times that, which is minutes of extra BLE transfer for no
   gain in fidelity.
@@ -496,7 +496,9 @@ The device validates bit depth in exactly one place and accepts 1/2/4/8 for
 grayscale; there is no second check to trip over.
 
 **Dimensions.** Encode at exactly the pixel size the capability characteristic
-advertises (bytes 17..20). The device centres the image and, if it is larger
+advertises (bytes 17..20). **Do not assume a panel size** — a measured X3 in
+Companion Mode reports **528 x 792**, not the 800 x 480 that older notes in this
+repo assume. That mismatch is exactly why these bytes exist; read them. The device centres the image and, if it is larger
 than the screen in either axis, scales it down to fit — which resamples and
 therefore *destroys the dither you carefully applied*. Smaller images are
 centred, not scaled up. Rotation and cropping are the phone's job; the device

@@ -48,7 +48,8 @@ inline constexpr size_t kPeerKeyLen = 9;
 // evicted (directory and all) when a 33rd enrolls.
 inline constexpr size_t kMaxPeers = 32;
 
-// Most icon tiles the sleep screen draws (6 x 3 at 64x64 on an 800x480 panel).
+// Most icon tiles the sleep screen draws (6 x 3 at 64x64, which fits the
+// measured 528x792 panel with comfortable gutters).
 // A display cap, separate from kMaxPeers: more than this many paired apps is
 // implausible, and a grid that scrolls would need input the sleep screen does
 // not take.
