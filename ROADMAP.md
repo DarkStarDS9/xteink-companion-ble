@@ -36,6 +36,39 @@ protocol doc for the full field and framing definition.
 
 ## Planned
 
+### 0. Multi-app / multi-phone platform base — **prerequisite for item 1**
+
+**Consumer:** every app. This is the platform layer the "serves multiple consumer apps" framing
+above has been asserting without actually having.
+
+**Concept:** the device is paired with many phone:app peers, each with its own SD directory holding
+button labels, routing (on-device action vs. notify the phone), and a sleep-screen icon. Exactly one
+peer holds the screen at a time. Switching apps on the phone is a foreground handover, **not a
+firmware mode change** — same protocol, same activity, different data.
+
+**Why it's a prerequisite and not a nice-to-have:** a BLE peripheral gets one link per *phone*, not
+per app — when two apps on one phone connect, the OS shares a single connection and their content
+frames interleave into one reassembly buffer. There is no link-layer fix, so app identity has to be
+declared in-band. Building the Polaroid image push before this means building it a second time.
+
+**Decided:** many peers enrolled, one connected at a time (no NimBLE connection-count increase);
+app-level pairing token over an unencrypted link, no BLE bonding; pushed 1-bpp icons, decorative
+grid (not a launcher); clean break to protocol v6 with a mandatory handshake — **SpokenFeeds must
+ship a v6 update in lockstep with the firmware flash.**
+
+Button labels and per-button routing (on-device action vs. notify the phone) are declared at
+registration and gate screen access — an app cannot display anything without having said what its
+buttons do. They are versioned by an opaque per-asset tag the device stores and reports back on
+connect, so an app update ships a new control scheme without re-pairing. Icons ride the same
+mechanism.
+
+**Memory:** under 1 KB net new steady-state RAM. Every per-app structure lives on SD.
+
+**Full design:** [docs/companion-multi-app-design.md](docs/companion-multi-app-design.md) — includes
+the prior-art review the item below asks for.
+
+---
+
 ### 1. Image push — "Polaroid" camera companion
 
 **Consumer:** a new, separate iPhone camera app. Not SpokenFeeds. This is explicitly a fork-only
@@ -77,15 +110,17 @@ framebuffer on a no-PSRAM ESP32-C3.
 **Open:** on-device UI/mode design, "developing" indicator UX, photo orientation/crop,
 corrupt-transfer cleanup, exact size cap (needs real encoder output to tune).
 
-**Prerequisite — review prior art before designing the on-device UI.** Two CrossPoint forks already
-solved multi-mode selection on this hardware:
+**Prerequisite — item 0, phase A.** The device is **display-only** here: the phone captures and
+dithers, the device shows the result. Phase A brings the session layer, per-peer image staging, and
+the button map (which is mandatory at registration, so it is not separable). Only the sleep-screen
+icon grid can slip past this item.
 
-* [`0x1abin/crossmux`](https://github.com/0x1abin/crossmux) — apps hub with mini-games, tools, standby faces
-* [`zakerytclarke/crosspoint-reader-apps`](https://github.com/zakerytclarke/crosspoint-reader-apps) — app support framework
-
-Read how they handle mode entry, exit, and per-mode state before designing ours. Not a base to
-adopt (see [SCOPE.md §6](SCOPE.md)) — just the wheel that already exists. The same prior art applies
-to item 2's boot-path re-wiring.
+**Prior art — reviewed, done.** `0x1abin/crossmux` and `zakerytclarke/crosspoint-reader-apps` were
+read; verdict and what was taken from each is in
+[docs/companion-multi-app-design.md §14](docs/companion-multi-app-design.md). Short version: both
+register *on-device* apps at compile time and enter them by constructing an `Activity`, which cannot
+express an app paired at runtime from a phone. The registry record shape and the paginated icon grid
+transfer; the mechanism does not. The same conclusion applies to item 2's boot-path re-wiring.
 
 **Non-firmware, decided:** the camera app will be **source-available** (not "open source" — the
 mislabeling is what drew the HashiCorp/Elastic/Redis backlash), under an existing named license

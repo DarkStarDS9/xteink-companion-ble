@@ -40,8 +40,12 @@ the wire format. Consumer apps depend on it.
 
 - Changing framing, field ids, or the capability characteristic is a **breaking change** — bump the
   version and update the doc in the same commit.
-- Field ids live in [src/CompanionBle.h](src/CompanionBle.h). `0x01` title, `0x02` body,
-  `0x03` content-id. Next free: `0x04`.
+- Field ids live in [src/CompanionBle.h](src/CompanionBle.h). Shipped: `0x01` title, `0x02` body,
+  `0x03` content-id. Reserved by design docs, not yet implemented: `0x04` image, `0x05` button map,
+  `0x06` icon. Next free: `0x07`.
+- The planned v6 shape — sessions, phone:app pairing, per-peer SD storage, button labels/routing —
+  is in [docs/companion-multi-app-design.md](docs/companion-multi-app-design.md). It is a **clean
+  break**: v6 requires a handshake, so shipped v5 clients stop working until updated.
 
 ## Upstream relationship
 
