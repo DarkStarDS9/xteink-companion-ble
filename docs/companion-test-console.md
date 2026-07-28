@@ -10,6 +10,14 @@ v6 protocol can be tested automatically instead of by hand.
 pio run -e test -t upload --upload-port /dev/cu.usbmodem21201
 ```
 
+**Put the shipping build back before the device returns to normal use.** The test
+build is fine to leave on a device being worked on, but it is not what an end
+user should be running:
+
+```bash
+pio run -t upload --upload-port /dev/cu.usbmodem21201
+```
+
 > **Status: the console itself is verified on hardware; the harness is not.**
 > Every command below has been exercised on a real X3 over USB serial. The
 > end-to-end harness that uses them alongside BLE has **never run**, because

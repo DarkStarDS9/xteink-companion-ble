@@ -129,10 +129,84 @@ reaches it.
 
 ## v6 bring-up log (2026-07-28)
 
-Protocol v6 (sessions, pairing tokens, per-peer SD storage, button map, icons,
-image push) implemented and flashed to a real X3. `docs/companion-display-protocol.md`
-is authoritative for the wire format; this section records only what has and has
-not been observed on hardware.
+**If you are picking this up cold, read this section first.** It is the single
+answer to "what has actually been proven on hardware?".
+
+### The one-paragraph answer
+
+Protocol v6 is **feature-complete and almost entirely unproven.** Every part of
+phases A, B and C is implemented — sessions, token pairing, per-peer SD storage,
+asset digests, the UI declaration, app-declared tags, the icon grid, image push —
+and **not one byte of it has crossed a BLE link.** No handshake, no content push,
+no image, no icon, no tag. What has been confirmed on a real X3 is: it boots into
+Companion Mode, it advertises, its capability block is byte-correct, its heap is
+stable, and its serial test console answers. That is all.
+
+The cause is environmental, not technical. macOS grants Bluetooth per
+*responsible process* and refuses it to anything running under tmux or an
+automation harness, so `scripts/companion_e2e_test.py` — which is written,
+covers eight groups, and would exercise nearly all of the above — has never run.
+Running it from Terminal.app is the single highest-value action available to
+this repository. See `docs/companion-test-console.md`.
+
+### Ranked risks, highest first
+
+1. **SD access from the NimBLE host task.** `HELLO` reads and writes
+   `peers.json` and the token file, and image CHUNKs append to SD, all on
+   NimBLE's host task rather than the main loop — a 4 KB stack. The paths are
+   shallow and this codebase already writes SD from the web-server task, but an
+   overflow would surface as a crash during pairing or mid-image, and nothing at
+   build time can see it. Watch serial for `Stack canary watchpoint`.
+2. **The image path has never executed.** Reading `TxtReaderActivity`'s
+   grayscale sequence already turned up one real bug in it — `renderImage()`
+   never displayed the black/white base before overlaying the grayscale planes,
+   so every print would have settled onto whatever was previously on the panel.
+   That fix is also unrun. Bisect with two independent encoders (see the
+   protocol doc's checklist item 23b) before suspecting either side.
+3. **Nothing has ever been drawn.** The icon grid's 1-bpp blit, the tag chips,
+   and the pairing prompt are all build-verified only. Row padding, bit order
+   and layout are written to the documented contract and have never been seen.
+
+### What *has* been confirmed on hardware
+
+- Boots straight into `CompanionModeActivity`; advertises with the service UUID
+  byte-verified in the payload (`start()=1 isAdvertising()=1`).
+- Capability block read back over serial and decoded by hand: 23 bytes, version
+  6, **528x792** panel, 64x64 icons, 128 KB image cap, 4 sessions. This is what
+  caught the panel-size error described below.
+- NimBLE costs 65,188 bytes (heap 124,168 -> 58,980 at server start), unchanged
+  by the session layer.
+- Free heap steady at ~50.7 KB with min-free ~49.6 KB over minutes idle. No
+  drift, no crash, across several reflashes.
+- The serial test console: `CPING`, `CSTATE`, `CPEERS`, `CCAP`, `CUI`, `CTAGS`,
+  `CBTN`, `CRESET` all answer correctly.
+- `display.getBufferSize()` = 52,272 bytes, confirming 528x792.
+
+### Budgets
+
+| | RAM | Flash |
+|---|---|---|
+| v5 baseline | 67,724 | 5,744,615 (87.7%) |
+| v6 `[env:default]` | 68,204 (**+480**) | 5,754,623 (87.8%) |
+| v6 `[env:test]` | 68,220 | 5,758,195 (87.9%) |
+
++480 B against the design's 1 KB net-new target. Everything per-peer lives on SD;
+the resident cost is the session table, the foreground peer's button map and its
+tags (162 B).
+
+### Device state
+
+**The device is currently running `[env:test]`**, which includes the serial test
+console. That is deliberate — the harness needs it. Before the reader goes back
+to normal use, put the shipping build back:
+
+```
+pio run -t upload --upload-port /dev/cu.usbmodem21201
+```
+
+---
+
+Everything below is the original bring-up detail.
 
 ### Observed on hardware
 

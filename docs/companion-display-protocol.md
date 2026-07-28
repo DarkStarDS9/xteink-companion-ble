@@ -37,6 +37,10 @@ this document disagree, the firmware is wrong.
 > end of this document — 36 items, all open — and
 > `docs/companion-test-console.md` for how to run them.
 >
+> **`docs/companion-mode-implementation-notes.md` § "v6 bring-up log" is the
+> single authoritative answer** to what has and has not been proven, with the
+> risks ranked and the measured budgets.
+>
 > **Treat every behaviour described here as specified-and-implemented, not
 > proven.** Highest-risk unproven areas: SD access from the NimBLE host task
 > during pairing and image staging (4 KB stack, a crash would look like a
@@ -553,13 +557,23 @@ four times smaller:
   values the subsequent `gray / 85` bucketing maps back to levels 0–3. There is
   no rounding anywhere on the round trip. Feeding 8-bit samples of the same four
   values is equally exact but says the same thing in four times the space.
-- **Smaller, and that is what decides whether a print transfers quickly.** A full
-  panel at 2 bpp is 96,000 bytes before compression against 384,000 at 8 bpp, and
-  dithered noise is close to incompressible, so the ratio largely survives
-  deflate. Measured on real dithered full-panel prints: Atkinson 28.5 KB,
-  Floyd–Steinberg 34.9 KB, ordered Bayer 5.3 KB. At 8 bpp the error-diffusion
-  cases are several times that, which is minutes of extra BLE transfer for no
-  gain in fidelity.
+- **Smaller — though by much less than the bit ratio suggests.** Raw, 2 bpp is
+  3.98x smaller (105,336 bytes against 418,968 for a full panel). After deflate
+  that mostly evaporates: an 8-bit buffer holding only four distinct values is
+  hugely redundant and deflate removes most of that on its own. Measured on real
+  dithered full-panel prints, same image, only depth changed:
+
+  | Dither | 2 bpp | 8 bpp | Saving |
+  |---|---|---|---|
+  | Atkinson | 31.8 KB | 38.6 KB | 17.6% |
+  | Floyd–Steinberg | 38.5 KB | 45.8 KB | 15.9% |
+  | Ordered Bayer | 5.9 KB | 13.0 KB | 54.4% |
+
+  So expect **16–18% for error diffusion**, and much better for ordered dither,
+  whose periodic pattern compresses well at both depths. 2 bpp is never larger,
+  and on a link this slow a sixth off every print is a sixth off the wait — but
+  it is not the 4x the raw ratio implies, and a client author should not plan
+  around one.
 
 The device validates bit depth in exactly one place and accepts 1/2/4/8 for
 grayscale; there is no second check to trip over.
