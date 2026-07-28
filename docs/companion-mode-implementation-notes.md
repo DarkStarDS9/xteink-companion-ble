@@ -185,6 +185,24 @@ carry real risk and have no build-time signal at all:
 3. **The icon grid's 1-bpp blit.** Row padding and MSB-first bit order are
    written to the documented contract but have never been drawn.
 
+### Rolling back to v5
+
+Flashing v6 disconnects any shipped v5 client until that client ships its v6
+update. The last v5 firmware commit is **`5688aec6`**, and it rebuilds from a
+clean tree:
+
+```
+git stash                       # if you have work in progress
+git checkout 5688aec6
+pio run -t upload --upload-port /dev/cu.usbmodem21201
+git checkout companion
+git stash pop
+```
+
+No prebuilt binary is kept in the repo — a 5.7 MB artifact in git for a
+two-minute rebuild is not a trade worth making, and a stale one is worse than
+none.
+
 ### Deliberately not carried forward from v5
 
 The v5 "Remaining before merging to master" list above is obsolete: its button
