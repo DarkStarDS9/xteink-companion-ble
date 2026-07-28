@@ -124,3 +124,70 @@ reaches it.
   side-UP/DOWN hint removal also need on-device visual confirmation — both
   were only exercised via `pio run` build-verification, not rendered on a
   real panel yet.
+
+---
+
+## v6 bring-up log (2026-07-28)
+
+Protocol v6 (sessions, pairing tokens, per-peer SD storage, button map, icons,
+image push) implemented and flashed to a real X3. `docs/companion-display-protocol.md`
+is authoritative for the wire format; this section records only what has and has
+not been observed on hardware.
+
+### Observed on hardware
+
+- Builds and flashes clean. RAM 68,188 B (20.8%, +464 B over the v5 baseline of
+  67,724), flash 5,758,937 B (87.9%, +14.3 KB). The +464 B is the session table
+  and the activity's new state, and is inside the design's 1 KB net-new target —
+  everything per-peer lives on SD.
+- Cold boot enters `CompanionModeActivity` directly and starts advertising:
+  `advertising: start()=1 isAdvertising()=1`, service UUID byte-verified in the
+  advertisement payload.
+- NimBLE cost measured again on this build: heap 124,168 → 58,980 at server
+  start, i.e. 65,188 bytes. Consistent with the 64,600 measured for v5 — the
+  session layer did not move it.
+- Free heap steady at 50,948 with min-free 50,932 over several minutes idle on
+  the waiting screen. No drift, no crash.
+
+### Not yet verified — needs a BLE central
+
+Everything below is build-verified only. The dev-machine pusher
+(`scripts/push_companion_content.py`, rewritten for v6) is the intended path and
+implements all of it, but macOS refused Bluetooth permission to the automation
+process that flashed this build, so nothing on the wire has been exercised. Run
+it from a terminal that has been granted Bluetooth access:
+
+```
+pip install bleak Pillow
+python scripts/push_companion_content.py            # pair, push text
+python scripts/push_companion_content.py --listen   # button events
+python scripts/push_companion_content.py --image-from photo.jpg
+python scripts/push_companion_content.py --icon icon.png --no-text
+python scripts/push_companion_content.py --forget   # force a fresh pairing prompt
+```
+
+The full list of what to check is the "Manual verification checklist" at the end
+of `docs/companion-display-protocol.md` — 36 items covering sessions, pairing,
+button-map gating, content, images, icons and power. In particular these three
+carry real risk and have no build-time signal at all:
+
+1. **SD access from the NimBLE host task.** `HELLO` reads/writes `peers.json`
+   and the token file, and image CHUNKs are appended to SD, all from NimBLE's
+   host task rather than the main loop. That task's stack is NimBLE-Arduino's
+   default 4 KB. The SD paths here are shallow (no recursion, JSON parsing is
+   heap-backed) and this codebase already writes SD from the web-server task,
+   but a stack overflow would show as a crash during pairing or mid-image, not
+   as anything a build catches. Watch for `Stack canary watchpoint` on serial.
+2. **Image decode path with `useDithering = false`.** The two-pass grayscale
+   settle re-decodes the staged PNG twice more via `ReaderUtils::renderAntiAliased`.
+   Confirm free heap during a push stays near its idle value — if it dips by
+   anything image-sized, something is buffering that should not be.
+3. **The icon grid's 1-bpp blit.** Row padding and MSB-first bit order are
+   written to the documented contract but have never been drawn.
+
+### Deliberately not carried forward from v5
+
+The v5 "Remaining before merging to master" list above is obsolete: its button
+mapping (side UP/DOWN → PREV/NEXT, `kSideUpMeansPrev`) was removed in v5 itself,
+and its remaining items were closed. The v6 button behaviour is not a firmware
+decision at all — it comes from the foreground app's pushed button map.

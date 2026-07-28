@@ -36,7 +36,7 @@ protocol doc for the full field and framing definition.
 
 ## Planned
 
-### 0. Multi-app / multi-phone platform base — **prerequisite for item 1**
+### 0. Multi-app / multi-phone platform base — **implemented, awaiting on-wire verification**
 
 **Consumer:** every app. This is the platform layer the "serves multiple consumer apps" framing
 above has been asserting without actually having.
