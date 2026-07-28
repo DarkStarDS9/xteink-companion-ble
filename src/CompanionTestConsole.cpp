@@ -31,6 +31,19 @@ struct VirtualPress {
 VirtualPress g_press;
 
 ScreenNameProvider g_screenNameProvider = nullptr;
+TagStateProvider g_tagStateProvider = nullptr;
+
+const char* tagStateName(uint8_t state) {
+  switch (static_cast<companionble::TagState>(state)) {
+    case companionble::TagState::Hidden:
+      return "hidden";
+    case companionble::TagState::Outline:
+      return "outline";
+    case companionble::TagState::Filled:
+      return "filled";
+  }
+  return "?";
+}
 
 void reply(const char* format, ...) {
   char buffer[192];
@@ -146,6 +159,8 @@ bool holdInProgress() { return g_press.active || g_press.releasePending; }
 
 void setScreenNameProvider(ScreenNameProvider provider) { g_screenNameProvider = provider; }
 
+void setTagStateProvider(TagStateProvider provider) { g_tagStateProvider = provider; }
+
 bool handleCommand(const String& command) {
   if (command == "CPING") {
     reply("pong v6");
@@ -177,6 +192,20 @@ bool handleCommand(const String& command) {
     const int buttonId = (space < 0 ? args : args.substring(0, space)).toInt();
     const unsigned long holdMs = space < 0 ? 0UL : static_cast<unsigned long>(args.substring(space + 1).toInt());
     injectButton(buttonId, holdMs);
+    return true;
+  }
+  if (command == "CTAGS") {
+    if (!g_tagStateProvider) {
+      reply("tags none: no provider");
+      return true;
+    }
+    TagReport report[companionble::kMaxTags];
+    const uint8_t count = g_tagStateProvider(report, companionble::kMaxTags);
+    reply("tags count=%u", static_cast<unsigned>(count));
+    for (uint8_t i = 0; i < count; ++i) {
+      reply("tag id=%u state=%s label=%s", static_cast<unsigned>(report[i].id), tagStateName(report[i].state),
+            report[i].label);
+    }
     return true;
   }
   if (command == "CUI") {

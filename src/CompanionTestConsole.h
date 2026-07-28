@@ -66,6 +66,20 @@ bool holdInProgress();
 using ScreenNameProvider = const char* (*)();
 void setScreenNameProvider(ScreenNameProvider provider);
 
+// One declared tag, as reported by CTAGS.
+struct TagReport {
+  uint8_t id;
+  uint8_t state;
+  char label[companionble::kMaxTagLabelLen + 1];
+};
+
+// Reports the foreground peer's live tag state. This is the one piece of
+// protocol state a BLE client genuinely cannot confirm for itself: the Status
+// characteristic is write-without-response, so nothing tells an app whether its
+// tag write landed. Reading it back over serial is how a test asserts it did.
+using TagStateProvider = uint8_t (*)(TagReport* out, uint8_t maxTags);
+void setTagStateProvider(TagStateProvider provider);
+
 }  // namespace companiontest
 
 #endif  // COMPANION_TEST_CONSOLE

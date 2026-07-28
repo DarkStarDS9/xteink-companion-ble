@@ -129,16 +129,26 @@ enum class ButtonEventType : uint8_t {
 // exactly as it declares button labels, and the device stores the strings and
 // draws them. Tag ids are per-peer, so two apps both using id 0 never collide.
 //
+// Identity and presentation are separate on the wire, and that separation is
+// load-bearing: a tag's id is what state refers to, and a label is only ever
+// drawn. App labels are localized — they change when the user switches phone
+// language, and can change from a server update with no app release — so a
+// design where state referenced label text would decide that switching to
+// German replaced every tag with a different one, and an article saved in
+// English would come back unsaved in German.
+//
 // This replaces v5's READ_LATER_SAVED, which baked one app's vocabulary into
 // firmware, and the numbered indicator slots that briefly replaced it, which
 // still made the firmware own the set.
 inline constexpr uint8_t kMaxTags = 6;
 
-// Longest tag label stored and drawn, in bytes. Tags are chips on one row
-// beside the title, so a long label would crowd out the title itself; a client
-// that sends more is truncated on a UTF-8 boundary. Sized with the RAM budget
-// in mind: kMaxTags * (kMaxTagLabelLen + 3) is the entire per-peer cost.
-inline constexpr size_t kMaxTagLabelLen = 12;
+// Longest tag label stored and drawn, in bytes. Matches the display-name cap,
+// and 24 bytes is what a localized label actually needs — German is the long
+// case among the languages consumer apps here ship, and "Später lesen" is 13
+// UTF-8 bytes on its own. A client that sends more is truncated on a UTF-8
+// boundary. Sized against the RAM budget: kMaxTags * (kMaxTagLabelLen + 3) is
+// the entire per-peer cost, resident only for the foreground peer.
+inline constexpr size_t kMaxTagLabelLen = 24;
 
 // How a declared tag is currently drawn. Visual, not semantic — what "on"
 // means is the app's business.

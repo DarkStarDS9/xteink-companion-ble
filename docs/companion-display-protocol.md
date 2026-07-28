@@ -331,6 +331,18 @@ prefixed with its 4-byte tag. **The device performs no comparison and computes
 no hash** — it stores the bytes an app handed it and reads them back. Which
 asset is stale is the app's conclusion, not the firmware's.
 
+**Assets may be re-pushed at any time during a session, not only at
+enrollment.** The digest block in `HELLO_OK` is where reconciliation usually
+starts, but nothing restricts a push to that moment: send a new UI declaration
+mid-session and the device stores it and redraws the hints and tag labels
+immediately. That matters because labels are localized — a user switching their
+phone to German should see German labels without reconnecting, and a
+server-driven label set can change with no app release. Do not build a one-shot
+declare-at-enrollment path.
+
+A re-pushed declaration changes **presentation only**. Tag state and button
+routing survive by id; nothing the user did is lost because the words changed.
+
 The tag is opaque, so a counter *works*, but **the recommended construction is
 the first 4 bytes of SHA-256 over the asset body** (the bytes after the tag, not
 including it). Every client in this repo uses exactly that, and an app that
@@ -527,6 +539,21 @@ device does not decide this for you, and it does not silently drop tags on the
 image screen either — the earlier behaviour, where tag state was accepted,
 acknowledged and then never drawn on an image, was a silent no-op and is gone.
 
+**A tag change alone does not re-develop the print.** Setting a tag while an
+image is displayed redraws only the chips, over the retained image, with a
+differential refresh. It does not re-decode or re-settle — that would cost
+seconds for a mark that moved.
+
+**On timing, if you want a "finished developing" mark.** A tag pushed *with* the
+image is drawn when the image is drawn, which is the *start* of the grayscale
+settle, not the end. If you want a mark that means "this print has finished
+resolving", set it with a standalone Status write after `IMAGE_STATUS(DISPLAYED)`
+arrives — that notification is sent after the settle completes, and the redraw it
+triggers is the cheap chips-only one described above. The device will not infer
+this for you: when a tag means "done" is your semantics, and a firmware that
+filled a mark because it decided that is what the app meant would be
+interpreting.
+
 ### UI declaration field (`0x05`)
 
 Everything the app declares about its own on-device UI: what its buttons do and
@@ -603,12 +630,23 @@ button labels, and the device stores the strings and renders them. This is the
 same three-part shape as buttons: the app declares the set, the device persists
 and draws it, and the runtime message carries only state.
 
+- **`tagId` is identity; the label is only ever drawn.** State updates reference
+  the id and never the text. This separation is load-bearing, not incidental:
+  labels are localized, so they change when the user switches phone language and
+  can change from a server update with no app release at all. A design where
+  state referenced label text would decide that switching to German had replaced
+  every tag with a different one, and an article saved in English would come back
+  unsaved in German. Change labels freely; identity and state are untouched.
 - **`tagId` is per-peer.** It means whatever the declaring app says it means, and
   two apps both using id `0` never collide, because each peer's declaration is
   its own. Ids need not be contiguous or start at zero.
-- Limits: **6 tags**, label **12 bytes** each. Longer labels are truncated on a
-  UTF-8 boundary; tags past the sixth are dropped. These are what bound the
-  device's per-peer RAM (90 bytes, resident only for the foreground peer).
+- **Labels are text, not emoji.** The device draws with a Latin font; an emoji
+  renders as tofu. Send the word and keep the glyph for your own surfaces.
+- Limits: **6 tags**, label **24 bytes** each — the same cap as the display name,
+  sized for localized labels rather than English ones ("Später lesen" is 13 bytes
+  before you start). Longer labels are truncated on a UTF-8 boundary; tags past
+  the sixth are dropped. These bound the device's per-peer RAM (162 bytes,
+  resident only for the foreground peer).
 - Every tag starts **hidden** when the declaration is loaded. Declaring a tag
   says it exists, not that it is on.
 - A tag id that was never declared is ignored wherever it appears. The

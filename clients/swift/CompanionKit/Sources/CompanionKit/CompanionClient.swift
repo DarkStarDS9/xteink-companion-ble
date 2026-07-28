@@ -821,6 +821,15 @@ extension CompanionClient: CBPeripheralDelegate {
             // pushed, the press was for content we have since replaced (a
             // reconnect race, a fast skip) and acting on it would apply the
             // user's intent to the wrong article.
+            //
+            // An *empty* echo is deliberately NOT treated as stale. It means the
+            // session has no content-id at all — the user pressed a button before
+            // the first push, or the app does not use content-ids. That is
+            // uncorrelated, not stale, and there is nothing wrong to act on. An
+            // app that pushes a content-id with every update will never see one
+            // once content is up, so the permissive reading costs it nothing;
+            // the strict reading would silently swallow every button press from
+            // an app that uses no content-ids at all.
             if let expectedContentId, !event.contentId.isEmpty, event.contentId != expectedContentId {
                 log("dropping stale button event (content-id mismatch)")
                 return

@@ -187,6 +187,9 @@ void CompanionModeActivity::onEnter() {
   companiontest::setScreenNameProvider([]() -> const char* {
     return g_screenNameActivity ? g_screenNameActivity->screenName() : "none";
   });
+  companiontest::setTagStateProvider([](companiontest::TagReport* out, uint8_t maxTags) -> uint8_t {
+    return g_screenNameActivity ? g_screenNameActivity->reportTags(out, maxTags) : 0;
+  });
 #endif
 
   if (!companionble::ensureStarted(renderer, cachedFontId)) {
@@ -210,6 +213,7 @@ void CompanionModeActivity::onExit() {
   companionble::setImageStagedCallback(nullptr);
 #ifdef COMPANION_TEST_CONSOLE
   companiontest::setScreenNameProvider(nullptr);
+  companiontest::setTagStateProvider(nullptr);
   g_screenNameActivity = nullptr;
 #endif
   companionble::stop();
@@ -241,6 +245,20 @@ void CompanionModeActivity::clearUiDeclaration() {
 // on every foreground handover and whenever that peer pushes a new map, so an
 // app update changes the buttons without a re-pair and without a firmware mode.
 void CompanionModeActivity::loadUiDeclaration() {
+  // A declaration can be re-pushed mid-session — most often because the user
+  // switched phone language, since labels are localized and can even be
+  // server-driven. That must change presentation only: an article the user
+  // saved in English is still saved in German. So tag *state* is carried across
+  // the reload by id, which is exactly why id and label are separate things on
+  // the wire.
+  uint8_t previousIds[companionble::kMaxTags];
+  uint8_t previousStates[companionble::kMaxTags];
+  const uint8_t previousCount = tagCount;
+  for (uint8_t i = 0; i < previousCount; ++i) {
+    previousIds[i] = tags[i].id;
+    previousStates[i] = tags[i].state;
+  }
+
   clearUiDeclaration();
   if (foregroundPeerKey.empty()) return;
 
@@ -289,6 +307,17 @@ void CompanionModeActivity::loadUiDeclaration() {
       tag.label[copy] = '\0';
     }
     offset += labelLen;
+  }
+
+  // Restore state for every tag that still exists. A tag the new declaration
+  // dropped simply goes away; one it added starts hidden.
+  for (uint8_t i = 0; i < tagCount; ++i) {
+    for (uint8_t j = 0; j < previousCount; ++j) {
+      if (tags[i].id == previousIds[j]) {
+        tags[i].state = previousStates[j];
+        break;
+      }
+    }
   }
   measureTagRow();
 }
@@ -745,7 +774,10 @@ void CompanionModeActivity::loop() {
     // previous content's tags.
     RenderLock lock;
     applyTagState(newTagStateBuf, newTagStateLen);
-    if (!commit) forceFastRefreshNextRender = true;
+    if (!commit) {
+      forceFastRefreshNextRender = true;
+      if (screen == Screen::Image) tagOnlyRedraw = true;
+    }
     requestUpdate();
   }
 
@@ -754,6 +786,11 @@ void CompanionModeActivity::loop() {
     setTagState(newTagId, newTagStateValue);
     measureTagRow();
     forceFastRefreshNextRender = true;
+    // A tag change while a print is on screen must not re-develop the print:
+    // re-decoding and re-settling costs several seconds for a chip that moved.
+    // The framebuffer still holds the image (renderAntiAliased restores the BW
+    // buffer), so the chips can be redrawn over it directly.
+    if (screen == Screen::Image) tagOnlyRedraw = true;
     requestUpdate();
   }
 
@@ -873,6 +910,18 @@ unsigned long CompanionModeActivity::buttonHeldTime(companionble::ButtonId id) c
   return mappedInput.getHeldTime();
 }
 
+#ifdef COMPANION_TEST_CONSOLE
+uint8_t CompanionModeActivity::reportTags(companiontest::TagReport* out, uint8_t maxTags) const {
+  const uint8_t count = tagCount < maxTags ? tagCount : maxTags;
+  for (uint8_t i = 0; i < count; ++i) {
+    out[i].id = tags[i].id;
+    out[i].state = tags[i].state;
+    snprintf(out[i].label, sizeof(out[i].label), "%s", tags[i].label);
+  }
+  return count;
+}
+#endif
+
 const char* CompanionModeActivity::screenName() const {
   switch (screen) {
     case Screen::StartFailed:
@@ -942,6 +991,19 @@ void CompanionModeActivity::notifyHeldButton(companionble::ButtonId button) {
 // ---------------------------------------------------------------------------
 
 void CompanionModeActivity::render(RenderLock&&) {
+  // Tag-only change over a displayed print: the framebuffer still holds the
+  // image, so redraw just the chips and flip with a differential refresh
+  // instead of re-decoding and re-settling a photo for a moved mark.
+  if (tagOnlyRedraw && screen == Screen::Image && !displayedImagePath.empty()) {
+    tagOnlyRedraw = false;
+    forceFastRefreshNextRender = false;
+    const int lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
+    renderTags(renderer.getScreenWidth() - cachedOrientedMarginRight, cachedOrientedMarginTop + lineHeight);
+    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+    return;
+  }
+  tagOnlyRedraw = false;
+
   renderer.clearScreen();
   switch (screen) {
     case Screen::StartFailed:

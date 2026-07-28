@@ -55,6 +55,7 @@ so a host can pick replies out of the log stream without parsing timestamps.
 | `CMD:CPEERS` | `CT:peers count=N` then one `CT:peer …` per peer | Enrolled peers with asset tags |
 | `CMD:CCAP` | `CT:cap len=23 <hex>` | Capability block without a BLE read |
 | `CMD:CUI` | `CT:ui …`, then one `CT:button …` and one `CT:tag …` per entry | The foreground app's declared buttons and tags |
+| `CMD:CTAGS` | `CT:tags count=N`, then one `CT:tag id=… state=… label=…` | Live tag state — see below |
 | `CMD:CBTN <id> [holdMs]` | `CT:btn id=… hold=…` | Inject a button press |
 | `CMD:CRESET` | `CT:reset ok` | Delete all peer state — back to never-paired |
 
@@ -73,6 +74,14 @@ repeat-while-held path — the device emits a button-event notification about
 every 100 ms with a rising duration, then a final one with `isFinal` set. That
 path is otherwise only reachable by a human holding a button, so it was
 effectively untestable before.
+
+### `CTAGS`
+
+The Status characteristic is **write-without-response**: nothing tells an app
+whether its tag write landed. This is the one piece of protocol state a BLE
+client genuinely cannot confirm for itself, and reading it back over serial is
+how a test asserts it did. It is also how the harness checks that tags survive a
+content push (they must) and clear on a foreground handover (they must).
 
 ### `CRESET`
 

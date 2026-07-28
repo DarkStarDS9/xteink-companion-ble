@@ -179,6 +179,20 @@ class Console:
                 peers.append(entry)
         return peers
 
+    def tags(self) -> dict:
+        """Live tag state, keyed by id. The only way to confirm a write-without-response landed."""
+        out = {}
+        for reply in self.send("CTAGS"):
+            if reply.startswith("tag "):
+                fields = {}
+                for token in reply[4:].split(" "):
+                    if "=" in token:
+                        key, value = token.split("=", 1)
+                        fields[key] = value
+                if "id" in fields:
+                    out[int(fields["id"])] = fields.get("state")
+        return out
+
     def press(self, button: int, hold_ms: int = 0) -> None:
         self.send(f"CBTN {button} {hold_ms}", expect="btn")
         # Let the device's loop pick the injection up and act on it.
@@ -549,12 +563,21 @@ async def run_tests(args, console: Console, results: Results) -> None:
             await asyncio.sleep(2.0)
             results.check("device still on text after a tag write plus a push",
                           console.state().get("screen") == "text")
+            # The Status write is write-without-response, so BLE cannot confirm
+            # it landed. Serial can — this is the assertion the harness exists
+            # for.
+            tags_seen = console.tags()
+            results.check("the tag write actually landed on the device",
+                          tags_seen.get(0) == "filled", str(tags_seen))
+            results.check("a content push did not clear it",
+                          tags_seen.get(0) == "filled",
+                          "tags must not auto-clear on a body push")
 
             # An undeclared id must be ignored rather than create a tag.
             await link.set_tag(peer_a, 99, 2)
             await asyncio.sleep(1.0)
-            results.check("an undeclared tag id does not upset the device",
-                          console.state().get("screen") == "text")
+            results.check("an undeclared tag id creates nothing",
+                          len(console.tags()) == len(DEFAULT_TAGS), str(console.tags()))
 
             # Atomic: content and tag state in one batch, one redraw.
             await link.push_field(peer_a, FIELD_TITLE, b"Tagged article")
@@ -563,6 +586,10 @@ async def run_tests(args, console: Console, results: Results) -> None:
             await asyncio.sleep(2.5)
             results.check("atomic content + tag push kept the device on text",
                           console.state().get("screen") == "text")
+            tags_seen = console.tags()
+            results.check("both tag states applied from the atomic batch",
+                          tags_seen.get(0) == "outline" and tags_seen.get(1) == "filled",
+                          str(tags_seen))
 
             # There is no read-back for tag rendering by design — it is pure
             # drawing. CMD:SCREENSHOT is the visual check.
@@ -633,6 +660,19 @@ async def run_tests(args, console: Console, results: Results) -> None:
                         console.state().get("foreground") == str(peer_b.session_id),
                         str(console.state()),
                     )
+
+                    # Re-grant: FOREGROUND must fire again, not just the first
+                    # time. If it does not, a preempted-then-restored app never
+                    # learns to re-push and the reader stays blank.
+                    outcome = await link.acquire(peer_a)
+                    results.check("FOREGROUND fires again on a re-grant",
+                                  outcome[0] == "foreground", str(outcome))
+                    results.check("the screen went back to app A",
+                                  console.state().get("foreground") == str(peer_a.session_id),
+                                  str(console.state()))
+                    results.check("tags cleared on the handover",
+                                  all(state == "hidden" for state in console.tags().values()),
+                                  str(console.tags()))
 
             # --- image push -------------------------------------------------- #
             if enabled("image"):

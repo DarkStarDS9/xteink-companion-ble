@@ -5,6 +5,7 @@
 
 #include "CompanionBle.h"
 #include "CompanionPeerStore.h"
+#include "CompanionTestConsole.h"
 #include "activities/Activity.h"
 
 // Companion Mode: X3 as a BLE GATT peripheral, rendering whatever the
@@ -69,6 +70,11 @@ class CompanionModeActivity final : public Activity {
   // full flashing refresh.
   bool forceFastRefreshNextRender = false;
 
+  // Set when only tag state changed while a print is on screen. render() then
+  // draws the chips over the retained framebuffer instead of re-decoding and
+  // re-settling the image, which would cost seconds for a mark that moved.
+  bool tagOnlyRedraw = false;
+
   std::string foregroundPeerKey;
   std::string foregroundAppName;
 
@@ -130,6 +136,15 @@ class CompanionModeActivity final : public Activity {
   bool buttonWasReleased(MappedInputManager::Button role, companionble::ButtonId id) const;
   unsigned long buttonHeldTime(companionble::ButtonId id) const;
   const char* screenName() const;
+#ifdef COMPANION_TEST_CONSOLE
+ public:
+  // Live tag state for the serial console's CTAGS. The Status characteristic is
+  // write-without-response, so this is the only way a test can confirm a tag
+  // write actually landed.
+  uint8_t reportTags(companiontest::TagReport* out, uint8_t maxTags) const;
+
+ private:
+#endif
 
   void notifyHeldButton(companionble::ButtonId button);
   void loadUiDeclaration();

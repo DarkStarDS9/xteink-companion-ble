@@ -131,8 +131,9 @@ public enum TagState: UInt8, Sendable {
 public enum CompanionTagLimits {
     /// Tags past this many are dropped by the device.
     public static let maxTags = 6
-    /// Labels longer than this are truncated on a UTF-8 boundary.
-    public static let maxLabelBytes = 12
+    /// Labels longer than this are truncated on a UTF-8 boundary. Matches the
+    /// display-name cap; sized for localized labels rather than English ones.
+    public static let maxLabelBytes = 24
 }
 
 /// Raw physical buttons. These mirror the firmware's own HAL indices; they are
