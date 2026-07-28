@@ -184,8 +184,8 @@ void notifyHelloOk(uint16_t helloTag, uint8_t sessionId, const char* peerKey, co
   offset += 16;
   payload[offset++] = 2;  // assetCount
 
-  payload[offset++] = kFieldButtonMap;
-  companionpeer::assetTag(peerKey, companionpeer::kAssetButtonMap, payload + offset);
+  payload[offset++] = kFieldUiDeclaration;
+  companionpeer::assetTag(peerKey, companionpeer::kAssetUiDeclaration, payload + offset);
   offset += 4;
 
   payload[offset++] = kFieldIcon;
@@ -208,7 +208,7 @@ void notifyBackground(uint8_t sessionId, BackgroundReason reason) {
 void notifyAssetAck(uint8_t sessionId, uint8_t assetId, companionpeer::AssetStoreResult result, const char* peerKey) {
   uint8_t payload[8] = {kSessAssetAck, sessionId, assetId, static_cast<uint8_t>(result), 0, 0, 0, 0};
   if (result == companionpeer::AssetStoreResult::Stored) {
-    companionpeer::assetTag(peerKey, assetId == kFieldIcon ? companionpeer::kAssetIcon : companionpeer::kAssetButtonMap,
+    companionpeer::assetTag(peerKey, assetId == kFieldIcon ? companionpeer::kAssetIcon : companionpeer::kAssetUiDeclaration,
                             payload + 4);
   }
   notifySession(payload, sizeof(payload));
@@ -294,10 +294,13 @@ uint32_t fieldCap(uint8_t field) {
       return kMaxContentIdLen;
     case kFieldImage:
       return kMaxImageFieldLen;
-    case kFieldButtonMap:
-      return companionpeer::kMaxButtonMapLen;
+    case kFieldUiDeclaration:
+      return companionpeer::kMaxUiDeclarationLen;
     case kFieldIcon:
       return 4 + kIconBytes;
+    case kFieldTagState:
+      // 1 count byte + kMaxTags x { tagId, state }.
+      return 1 + 2 * kMaxTags;
     default:
       return kMaxFieldLen;
   }
@@ -305,7 +308,7 @@ uint32_t fieldCap(uint8_t field) {
 
 bool isKnownField(uint8_t field) {
   return field == kFieldTitle || field == kFieldBody || field == kFieldContentId || field == kFieldImage ||
-         field == kFieldButtonMap || field == kFieldIcon;
+         field == kFieldUiDeclaration || field == kFieldIcon || field == kFieldTagState;
 }
 
 // ---------------------------------------------------------------------------
@@ -458,7 +461,7 @@ class SessionCharCallbacks : public NimBLECharacteristicCallbacks {
         // A peer with no button map cannot take the screen. This is what makes
         // "an app with undefined buttons" structurally impossible rather than a
         // case the rendering code has to handle.
-        if (!companionpeer::hasButtonMap(session->peerKey)) {
+        if (!companionpeer::hasUiDeclaration(session->peerKey)) {
           const uint8_t denied[3] = {kSessAcquireDenied, sessionId, kAcquireDeniedNoButtonMap};
           notifySession(denied, sizeof(denied));
           return;
@@ -499,12 +502,12 @@ void beginImageStaging(const Session& session) {
 void finishAsset(uint8_t field, const Session& session, uint8_t sessionId) {
   const companionpeer::AssetStoreResult result =
       companionpeer::storeAsset(session.peerKey, field == kFieldIcon ? companionpeer::kAssetIcon
-                                                                     : companionpeer::kAssetButtonMap,
+                                                                     : companionpeer::kAssetUiDeclaration,
                                 g_activeBuf.get(), g_activeWritten, kIconBytes);
   notifyAssetAck(sessionId, field, result, session.peerKey);
   if (result != companionpeer::AssetStoreResult::Stored) {
     LOG_ERR("CBLE", "asset 0x%02x rejected (%u)", field, static_cast<unsigned>(static_cast<uint8_t>(result)));
-  } else if (field == kFieldButtonMap && g_foreground == sessionId && g_foregroundCb) {
+  } else if (field == kFieldUiDeclaration && g_foreground == sessionId && g_foregroundCb) {
     // The foreground app just changed its control scheme; re-read it now rather
     // than waiting for the next connect.
     const std::string name = companionpeer::displayName(session.peerKey);
@@ -619,7 +622,7 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
             break;
           }
 
-          case kFieldButtonMap:
+          case kFieldUiDeclaration:
           case kFieldIcon:
             if (g_activeBuf) finishAsset(field, *session, sessionId);
             break;
@@ -651,7 +654,8 @@ class StatusCharCallbacks : public NimBLECharacteristicCallbacks {
     if (value.size() < 3) return;
     const uint8_t* data = value.data();
     if (data[0] != g_foreground) return;  // not the app that owns the screen
-    if (data[1] >= kMaxIndicators) return;
+    // tagId is whatever the app declared; the firmware neither allocates nor
+    // validates ids — an id the peer never declared is simply ignored upstream.
     if (g_statusCb) g_statusCb(data[1], data[2]);
   }
 };

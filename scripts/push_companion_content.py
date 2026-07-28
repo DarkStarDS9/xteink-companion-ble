@@ -46,7 +46,7 @@ SESSION_CHAR_UUID = "7c9c0005-3e4a-4b1a-9c1e-6d8a1f2b0001"
 
 OP_START, OP_CHUNK, OP_END = 0x01, 0x02, 0x03
 FIELD_TITLE, FIELD_BODY, FIELD_CONTENT_ID = 0x01, 0x02, 0x03
-FIELD_IMAGE, FIELD_BUTTON_MAP, FIELD_ICON = 0x04, 0x05, 0x06
+FIELD_IMAGE, FIELD_UI_DECL, FIELD_ICON, FIELD_TAG_STATE = 0x04, 0x05, 0x06, 0x07
 FINAL_FLAG = 0x80
 
 SESS_HELLO, SESS_BYE, SESS_ACQUIRE, SESS_RELEASE = 0x01, 0x02, 0x03, 0x04
@@ -69,7 +69,7 @@ DENIED_REASONS = {
     0x04: "storage failure",
     0x05: "another pairing prompt is up",
 }
-ACQUIRE_DENIED_REASONS = {0x00: "no button map stored", 0x01: "unknown session"}
+ACQUIRE_DENIED_REASONS = {0x00: "no UI declaration stored", 0x01: "unknown session"}
 ASSET_RESULTS = {0x00: "stored", 0x01: "rejected: size", 0x02: "rejected: format", 0x03: "rejected: storage"}
 IMAGE_RESULTS = {0x00: "displayed", 0x01: "decode failed", 0x02: "rejected: size", 0x03: "storage failed"}
 BUTTON_NAMES = {0: "BACK", 1: "CONFIRM", 2: "LEFT", 3: "RIGHT", 4: "UP", 5: "DOWN", 6: "POWER"}
@@ -93,8 +93,9 @@ DEFAULT_BODY = (
     "app. Use --title/--body/--body-file to push your own content."
 )
 
-# What this script tells the device its buttons do. LEFT/RIGHT page the buffered
-# body on-device; everything else is forwarded so --listen can print it.
+# What this script declares about its own UI. LEFT/RIGHT page the buffered body
+# on-device; everything else is forwarded so --listen can print it. The tags are
+# this script's own invention — the device defines none.
 BUTTON_MAP = [
     (2, ROUTING_PAGE_PREV, "<"),
     (3, ROUTING_PAGE_NEXT, ">"),
@@ -150,12 +151,27 @@ def asset_tag(body: bytes) -> bytes:
     return b"\x00\x00\x00\x01" if tag == b"\x00\x00\x00\x00" else tag
 
 
-def encode_button_map() -> bytes:
+TAGS = [(0, "Saved"), (1, "New")]
+
+
+def encode_ui_declaration() -> bytes:
     body = bytes([len(BUTTON_MAP)])
     for button, routing, label in BUTTON_MAP:
         encoded = label.encode("utf-8")
         body += bytes([button, routing, len(encoded)]) + encoded
+    body += bytes([len(TAGS)])
+    for tag_id, label in TAGS:
+        encoded = label.encode("utf-8")[:12]
+        body += bytes([tag_id, len(encoded)]) + encoded
     return asset_tag(body) + body
+
+
+def encode_tag_state(states) -> bytes:
+    """states: list of (tagId, state). state 0 hidden / 1 outline / 2 filled."""
+    out = bytes([len(states)])
+    for tag_id, state in states:
+        out += bytes([tag_id, state])
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -323,10 +339,10 @@ class Session:
         print(f"  image: {IMAGE_RESULTS.get(result, result)}")
         return result
 
-    async def set_indicator(self, slot: int, state: int) -> None:
-        """Indicator slots are anonymous: the device draws a mark and knows nothing."""
+    async def set_tag(self, tag_id: int, state: int) -> None:
+        """State-only change to one declared tag, without re-pushing content."""
         await self.client.write_gatt_char(
-            STATUS_CHAR_UUID, bytes([self.session_id, slot, state]), response=True
+            STATUS_CHAR_UUID, bytes([self.session_id, tag_id, state]), response=True
         )
 
 
@@ -425,11 +441,11 @@ async def run(args) -> None:
 
         # Push only what the device does not already have — the device compares
         # nothing, so staleness is this side's conclusion.
-        button_map = encode_button_map()
-        if session.asset_tags.get(FIELD_BUTTON_MAP) != button_map[:4]:
-            await session.push_asset(FIELD_BUTTON_MAP, button_map)
+        declaration = encode_ui_declaration()
+        if session.asset_tags.get(FIELD_UI_DECL) != declaration[:4]:
+            await session.push_asset(FIELD_UI_DECL, declaration)
         else:
-            print("  button map already current.")
+            print("  UI declaration already current.")
 
         if args.icon:
             icon = encode_icon(args.icon, caps["icon_w"], caps["icon_h"])
@@ -455,13 +471,19 @@ async def run(args) -> None:
             # content-id carries the final flag: the device only commits and
             # redraws once this last field's END arrives, so title+body land
             # together instead of the headline updating first.
-            await session.push_field(FIELD_CONTENT_ID, args.content_id.encode("utf-8")[:32], final=True)
+            if args.tag is not None:
+                # Tags last, carrying the final flag: content and tag state then
+                # commit in one redraw rather than the tag flipping separately.
+                await session.push_field(FIELD_CONTENT_ID, args.content_id.encode("utf-8")[:32])
+                await session.push_field(FIELD_TAG_STATE, encode_tag_state([tuple(args.tag)]), final=True)
+            else:
+                await session.push_field(FIELD_CONTENT_ID, args.content_id.encode("utf-8")[:32], final=True)
             print("  Pushed.")
 
-        if args.indicator is not None:
-            slot, state = args.indicator
-            await session.set_indicator(slot, state)
-            print(f"  Set indicator slot {slot} to state {state}.")
+        if args.set_tag is not None:
+            tag_id, state = args.set_tag
+            await session.set_tag(tag_id, state)
+            print(f"  Set tag {tag_id} to state {state} (state-only write).")
 
         if args.listen:
             print("Listening for button events. Ctrl-C to stop.")
@@ -485,12 +507,20 @@ def main() -> None:
     parser.add_argument("--icon", default=None, help="Encode this image as the 1-bpp sleep-screen icon (needs Pillow)")
     parser.add_argument("--no-text", action="store_true", help="Handshake and push assets, but push no content")
     parser.add_argument(
-        "--indicator",
+        "--tag",
         nargs=2,
         type=int,
-        metavar=("SLOT", "STATE"),
+        metavar=("ID", "STATE"),
         default=None,
-        help="Set indicator SLOT (0-3) to STATE (0 hidden, 1 outline, 2 filled) after pushing",
+        help="Push tag ID to STATE atomically with the content (0 hidden, 1 outline, 2 filled)",
+    )
+    parser.add_argument(
+        "--set-tag",
+        nargs=2,
+        type=int,
+        metavar=("ID", "STATE"),
+        default=None,
+        help="Set tag ID to STATE with a standalone Status write, after any content push",
     )
     parser.add_argument("--listen", action="store_true", help="Stay connected and print button events")
     parser.add_argument("--forget", action="store_true", help="Present no token, forcing a fresh pairing prompt")

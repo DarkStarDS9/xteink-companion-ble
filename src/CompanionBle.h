@@ -121,19 +121,31 @@ enum class ButtonEventType : uint8_t {
   ButtonPress = 0x01,
 };
 
-// Indicator slots the Status characteristic can set. The device draws a small
-// mark per slot and has NO idea what any of them mean — "saved", "playing",
-// "unread" are all phone-side semantics. This deliberately replaces v5's named
-// READ_LATER_SAVED, which baked one app's vocabulary into firmware: the device
-// stores and renders what an app declared, forwards raw events, and interprets
-// nothing.
-inline constexpr uint8_t kMaxIndicators = 4;
+// Tags: short labelled marks an app declares and then switches on and off.
+//
+// The firmware defines NO tags. There is no built-in "saved", no fixed slots,
+// no reserved ids and no enum of permitted values — an app declares which tags
+// exist and what each is called in its UI declaration (kFieldUiDeclaration),
+// exactly as it declares button labels, and the device stores the strings and
+// draws them. Tag ids are per-peer, so two apps both using id 0 never collide.
+//
+// This replaces v5's READ_LATER_SAVED, which baked one app's vocabulary into
+// firmware, and the numbered indicator slots that briefly replaced it, which
+// still made the firmware own the set.
+inline constexpr uint8_t kMaxTags = 6;
 
-// Indicator states, phone -> device. Deliberately visual, not semantic.
-enum class IndicatorState : uint8_t {
-  Hidden = 0x00,
-  Outline = 0x01,
-  Filled = 0x02,
+// Longest tag label stored and drawn, in bytes. Tags are chips on one row
+// beside the title, so a long label would crowd out the title itself; a client
+// that sends more is truncated on a UTF-8 boundary. Sized with the RAM budget
+// in mind: kMaxTags * (kMaxTagLabelLen + 3) is the entire per-peer cost.
+inline constexpr size_t kMaxTagLabelLen = 12;
+
+// How a declared tag is currently drawn. Visual, not semantic — what "on"
+// means is the app's business.
+enum class TagState : uint8_t {
+  Hidden = 0x00,   // declared but not drawn at all
+  Outline = 0x01,  // drawn, unfilled
+  Filled = 0x02,   // drawn, filled
 };
 
 // Content characteristic field identifiers, matching docs/companion-display-protocol.md.
@@ -141,9 +153,18 @@ inline constexpr uint8_t kFieldTitle = 0x01;
 inline constexpr uint8_t kFieldBody = 0x02;
 inline constexpr uint8_t kFieldContentId = 0x03;
 inline constexpr uint8_t kFieldImage = 0x04;
-inline constexpr uint8_t kFieldButtonMap = 0x05;
+// The peer's UI declaration: button labels/routing AND tag labels, in one
+// versioned asset. One declaration rather than two because both halves are
+// near-static strings the firmware only renders, and folding them halves the
+// digest bookkeeping for every client.
+inline constexpr uint8_t kFieldUiDeclaration = 0x05;
 inline constexpr uint8_t kFieldIcon = 0x06;
-// Next free: 0x07.
+// Tag *state* — which of the peer's declared tags are currently in which
+// state. Carries no labels and declares nothing. Pushed through the same
+// framing as title/body so it can ride the kFinalFieldFlag batch, which is what
+// makes content and its tag state commit in a single redraw.
+inline constexpr uint8_t kFieldTagState = 0x07;
+// Next free: 0x08.
 
 // The top bit of a START packet's field byte marks "this is the last field of
 // an atomic content push". The device buffers each field's END as before, but
@@ -251,10 +272,14 @@ using ContentFieldCallback = void (*)(uint8_t field, const uint8_t* data, size_t
 void setContentFieldCallback(ContentFieldCallback cb);
 
 // Callback for a Status characteristic write from the foreground session: set
-// indicator slot `indicatorId` to `state`. Same task-boundary rules as
-// ContentFieldCallback. Indicators are NOT reset by a subsequent content push —
-// when one should clear is app meaning, and the app is the one that knows.
-using StatusCallback = void (*)(uint8_t indicatorId, uint8_t state);
+// declared tag `tagId` to `state`, without re-pushing content. Same
+// task-boundary rules as ContentFieldCallback.
+//
+// Tags are NOT reset by a subsequent content push — when a tag should clear is
+// app meaning, and the app is the one that knows. An app that wants content and
+// tag state to change together pushes kFieldTagState inside the same atomic
+// batch instead, which is the whole reason that field exists.
+using StatusCallback = void (*)(uint8_t tagId, uint8_t state);
 void setStatusCallback(StatusCallback cb);
 
 // An unknown peer (or one with a bad token) wants to pair. The activity shows a

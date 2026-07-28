@@ -28,12 +28,12 @@ namespace {
 constexpr int kCompanionFontId = NOTOSANS_14_FONT_ID;       // body
 constexpr int kCompanionTitleFontId = NOTOSANS_16_FONT_ID;  // title: larger + bold
 
-// Width reserved at the title line's right edge for the app's indicator slots —
-// shared by the title-wrap width budget and the slots' own x positions.
-constexpr int kIndicatorSlotSize = 12;
-constexpr int kIndicatorSlotGap = 6;
-constexpr int kIndicatorAreaWidth =
-    companionble::kMaxIndicators * (kIndicatorSlotSize + kIndicatorSlotGap) + kIndicatorSlotGap;
+// Tag chip geometry. The row's actual width is measured from the visible
+// labels (see measureTagRow()) rather than reserved at a fixed maximum, so an
+// app with no tags gives its title the full width.
+constexpr int kTagChipPadX = 4;
+constexpr int kTagChipPadY = 2;
+constexpr int kTagChipGap = 5;
 
 // Title wraps onto at most this many lines before falling back to
 // ellipsis-truncating the last line (see wrapTitleToLines()).
@@ -65,9 +65,14 @@ volatile bool g_pendingTitleReady = false;
 uint8_t g_pendingBodyBuf[companionble::kMaxFieldLen];
 uint16_t g_pendingBodyLen = 0;
 volatile bool g_pendingBodyReady = false;
-uint8_t g_pendingIndicatorId = 0;
-uint8_t g_pendingIndicatorState = 0;
+uint8_t g_pendingTagId = 0;
+uint8_t g_pendingTagState = 0;
 volatile bool g_pendingStatusReady = false;
+
+// Tag state arriving as content field 0x07, so it can ride the atomic batch.
+uint8_t g_pendingTagStateBuf[1 + 2 * companionble::kMaxTags];
+uint8_t g_pendingTagStateLen = 0;
+volatile bool g_pendingTagStateReady = false;
 
 // Foreground handover and pairing requests are also host-task events. Paths and
 // names are short and fixed-length here so the critical section stays a memcpy.
@@ -102,6 +107,11 @@ void onContentField(uint8_t field, const uint8_t* data, size_t len, bool final) 
     memcpy(g_pendingTitleBuf, data, n);
     g_pendingTitleLen = static_cast<uint16_t>(n);
     g_pendingTitleReady = true;
+  } else if (field == companionble::kFieldTagState) {
+    const size_t n = len > sizeof(g_pendingTagStateBuf) ? sizeof(g_pendingTagStateBuf) : len;
+    memcpy(g_pendingTagStateBuf, data, n);
+    g_pendingTagStateLen = static_cast<uint8_t>(n);
+    g_pendingTagStateReady = true;
   } else if (field == companionble::kFieldBody) {
     const size_t n = len > sizeof(g_pendingBodyBuf) ? sizeof(g_pendingBodyBuf) : len;
     memcpy(g_pendingBodyBuf, data, n);
@@ -115,10 +125,10 @@ void onContentField(uint8_t field, const uint8_t* data, size_t len, bool final) 
   portEXIT_CRITICAL(&g_mux);
 }
 
-void onStatus(uint8_t indicatorId, uint8_t state) {
+void onStatus(uint8_t tagId, uint8_t state) {
   portENTER_CRITICAL(&g_mux);
-  g_pendingIndicatorId = indicatorId;
-  g_pendingIndicatorState = state;
+  g_pendingTagId = tagId;
+  g_pendingTagState = state;
   g_pendingStatusReady = true;
   portEXIT_CRITICAL(&g_mux);
 }
@@ -158,12 +168,11 @@ void CompanionModeActivity::onEnter() {
   Activity::onEnter();
   connected = false;
   haveContent = false;
-  memset(indicators, 0, sizeof(indicators));
   forceFastRefreshNextRender = false;
   currentPage = 0;
   totalPages = 0;
   pages.clear();
-  clearButtonMap();
+  clearUiDeclaration();
   cachedFontId = kCompanionFontId;
   computeViewport();
 
@@ -221,7 +230,7 @@ void CompanionModeActivity::onExit() {
 // Button map
 // ---------------------------------------------------------------------------
 
-void CompanionModeActivity::clearButtonMap() {
+void CompanionModeActivity::clearUiDeclaration() {
   for (auto& spec : buttons) {
     spec.routing = companionble::ButtonRouting::None;
     spec.label.clear();
@@ -231,18 +240,18 @@ void CompanionModeActivity::clearButtonMap() {
 // Reads the foreground peer's declared control scheme off the SD card. Called
 // on every foreground handover and whenever that peer pushes a new map, so an
 // app update changes the buttons without a re-pair and without a firmware mode.
-void CompanionModeActivity::loadButtonMap() {
-  clearButtonMap();
+void CompanionModeActivity::loadUiDeclaration() {
+  clearUiDeclaration();
   if (foregroundPeerKey.empty()) return;
 
-  uint8_t raw[companionpeer::kMaxButtonMapLen];
+  uint8_t raw[companionpeer::kMaxUiDeclarationLen];
   const size_t len =
-      companionpeer::readAssetBody(foregroundPeerKey.c_str(), companionpeer::kAssetButtonMap, raw, sizeof(raw));
+      companionpeer::readAssetBody(foregroundPeerKey.c_str(), companionpeer::kAssetUiDeclaration, raw, sizeof(raw));
   if (len < 1) return;
 
-  const uint8_t count = raw[0];
+  const uint8_t buttonEntries = raw[0];
   size_t offset = 1;
-  for (uint8_t i = 0; i < count && offset + 3 <= len; ++i) {
+  for (uint8_t i = 0; i < buttonEntries && offset + 3 <= len; ++i) {
     const uint8_t buttonId = raw[offset];
     const uint8_t routing = raw[offset + 1];
     const uint8_t labelLen = raw[offset + 2];
@@ -258,6 +267,66 @@ void CompanionModeActivity::loadButtonMap() {
     }
     offset += labelLen;
   }
+
+  // Tag section. Optional — an app with no tags may simply end after its
+  // buttons. Every tag starts Hidden: the declaration says what exists, not
+  // what is currently on, and the app pushes state separately.
+  if (offset >= len) return;
+  const uint8_t tagEntries = raw[offset++];
+  for (uint8_t i = 0; i < tagEntries && offset + 2 <= len; ++i) {
+    const uint8_t tagId = raw[offset];
+    const uint8_t labelLen = raw[offset + 1];
+    offset += 2;
+    if (offset + labelLen > len) break;
+    if (tagCount < companionble::kMaxTags) {
+      TagSpec& tag = tags[tagCount++];
+      tag.id = tagId;
+      tag.state = static_cast<uint8_t>(companionble::TagState::Hidden);
+      size_t copy = labelLen < companionble::kMaxTagLabelLen ? labelLen : companionble::kMaxTagLabelLen;
+      // Truncate on a UTF-8 boundary so a clipped label is never invalid.
+      while (copy > 0 && (raw[offset + copy] & 0xC0) == 0x80) --copy;
+      memcpy(tag.label, raw + offset, copy);
+      tag.label[copy] = '\0';
+    }
+    offset += labelLen;
+  }
+  measureTagRow();
+}
+
+// Applies a pushed tag-state field: count, then {tagId, state} pairs. Ids the
+// peer never declared are ignored — the declaration is the only place tags come
+// into existence.
+void CompanionModeActivity::applyTagState(const uint8_t* data, size_t len) {
+  if (len < 1) return;
+  const uint8_t entries = data[0];
+  size_t offset = 1;
+  for (uint8_t i = 0; i < entries && offset + 2 <= len; ++i) {
+    setTagState(data[offset], data[offset + 1]);
+    offset += 2;
+  }
+  measureTagRow();
+}
+
+void CompanionModeActivity::setTagState(uint8_t tagId, uint8_t state) {
+  if (state > static_cast<uint8_t>(companionble::TagState::Filled)) return;
+  for (uint8_t i = 0; i < tagCount; ++i) {
+    if (tags[i].id == tagId) {
+      tags[i].state = state;
+      return;
+    }
+  }
+}
+
+// The tag row's width depends on which labels are currently visible, so the
+// title's wrap budget is recomputed whenever either changes rather than
+// reserving a worst case that would permanently narrow every title.
+void CompanionModeActivity::measureTagRow() {
+  int width = 0;
+  for (uint8_t i = 0; i < tagCount; ++i) {
+    if (tags[i].state == static_cast<uint8_t>(companionble::TagState::Hidden)) continue;
+    width += renderer.getTextWidth(UI_10_FONT_ID, tags[i].label) + 2 * kTagChipPadX + kTagChipGap;
+  }
+  tagRowWidth = width;
 }
 
 companionble::ButtonRouting CompanionModeActivity::routingFor(companionble::ButtonId button) const {
@@ -315,7 +384,7 @@ void CompanionModeActivity::updateTitleLayout() {
 }
 
 std::vector<std::string> CompanionModeActivity::wrapTitleToLines(const std::string& text) const {
-  const int maxWidth = viewportWidth - kIndicatorAreaWidth;
+  const int maxWidth = viewportWidth - tagRowWidth;
   std::vector<std::string> lines;
   std::string remaining = text;
 
@@ -466,7 +535,7 @@ void CompanionModeActivity::checkIdleTimers() {
 
 void CompanionModeActivity::applyForegroundChange() {
   RenderLock lock;
-  loadButtonMap();
+  loadUiDeclaration();
 
   if (foregroundPeerKey.empty()) {
     // Nobody holds the screen. Content stays up — it is the idle timeout, not
@@ -483,9 +552,6 @@ void CompanionModeActivity::applyForegroundChange() {
     totalPages = 0;
     currentPage = 0;
     haveContent = false;
-    // A different app owns the screen now: its indicators start clear, since
-    // they carry the previous app's meaning, not this one's.
-    memset(indicators, 0, sizeof(indicators));
     displayedImagePath.clear();
     updateTitleLayout();
     screen = Screen::Text;
@@ -565,8 +631,11 @@ void CompanionModeActivity::loop() {
   bool gotImage = false;
   std::string newTitle;
   std::string newBody;
-  uint8_t newIndicatorId = 0;
-  uint8_t newIndicatorState = 0;
+  uint8_t newTagId = 0;
+  uint8_t newTagStateValue = 0;
+  bool gotTagState = false;
+  uint8_t newTagStateBuf[sizeof(g_pendingTagStateBuf)] = {0};
+  uint8_t newTagStateLen = 0;
   char newForegroundKey[companionpeer::kPeerKeyLen] = {0};
   char newForegroundName[companionpeer::kMaxNameLen + 1] = {0};
   char newPairingName[companionpeer::kMaxNameLen + 1] = {0};
@@ -599,10 +668,16 @@ void CompanionModeActivity::loop() {
     g_pendingBatchStartMs = 0;
   }
   if (g_pendingStatusReady) {
-    newIndicatorId = g_pendingIndicatorId;
-    newIndicatorState = g_pendingIndicatorState;
+    newTagId = g_pendingTagId;
+    newTagStateValue = g_pendingTagState;
     g_pendingStatusReady = false;
     gotStatus = true;
+  }
+  if (g_pendingTagStateReady) {
+    memcpy(newTagStateBuf, g_pendingTagStateBuf, g_pendingTagStateLen);
+    newTagStateLen = g_pendingTagStateLen;
+    g_pendingTagStateReady = false;
+    gotTagState = true;
   }
   if (g_pendingForegroundReady) {
     memcpy(newForegroundKey, g_pendingForegroundKey, sizeof(newForegroundKey));
@@ -663,9 +738,21 @@ void CompanionModeActivity::loop() {
     requestUpdate();
   }
 
-  if (gotStatus && newIndicatorId < companionble::kMaxIndicators) {
+  if (gotTagState) {
+    // Arrives as a content field so it can ride the atomic batch: pushed with
+    // title/body under one kFinalFieldFlag, content and its tag state land in a
+    // single redraw and there is never a frame where new content wears the
+    // previous content's tags.
     RenderLock lock;
-    indicators[newIndicatorId] = newIndicatorState;
+    applyTagState(newTagStateBuf, newTagStateLen);
+    if (!commit) forceFastRefreshNextRender = true;
+    requestUpdate();
+  }
+
+  if (gotStatus) {
+    RenderLock lock;
+    setTagState(newTagId, newTagStateValue);
+    measureTagRow();
     forceFastRefreshNextRender = true;
     requestUpdate();
   }
@@ -991,8 +1078,7 @@ void CompanionModeActivity::renderImage() {
   config.performanceMode = false;
 
   const std::string path = displayedImagePath;
-  bool decoded = decoder->decodeToFramebuffer(path, renderer, config);
-  if (!decoded) {
+  if (!decoder->decodeToFramebuffer(path, renderer, config)) {
     renderer.clearScreen();
     renderer.drawCenteredText(kCompanionFontId, renderer.getScreenHeight() / 2, tr(STR_COMPANION_IMAGE_FAILED), true);
     renderer.displayBuffer();
@@ -1000,6 +1086,23 @@ void CompanionModeActivity::renderImage() {
     displayedImagePath.clear();
     return;
   }
+
+  // Tags are drawn over the print only when the app has actually switched one
+  // on. That is not a firmware policy about when an app's UI is honoured — an
+  // app that leaves its tags hidden simply has nothing to draw, and gets a
+  // pixel-exact print. An app that wants a tag on a photo asks for it, and
+  // accepts the pixels it costs.
+  if (tagRowWidth > 0) {
+    const int lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
+    renderTags(renderer.getScreenWidth() - cachedOrientedMarginRight, cachedOrientedMarginTop + lineHeight);
+  }
+
+  // Display the black/white base before overlaying the grayscale planes. The
+  // reader path does the same (see TxtReaderActivity::render): renderAntiAliased
+  // only stores/restores the BW buffer and pushes the *gray* planes, so without
+  // this the panel would keep whatever was on it and the grayscale overlay would
+  // land on the wrong base.
+  renderer.displayBuffer();
 
   // Two-pass grayscale settle. This re-decodes the image twice more, which is
   // slow — several seconds — and that is fine: a visible "developing" draw is
@@ -1009,25 +1112,37 @@ void CompanionModeActivity::renderImage() {
   companionble::notifyImageStatus(companionble::ImageResult::Displayed);
 }
 
-// Draws the foreground app's indicator slots: an outline or filled mark per
-// slot. Deliberately a neutral shape rather than the v5 star — a star reads as
-// "favourite", which is exactly the app-level meaning the firmware is not
-// allowed to hold. The app decides what each slot means and when it lights.
-void CompanionModeActivity::renderIndicators(int rightEdgeX, int centerY) const {
-  int x = rightEdgeX - kIndicatorSlotSize;
-  const int y = centerY - kIndicatorSlotSize / 2;
-  for (int slot = companionble::kMaxIndicators - 1; slot >= 0; --slot) {
-    switch (static_cast<companionble::IndicatorState>(indicators[slot])) {
-      case companionble::IndicatorState::Filled:
-        renderer.fillRect(x, y, kIndicatorSlotSize, kIndicatorSlotSize, true);
-        break;
-      case companionble::IndicatorState::Outline:
-        renderer.drawRect(x, y, kIndicatorSlotSize, kIndicatorSlotSize, true);
-        break;
-      case companionble::IndicatorState::Hidden:
-        break;  // nothing drawn, and the slot still holds its place in the row
+// Draws the foreground app's visible tags as a right-aligned row of chips.
+//
+// The firmware knows none of these strings — they came out of the peer's UI
+// declaration, exactly like button labels, and this only renders them. Outline
+// and filled are the two visible states; hidden tags take no space at all,
+// which is what lets an app declare more tags than it usually shows.
+void CompanionModeActivity::renderTags(int rightEdgeX, int centerY) const {
+  const int textHeight = renderer.getLineHeight(UI_10_FONT_ID);
+  const int chipHeight = textHeight + 2 * kTagChipPadY;
+  const int y = centerY - chipHeight / 2;
+  int x = rightEdgeX;
+
+  for (int i = static_cast<int>(tagCount) - 1; i >= 0; --i) {
+    const TagSpec& tag = tags[i];
+    if (tag.state == static_cast<uint8_t>(companionble::TagState::Hidden)) continue;
+
+    const int textWidth = renderer.getTextWidth(UI_10_FONT_ID, tag.label);
+    const int chipWidth = textWidth + 2 * kTagChipPadX;
+    x -= chipWidth;
+    if (x < 0) break;  // ran out of room: drop the leftmost chips rather than overlap the title
+
+    const bool filled = tag.state == static_cast<uint8_t>(companionble::TagState::Filled);
+    if (filled) {
+      renderer.fillRect(x, y, chipWidth, chipHeight, true);
+    } else {
+      renderer.drawRect(x, y, chipWidth, chipHeight, true);
     }
-    x -= kIndicatorSlotSize + kIndicatorSlotGap;
+    // Knocked out of the fill when filled, so a marked tag reads as marked
+    // rather than as a black box.
+    renderer.drawText(UI_10_FONT_ID, x + kTagChipPadX, y + kTagChipPadY, tag.label, !filled);
+    x -= kTagChipGap;
   }
 }
 
@@ -1042,7 +1157,7 @@ void CompanionModeActivity::renderPage() {
     titleY += titleLineHeight;
   }
 
-  renderIndicators(cachedOrientedMarginLeft + viewportWidth, cachedOrientedMarginTop + titleLineHeight / 2);
+  renderTags(cachedOrientedMarginLeft + viewportWidth, cachedOrientedMarginTop + titleLineHeight / 2);
 
   const int lineHeight = renderer.getLineHeight(cachedFontId);
   int y = cachedOrientedMarginTop + cachedTitleBlockHeight;
@@ -1096,7 +1211,7 @@ void CompanionModeActivity::renderPage() {
   }
 
   if (forceFastRefreshNextRender) {
-    // Status-triggered redraw (an indicator flip): always no-flash,
+    // Tag-triggered redraw: always no-flash,
     // independent of the periodic full-refresh cadence below.
     forceFastRefreshNextRender = false;
     renderer.displayBuffer(HalDisplay::FAST_REFRESH);

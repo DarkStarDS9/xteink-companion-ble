@@ -54,7 +54,7 @@ so a host can pick replies out of the log stream without parsing timestamps.
 | `CMD:CSTATE` | `CT:state screen=… connected=… sessions=… foreground=… peer=…` | Assertable snapshot |
 | `CMD:CPEERS` | `CT:peers count=N` then one `CT:peer …` per peer | Enrolled peers with asset tags |
 | `CMD:CCAP` | `CT:cap len=23 <hex>` | Capability block without a BLE read |
-| `CMD:CBUTTONMAP` | `CT:buttonmap …` then one `CT:button …` per entry | What the foreground app declared |
+| `CMD:CUI` | `CT:ui …`, then one `CT:button …` and one `CT:tag …` per entry | The foreground app's declared buttons and tags |
 | `CMD:CBTN <id> [holdMs]` | `CT:btn id=… hold=…` | Inject a button press |
 | `CMD:CRESET` | `CT:reset ok` | Delete all peer state — back to never-paired |
 
@@ -89,8 +89,12 @@ CMD:CSTATE          -> CT:state screen=pairing connected=1 sessions=0 foreground
 CMD:CBTN 1          -> CT:btn id=1 hold=0
                        (host receives HELLO_OK)
 CMD:CPEERS          -> CT:peers count=1
-                       CT:peer key=a1b2c3d4 name=Dev Pusher buttons=00000000 icon=00000000
+                       CT:peer key=a1b2c3d4 name=Dev Pusher ui=00000000 icon=00000000
                        (host pushes the button map, ACQUIREs, pushes content)
+CMD:CUI             -> CT:ui peer=a1b2c3d4 buttons=4
+                       CT:button id=2 routing=page_prev label=<
+                       CT:ui tags=2
+                       CT:tag id=0 label=Saved
 CMD:CSTATE          -> CT:state screen=text connected=1 sessions=1 foreground=1 peer=a1b2c3d4
 CMD:CBTN 0 1200     -> CT:btn id=0 hold=1200
                        (host receives ~12 button-event notifications then a final)

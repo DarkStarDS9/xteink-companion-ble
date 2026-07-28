@@ -21,7 +21,7 @@ constexpr const char* kIndexPath = "/.crosspoint/companion/peers.json";
 std::string peerDir(const char* peerKey) { return std::string(kPeersDir) + "/" + peerKey; }
 
 std::string assetPath(const char* peerKey, uint8_t assetId) {
-  const char* name = assetId == kAssetIcon ? "icon.bin" : "buttons.bin";
+  const char* name = assetId == kAssetIcon ? "icon.bin" : "ui.bin";
   return peerDir(peerKey) + "/" + name;
 }
 
@@ -92,28 +92,43 @@ bool writeWholeFile(const std::string& path, const uint8_t* data, size_t len) {
   return written == len;
 }
 
-// The button map is validated here rather than at render time so a malformed
-// push is rejected with ASSET_REJECTED_FORMAT while the app can still do
-// something about it — an app whose map half-parsed would draw nonsense hints
-// with no way to find out why.
-bool buttonMapParses(const uint8_t* data, size_t len) {
-  if (len < 5) return false;  // 4-byte tag + entry count
-  const uint8_t count = data[4];
+// The UI declaration is validated here rather than at render time so a
+// malformed push is rejected with ASSET_REJECTED_FORMAT while the app can still
+// do something about it — a declaration that half-parsed would draw nonsense
+// hints with no way to find out why.
+//
+//   bytes 0..3  opaque digest
+//   byte  4     button entry count N
+//   N x { buttonId:1, routing:1, labelLen:1, label[labelLen] }
+//   byte        tag entry count M          (optional; absent means zero tags)
+//   M x { tagId:1, labelLen:1, label[labelLen] }
+bool uiDeclarationParses(const uint8_t* data, size_t len) {
+  if (len < 5) return false;  // digest + button count
+  const uint8_t buttonCount = data[4];
   size_t offset = 5;
-  for (uint8_t i = 0; i < count; ++i) {
+  for (uint8_t i = 0; i < buttonCount; ++i) {
     if (offset + 3 > len) return false;
-    const uint8_t labelLen = data[offset + 2];
-    offset += 3 + labelLen;
+    offset += 3 + data[offset + 2];
     if (offset > len) return false;
   }
-  return true;
+
+  // The tag section is optional: an app with no tags may simply stop after its
+  // buttons rather than append a zero byte.
+  if (offset == len) return true;
+  const uint8_t tagCount = data[offset++];
+  for (uint8_t i = 0; i < tagCount; ++i) {
+    if (offset + 2 > len) return false;
+    offset += 2 + data[offset + 1];
+    if (offset > len) return false;
+  }
+  return offset == len;
 }
 
 // Deletes a peer's directory and everything under it. Used by LRU eviction.
 void removePeerDir(const char* peerKey) {
   const std::string dir = peerDir(peerKey);
   Storage.remove((dir + "/token.bin").c_str());
-  Storage.remove((dir + "/buttons.bin").c_str());
+  Storage.remove((dir + "/ui.bin").c_str());
   Storage.remove((dir + "/icon.bin").c_str());
   Storage.removeDir((dir + "/data").c_str());
   Storage.rmdir(dir.c_str());
@@ -226,9 +241,9 @@ AssetStoreResult storeAsset(const char* peerKey, uint8_t assetId, const uint8_t*
                             size_t expectedIconBytes) {
   if (assetId == kAssetIcon) {
     if (len != 4 + expectedIconBytes) return AssetStoreResult::RejectedSize;
-  } else if (assetId == kAssetButtonMap) {
-    if (len > kMaxButtonMapLen) return AssetStoreResult::RejectedSize;
-    if (!buttonMapParses(data, len)) return AssetStoreResult::RejectedFormat;
+  } else if (assetId == kAssetUiDeclaration) {
+    if (len > kMaxUiDeclarationLen) return AssetStoreResult::RejectedSize;
+    if (!uiDeclarationParses(data, len)) return AssetStoreResult::RejectedFormat;
   } else {
     return AssetStoreResult::RejectedFormat;
   }
@@ -238,7 +253,7 @@ AssetStoreResult storeAsset(const char* peerKey, uint8_t assetId, const uint8_t*
   return AssetStoreResult::Stored;
 }
 
-bool hasButtonMap(const char* peerKey) { return Storage.exists(assetPath(peerKey, kAssetButtonMap).c_str()); }
+bool hasUiDeclaration(const char* peerKey) { return Storage.exists(assetPath(peerKey, kAssetUiDeclaration).c_str()); }
 
 size_t readAssetBody(const char* peerKey, uint8_t assetId, uint8_t* buf, size_t bufLen) {
   HalFile file;

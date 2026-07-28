@@ -70,13 +70,13 @@ void reportPeers() {
   const size_t count = companionpeer::listPeers(keys, companionpeer::kMaxPeers);
   reply("peers count=%u", static_cast<unsigned>(count));
   for (size_t i = 0; i < count; ++i) {
-    uint8_t mapTag[4];
+    uint8_t uiTag[4];
     uint8_t iconTag[4];
-    companionpeer::assetTag(keys[i], companionpeer::kAssetButtonMap, mapTag);
+    companionpeer::assetTag(keys[i], companionpeer::kAssetUiDeclaration, uiTag);
     companionpeer::assetTag(keys[i], companionpeer::kAssetIcon, iconTag);
     const std::string name = companionpeer::displayName(keys[i]);
-    reply("peer key=%s name=%s buttons=%02x%02x%02x%02x icon=%02x%02x%02x%02x", keys[i], name.c_str(), mapTag[0],
-          mapTag[1], mapTag[2], mapTag[3], iconTag[0], iconTag[1], iconTag[2], iconTag[3]);
+    reply("peer key=%s name=%s ui=%02x%02x%02x%02x icon=%02x%02x%02x%02x", keys[i], name.c_str(), uiTag[0],
+          uiTag[1], uiTag[2], uiTag[3], iconTag[0], iconTag[1], iconTag[2], iconTag[3]);
   }
 }
 
@@ -179,22 +179,24 @@ bool handleCommand(const String& command) {
     injectButton(buttonId, holdMs);
     return true;
   }
-  if (command == "CBUTTONMAP") {
+  if (command == "CUI") {
     const char* peerKey = companionble::foregroundPeerKey();
     if (peerKey[0] == '\0') {
-      reply("buttonmap none: no foreground peer");
+      reply("ui none: no foreground peer");
       return true;
     }
-    uint8_t raw[companionpeer::kMaxButtonMapLen];
+    uint8_t raw[companionpeer::kMaxUiDeclarationLen];
     const size_t length =
-        companionpeer::readAssetBody(peerKey, companionpeer::kAssetButtonMap, raw, sizeof(raw));
+        companionpeer::readAssetBody(peerKey, companionpeer::kAssetUiDeclaration, raw, sizeof(raw));
     if (length < 1) {
-      reply("buttonmap none: peer %s has no stored map", peerKey);
+      reply("ui none: peer %s has no stored declaration", peerKey);
       return true;
     }
-    reply("buttonmap peer=%s entries=%u", peerKey, static_cast<unsigned>(raw[0]));
+
+    const uint8_t buttonCount = raw[0];
+    reply("ui peer=%s buttons=%u", peerKey, static_cast<unsigned>(buttonCount));
     size_t offset = 1;
-    for (uint8_t i = 0; i < raw[0] && offset + 3 <= length; ++i) {
+    for (uint8_t i = 0; i < buttonCount && offset + 3 <= length; ++i) {
       const uint8_t id = raw[offset];
       const uint8_t routing = raw[offset + 1];
       const uint8_t labelLen = raw[offset + 2];
@@ -206,6 +208,25 @@ bool handleCommand(const String& command) {
       offset += labelLen;
       reply("button id=%u routing=%s label=%s", static_cast<unsigned>(id),
             routingName(static_cast<companionble::ButtonRouting>(routing)), label);
+    }
+
+    // The tag section is optional — an app with no tags simply ends here.
+    if (offset >= length) {
+      reply("ui tags=0");
+      return true;
+    }
+    const uint8_t tagCount = raw[offset++];
+    reply("ui tags=%u", static_cast<unsigned>(tagCount));
+    for (uint8_t i = 0; i < tagCount && offset + 2 <= length; ++i) {
+      const uint8_t id = raw[offset];
+      const uint8_t labelLen = raw[offset + 1];
+      offset += 2;
+      if (offset + labelLen > length) break;
+      char label[32] = {0};
+      const size_t copy = labelLen < sizeof(label) - 1 ? labelLen : sizeof(label) - 1;
+      memcpy(label, raw + offset, copy);
+      offset += labelLen;
+      reply("tag id=%u label=%s", static_cast<unsigned>(id), label);
     }
     return true;
   }

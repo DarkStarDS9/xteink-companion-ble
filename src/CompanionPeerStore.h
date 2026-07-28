@@ -58,14 +58,16 @@ inline constexpr size_t kMaxIconTiles = 18;
 // Longest display name stored, matching the protocol's own 24-byte cap.
 inline constexpr size_t kMaxNameLen = 24;
 
-// Asset ids, matching the content field ids they arrive as.
-inline constexpr uint8_t kAssetButtonMap = 0x05;
+// Asset ids, matching the content field ids they arrive as. The UI declaration
+// carries button labels/routing and tag labels together — see
+// kFieldUiDeclaration in CompanionBle.h for why they are one asset.
+inline constexpr uint8_t kAssetUiDeclaration = 0x05;
 inline constexpr uint8_t kAssetIcon = 0x06;
 
-// Longest button-map asset accepted (tag included). Far more than the seven
-// physical buttons need; a longer push is rejected rather than truncated,
-// because a half-stored control scheme is worse than none.
-inline constexpr size_t kMaxButtonMapLen = 512;
+// Longest UI declaration accepted (digest included). Comfortably more than
+// seven buttons and a handful of tags need; a longer push is rejected rather
+// than truncated, because a half-stored UI is worse than none.
+inline constexpr size_t kMaxUiDeclarationLen = 512;
 
 // Derives the directory name for a peer: the first 8 hex chars of SHA-256 over
 // appId || installId. Deterministic, so the same phone:app pair always lands in
@@ -107,9 +109,9 @@ enum class AssetStoreResult : uint8_t {
 AssetStoreResult storeAsset(const char* peerKey, uint8_t assetId, const uint8_t* data, size_t len,
                             size_t expectedIconBytes);
 
-// True if this peer has a stored button map. ACQUIRE is refused without one:
-// an app that has not said what its buttons do cannot reach the screen.
-bool hasButtonMap(const char* peerKey);
+// True if this peer has a stored UI declaration. ACQUIRE is refused without
+// one: an app that has not said what its buttons do cannot reach the screen.
+bool hasUiDeclaration(const char* peerKey);
 
 // Reads an asset body (tag stripped) into `buf`. Returns the number of bytes
 // read, 0 if absent or larger than `bufLen`.

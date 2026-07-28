@@ -80,7 +80,7 @@ Three ids, all opaque to the firmware (it compares bytes and never parses):
 | `deviceId` | 4 bytes | the device (eFuse MAC tail) | which display. Read from the capability characteristic; key *your* per-device storage on it. |
 
 A **peer** is the pair `(appId, installId)` — one phone's copy of one app. All
-per-peer state on the device (auth token, button map, icon, staging files) is
+per-peer state on the device (auth token, UI declaration, icon, staging files) is
 keyed by it.
 
 **Store `installId` somewhere that dies with the app, not somewhere that
@@ -101,7 +101,7 @@ central connects
    -> write HELLO on the Session characteristic
    <- HELLO_PENDING (first time only, while the user confirms on-device)
    <- HELLO_OK  { sessionId, token, asset digests }
-   -> push any asset whose digest differs from yours  (button map is mandatory)
+   -> push any asset whose digest differs from yours  (UI declaration is mandatory)
    -> ACQUIRE
    <- FOREGROUND
    ... push content, receive button events ...
@@ -130,8 +130,8 @@ everything else is background.
   brought that app to the foreground on their phone; the firmware has no
   standing to second-guess that. The preempted session gets `BACKGROUND` with
   reason `PREEMPTED`.
-- `ACQUIRE` is **rejected** if the peer has no stored button map (see "Button
-  map" below) — `ACQUIRE_DENIED` with reason `NO_BUTTON_MAP`. Push the map,
+- `ACQUIRE` is **rejected** if the peer has no stored UI declaration (see "UI
+  declaration field" below) — `ACQUIRE_DENIED` with reason `NO_UI_DECLARATION`. Push the declaration,
   then retry.
 - The device retains **no content for a background session**. On regaining the
   foreground an app re-pushes everything it wants shown. (Buffering per-session
@@ -146,7 +146,7 @@ diagnostic.
 
 - Granted → `FOREGROUND` with your `sessionId`.
 - Refused → `ACQUIRE_DENIED` with a reason. Today the only recoverable one is
-  `NO_BUTTON_MAP`: push field `0x05`, then retry.
+  `NO_UI_DECLARATION`: push field `0x05`, then retry.
 
 A `FOREGROUND` notification is also how you learn you got the screen *back*
 after being preempted. The device retains nothing for a background session, so
@@ -259,7 +259,7 @@ BACKGROUND reason        0x00 PREEMPTED         another session acquired the scr
                          0x01 RELEASED          this session released it
                          0x02 LINK_LOST         (informational; not deliverable in practice)
 
-ACQUIRE_DENIED reason    0x00 NO_BUTTON_MAP     push field 0x05, then retry
+ACQUIRE_DENIED reason    0x00 NO_UI_DECLARATION push field 0x05, then retry
                          0x01 UNKNOWN_SESSION   no such live session
 
 ASSET_ACK result         0x00 STORED
@@ -295,6 +295,11 @@ while a prompt is up is denied with `BUSY` and should retry once the user has
 dealt with the first — stacking prompts would leave the user confirming an app
 whose name is no longer on screen.
 
+`BUSY` is the one refusal worth retrying; every other `HELLO_DENIED` reason is an
+answer. **Retrying means reconnecting**, not re-sending `HELLO` on the same link:
+there is no "start over on this connection" message, by design — one handshake
+per link keeps the session table's lifetime trivially tied to the connection.
+
 A known peer presenting its correct token gets `HELLO_OK` immediately, with no
 prompt. That is the whole of the "connects automatically" relationship.
 
@@ -318,7 +323,7 @@ assetCount : 1
 assetCount x { assetId : 1, tag : 4 }
 ```
 
-`assetId` values match the content field ids: `0x05` button map, `0x06` icon.
+`assetId` values match the content field ids: `0x05` UI declaration, `0x06` icon.
 
 The client compares each tag against the tag of the asset it would push, and
 pushes only the ones that differ, as content fields `0x05` / `0x06`, each
@@ -340,7 +345,7 @@ A tag of `00 00 00 00` on the wire means "no asset stored". Do not use it as a
 real tag value; if your hash lands on it, push anything else (e.g. flip the low
 bit).
 
-**A peer with no button map cannot take the screen** (see `ACQUIRE_DENIED`).
+**A peer with no UI declaration cannot take the screen** (see `ACQUIRE_DENIED`).
 This makes "an app with undefined buttons" structurally impossible rather than
 a case the rendering code has to handle.
 
@@ -395,13 +400,14 @@ discarded on disconnect and on a foreground handover.
 | `0x02` | body | max text length (capability) | RAM |
 | `0x03` | content-id | 32 bytes | RAM |
 | `0x04` | image | max image length (capability) | **streamed to SD**, never buffered in RAM |
-| `0x05` | button map | 512 bytes | SD (`buttons.json`) |
+| `0x05` | UI declaration (buttons + tags) | 512 bytes | SD (`ui.bin`) |
 | `0x06` | icon | icon width x height / 8 bytes | SD (`icon.bin`) |
+| `0x07` | tag state | 13 bytes | RAM (foreground only) |
 
-Next free: `0x07`.
+Next free: `0x08`.
 
 Content past a field's cap is truncated (title/body/content-id) or rejected
-outright with `ASSET_ACK`/`IMAGE_STATUS` (image, button map, icon) — a
+outright with `ASSET_ACK`/`IMAGE_STATUS` (image, UI declaration, icon) — a
 truncated asset is worse than no asset.
 
 ### Atomic multi-field pushes (`0x80` final-field flag)
@@ -441,9 +447,9 @@ alongside every title/body can detect "this button press was for an article I
 have since replaced" (a reconnect race, a fast skip) and no-op instead of
 acting on stale on-screen state.
 
-The device does not reset content-id when a new body arrives (unlike the
-read-later indicator). A client that cares about this correlation should push a
-new content-id with every title/body update.
+The device does not reset content-id when a new body arrives, any more than it
+resets tags. A client that cares about this correlation should push a new
+content-id with every title/body update.
 
 Max length: **32 bytes** (`kMaxContentIdLen` in `src/CompanionBle.h`) — see
 "Content-id budget" below for why it is so much smaller than title/body.
@@ -510,16 +516,49 @@ afterwards returns the screen to text. There is no compositing of the two, and
 no "image mode" the client enters or leaves: the last completed push of either
 kind is what is on screen.
 
-### Button map field (`0x05`)
+**Tags are drawn over an image, but only if you switch one on.** A visible tag
+is rendered as a chip in the top corner of the print, over the image content —
+there is nowhere else for it to go, since reserving a band would shrink the
+image and force the scaling that ruins your dither.
+
+So the choice is yours and it is explicit: leave every tag hidden and the print
+is pixel-exact, or switch one on and accept the pixels the chip costs. The
+device does not decide this for you, and it does not silently drop tags on the
+image screen either — the earlier behaviour, where tag state was accepted,
+acknowledged and then never drawn on an image, was a silent no-op and is gone.
+
+### UI declaration field (`0x05`)
+
+Everything the app declares about its own on-device UI: what its buttons do and
+what they are called, and what tags exist and what they are called. One asset,
+one digest.
 
 ```
-bytes 0..3   asset tag (opaque, stored verbatim — see "Asset digests")
-byte 4       entry count N
+bytes 0..3   asset digest (opaque, stored verbatim — see "Asset digests")
+
+byte 4       button entry count N
 N x {  buttonId : 1
        routing  : 1
        labelLen : 1
        label    : labelLen bytes, UTF-8, may be empty  }
+
+byte         tag entry count M          <- optional; absent means "no tags"
+M x {  tagId    : 1
+       labelLen : 1
+       label    : labelLen bytes, UTF-8  }
 ```
+
+**Why one asset and not two.** Buttons and tags are the same kind of thing — near
+static strings the device stores and draws without understanding — and they
+change on the same cadence, at app update. Folding them halves the digest
+bookkeeping every client has to do, keeps `HELLO_OK`'s digest block at two
+entries, and means an app writes one encoder instead of two. The cost is that
+relabelling a tag re-pushes the buttons too, which is a few hundred bytes once
+per app version.
+
+An app with no tags may simply stop after its buttons; the tag count byte is
+optional. An app with no buttons still needs this asset — `ACQUIRE` is gated on
+it existing.
 
 `buttonId` uses the same values as the button-event characteristic (table
 below). A button not listed behaves as `NONE`.
@@ -549,19 +588,78 @@ Notes:
   everything else notifies) does not survive — an app declares its scheme or
   does not get the screen. The firmware keeps a fixed internal scheme only for
   its own screens: the pairing prompt, "waiting for <app>", and the sleep grid.
-- Persisted to `buttons.json` in the peer directory, so the hints stay correct
-  while disconnected.
+- Persisted to `ui.bin` in the peer directory, so the hints stay correct while
+  disconnected.
 - Ship a new tag when an app update changes the scheme; the device picks it up
   on the next connect without re-pairing.
 
-Max 512 bytes total, which is far more than the 7 physical buttons need.
+#### Tags
+
+A tag is a short labelled chip the device draws beside the title, which the app
+switches on and off at runtime. **The firmware defines no tags.** There is no
+built-in "saved", no fixed slots, no reserved ids, no enum of permitted values —
+the app declares which tags exist and what each is called, exactly as it declares
+button labels, and the device stores the strings and renders them. This is the
+same three-part shape as buttons: the app declares the set, the device persists
+and draws it, and the runtime message carries only state.
+
+- **`tagId` is per-peer.** It means whatever the declaring app says it means, and
+  two apps both using id `0` never collide, because each peer's declaration is
+  its own. Ids need not be contiguous or start at zero.
+- Limits: **6 tags**, label **12 bytes** each. Longer labels are truncated on a
+  UTF-8 boundary; tags past the sixth are dropped. These are what bound the
+  device's per-peer RAM (90 bytes, resident only for the foreground peer).
+- Every tag starts **hidden** when the declaration is loaded. Declaring a tag
+  says it exists, not that it is on.
+- A tag id that was never declared is ignored wherever it appears. The
+  declaration is the only place tags come into existence.
+
+Max 512 bytes total for the whole declaration, which is far more than 7 buttons
+and 6 tags need.
+
+### Tag state field (`0x07`)
+
+```
+byte 0       entry count K
+K x {  tagId : 1
+       state : 1  }
+```
+
+```
+state   0x00 HIDDEN    declared but not drawn at all
+        0x01 OUTLINE   drawn, unfilled
+        0x02 FILLED    drawn, filled
+```
+
+Carries no labels and declares nothing — only which of the peer's already
+declared tags are now in which state. Ids not in the message keep their current
+state.
+
+**This field exists so tag state can ride the `0x80` atomic batch.** Push it in
+the same batch as title/body and the content and its tags commit in a single
+redraw, so there is never a frame where new content wears the previous content's
+tags:
+
+```
+title  (0x01)
+body   (0x02)
+tags   (0x07 | 0x80)     <- final: everything commits here, one redraw
+```
+
+That ordering problem is real and worth stating plainly: **tags are not reset by
+a content push.** When a tag should clear is app meaning — the same reasoning
+that keeps the firmware out of button semantics — so a device that cleared tags
+because a body arrived would be interpreting. If you push content without tag
+state, the previous content's tags stay on screen. Push both together.
+
+Tags **are** cleared on a foreground handover, since they carry the outgoing
+app's meaning and not the incoming one's, and on a fresh UI declaration.
 
 ### Icon field (`0x06`)
 
 ```
-bytes 0..3   asset tag (opaque, stored verbatim)
-bytes 4..N   1-bpp bitmap, row-major, MSB-first within each byte,
-             rows padded to whole bytes
+bytes 0..3   asset digest (opaque, stored verbatim)
+bytes 4..N   1-bpp bitmap, row-major, MSB-first within each byte
 ```
 
 Exactly `iconWidth x iconHeight / 8` bitmap bytes for the dimensions advertised
@@ -622,7 +720,7 @@ These ids mirror `HalGPIO::BTN_*`/`InputManager::BTN_*` exactly (see
 uses internally, not a protocol-specific renumbering.
 
 Unlike v5, **which buttons reach the wire is now the app's decision**, declared
-in its button map. LEFT/RIGHT are no longer hardwired to local paging and
+in its UI declaration. LEFT/RIGHT are no longer hardwired to local paging and
 POWER is still never notified.
 
 A press/hold/release sequence looks like this on the wire (BACK held for 1.5 s
@@ -679,7 +777,7 @@ byte 0        protocol version = 6
 byte 1        screen width in characters, at the font Companion Mode uses
 byte 2        screen height in characters (lines per page)
 bytes 3..4    max text field length, uint16 LE — title/body only
-byte 5        feature flags: bit0 image, bit1 button map, bit2 icons, bit3 sessions
+byte 5        feature flags: bit0 image, bit1 UI declaration, bit2 icons, bit3 sessions
 bytes 6..9    max image field length, uint32 LE
 byte 10       max concurrent sessions (4)
 byte 11       icon width in pixels
@@ -718,37 +816,26 @@ the pixel canvas an image push should target.
 
 ---
 
-## Status characteristic — indicator slots
+## Status characteristic — setting one tag without re-pushing content
 
 Phone → device. Three bytes:
 
 ```
 byte 0:  sessionId
-byte 1:  indicatorId   (0..3)
-byte 2:  state         (0 hidden, 1 outline, 2 filled)
+byte 1:  tagId       (one the peer declared)
+byte 2:  state       (0 hidden, 1 outline, 2 filled)
 ```
 
-The device draws a small mark per slot along the right edge of the title row,
-and **has no idea what any of them mean.** "Saved", "playing", "unread",
-"synced" are all app vocabulary; the firmware knows only "slot 2 is filled".
+The state-only path. Use it when a tag changes but the content did not — the
+user saved the article that is already on screen, playback started, a sync
+finished. It avoids re-sending a body to flip one chip, and redraws with a
+no-flash differential refresh.
 
-This is the same principle as the button map: the app declares what exists, the
-device renders it, and interpretation stays on the phone. There is no
-`READ_LATER_SAVED` any more — see the v6 migration list.
+Use the content field `0x07` instead whenever the content is changing too, so
+the two commit together.
 
-Notes:
-
-- **Indicators are not reset by a content push.** When an indicator should clear
-  is app meaning, and only the app knows it. Set it to `hidden` yourself. (v5's
-  read-later flag auto-cleared on a new body; that behaviour encoded one app's
-  article model into the firmware and is gone.)
-- They *are* cleared on a foreground handover, since they carry the outgoing
-  app's meaning and not the incoming one's.
-- Writes from a non-foreground session are ignored.
-- A change redraws with a no-flash differential refresh, never a full flash.
-- The mark is a deliberately neutral square rather than v5's star: a star reads
-  as "favourite", which is exactly the app-level meaning the device is not
-  allowed to hold.
+Writes from a non-foreground session are ignored, and a `tagId` the peer never
+declared is ignored.
 
 ## On-screen behaviour
 
@@ -774,13 +861,15 @@ means:
 /.crosspoint/companion/
   peers.json                 index: peerKey -> { appId, installId, displayName, lastSeenMs }
   peers/<peerKey>/
-    peer.json                display name, auth token, asset tags
+    token.bin                16-byte pairing token
     icon.bin                 1-bpp sleep-screen icon
-    buttons.json             button map (labels + routing)
+    ui.bin                   UI declaration (button routing/labels + tag labels)
     data/                    per-peer scratch: staged image, event logs
 ```
 
-`peerKey` is the first 8 hex chars of a hash over `appId || installId`. Peer
+Assets are stored as the exact bytes the phone pushed, digest included — the
+digest has to survive verbatim anyway, and a blob costs no parser. `peerKey` is
+the first 8 hex chars of a SHA-256 over `appId || installId`. Peer
 directories are capped at 32, evicting the least recently seen — unbounded
 growth would make `peers.json` unbounded, and it is parsed into RAM.
 
@@ -801,17 +890,20 @@ Migration checklist for a v5 client:
    now 7 bytes, not 4.
 4. **Button-event payload gained a leading `sessionId` byte**; header and
    duration shifted by one, content-id now starts at byte 4.
-5. **The Status characteristic is now generic indicator slots**, 3 bytes
-   (`sessionId`, `indicatorId`, `state`), not a 1-byte `READ_LATER_SAVED`. Map
-   your own meaning onto a slot; the device holds none. Note that indicators no
-   longer auto-clear on a body push — clear them yourself.
+5. **The Status characteristic sets one app-declared tag**, 3 bytes
+   (`sessionId`, `tagId`, `state`), not a 1-byte `READ_LATER_SAVED`. The device
+   holds no vocabulary: declare your tags in field `0x05`, then switch them.
+   Tags do not auto-clear on a body push — push field `0x07` in the same atomic
+   batch instead.
 6. **Capability characteristic grew from 5 bytes to 23** with a new layout past
    byte 4.
-7. **Push a button map (field `0x05`) before `ACQUIRE`.** There is no default
-   map; without one `ACQUIRE` is denied and nothing renders.
+7. **Push a UI declaration (field `0x05`) before `ACQUIRE`.** There is no
+   default; without one `ACQUIRE` is denied and nothing renders. It carries both
+   button routing/labels and tag labels.
 8. Optional but recommended: push an icon (field `0x06`) so the app appears on
    the sleep screen.
-9. New fields available: `0x04` image, `0x05` button map, `0x06` icon.
+9. New fields available: `0x04` image, `0x05` UI declaration, `0x06` icon,
+   `0x07` tag state.
 10. `deviceId` and screen pixel dimensions are now readable from the capability
     characteristic, which is guaranteed readable *before* the handshake — check
     byte 0 and refuse a non-6 device with a real message, because a v6 device
@@ -824,7 +916,7 @@ Design decisions made during implementation, beyond
 `ACQUIRE_DENIED` / `ASSET_ACK` / `IMAGE_STATUS` notifications, `sessionId` on
 button events and Status writes, the uint32 START length, the capability block's
 screen-pixel and content-id-cap entries, and the replacement of the named
-`READ_LATER_SAVED` status byte with anonymous indicator slots. Each is recorded in place
+`READ_LATER_SAVED` status byte with app-declared tags. Each is recorded in place
 above with its rationale; §12 of the design doc records the resolutions of its
 open questions.
 
@@ -858,8 +950,8 @@ READ_LATER) and added the Status characteristic.
 - **Firmware**: `src/CompanionBle.h`/`src/CompanionBle.cpp` (service and
   characteristics, session table, content reassembly, image streaming to SD,
   button-event notify, capability characteristic);
-  `src/CompanionPeerStore.{h,cpp}` (peer directory, tokens, asset tags, button
-  map, icons); `src/activities/companion/CompanionModeActivity.{h,cpp}` (the
+  `src/CompanionPeerStore.{h,cpp}` (peer directory, tokens, asset digests, UI
+  declaration, icons); `src/activities/companion/CompanionModeActivity.{h,cpp}` (the
   on-device screen: pagination, pairing prompt, button routing, image render,
   sleep grid). See `docs/companion-mode-implementation-notes.md` for the
   bring-up log.
@@ -868,7 +960,7 @@ READ_LATER) and added the Status characteristic.
   ACQUIRE/RELEASE, asset digest compare-and-push, the framer, and button-event
   decoding. Shared by this fork's consumer apps; see its `README.md`.
 - **Python client**: `scripts/push_companion_content.py` pushes title/body/
-  content-id, a button map, an icon and an image over BLE straight from a dev
+  content-id, a UI declaration, an icon and an image over BLE straight from a dev
   machine (`bleak`, see `scripts/requirements.txt`). Run with `--help`. It
   implements the exact framing above and is the fastest way to exercise the
   firmware without an app.
@@ -895,16 +987,17 @@ Sessions and pairing:
 7. Two `HELLO`s in flight at once with different `helloTag`s: each reply
    carries the matching tag.
 
-Button map gating:
+UI declaration gating:
 
-8. Immediately after `HELLO_OK` with an all-zero button-map tag, send
-   `ACQUIRE`: confirm `ACQUIRE_DENIED(NO_BUTTON_MAP)` and nothing on screen
+8. Immediately after `HELLO_OK` with an all-zero declaration digest, send
+   `ACQUIRE`: confirm `ACQUIRE_DENIED(NO_UI_DECLARATION)` and nothing on screen
    changes.
-9. Push field `0x05` with a valid map: `ASSET_ACK(STORED)`. `ACQUIRE` now
-   returns `FOREGROUND`.
-10. Reconnect: `HELLO_OK`'s digest block reports the tag just pushed, not
+9. Push field `0x05` with a valid declaration: `ASSET_ACK(STORED)`. `ACQUIRE`
+   now returns `FOREGROUND`.
+10. Reconnect: `HELLO_OK`'s digest block reports the digest just pushed, not
     zeros. Push nothing and `ACQUIRE` — accepted.
-11. Push a map with a new tag and different labels: the hint row changes.
+11. Push a declaration with a new digest and different labels: the hint row
+    changes, and `CMD:CUI` reads back both the buttons and the tags.
 12. Map a button to `LOCAL_PAGE_NEXT` and confirm it pages on-device with no BLE
     event; map the same button to `REMOTE` and confirm it now notifies instead.
 13. Map POWER to `NONE` and confirm POWER still sleeps the device.
@@ -920,9 +1013,14 @@ Content and sessions:
     `sessionId` and the pushed content-id.
 18. Push a *different* content-id and confirm a stale client-side comparison
     would reject the next press.
-19. Write Status `[sessionId, 0, 2]` and confirm indicator slot 0 fills with no
-    flash; `[sessionId, 0, 1]` for outline, `[sessionId, 0, 0]` to clear. Push a
-    new body afterwards and confirm the indicator does **not** reset itself.
+19. Declare two tags in the UI declaration, then write Status
+    `[sessionId, <tagId>, 2]` and confirm that tag's chip appears filled with no
+    flash; `1` for outline, `0` to hide. Confirm an undeclared id does nothing.
+20. Push a new body afterwards and confirm the tag does **not** reset itself,
+    then push title+body+`0x07 | 0x80` together and confirm the content and the
+    tag change in one redraw.
+21. Confirm a long tag label is truncated rather than crowding the title, and
+    that hiding every tag returns the title to full width.
 20. With two sessions live, push content from the background session: nothing on
     screen changes. `ACQUIRE` from it: the other session gets
     `BACKGROUND(PREEMPTED)` and the screen clears to the new session's content.
@@ -931,7 +1029,7 @@ Content and sessions:
 
 Images:
 
-23. Push a correctly-sized 8-bit grayscale PNG using only `{0,85,170,255}`:
+24. Push a correctly-sized grayscale PNG using only `{0,85,170,255}`:
     confirm it renders full-screen, the grayscale settle runs, and
     `IMAGE_STATUS(DISPLAYED)` arrives.
 24. Confirm the staged file lands under `peers/<peerKey>/data/` and that free
@@ -943,6 +1041,8 @@ Images:
     device does not try to decode it.
 27. Push an image larger than the advertised max: `IMAGE_STATUS(REJECTED_SIZE)`.
 28. Push a body after an image and confirm the screen returns to text.
+28b. With a tag visible, push an image and confirm the chip is drawn over the
+    print; hide every tag, re-push, and confirm the print is untouched.
 
 Icons and sleep screen:
 

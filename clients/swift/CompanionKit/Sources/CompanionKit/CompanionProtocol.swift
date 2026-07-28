@@ -41,8 +41,11 @@ public enum CompanionField: UInt8, Sendable, CaseIterable {
     case body = 0x02
     case contentId = 0x03
     case image = 0x04
-    case buttonMap = 0x05
+    /// Buttons and tags in one versioned asset — see ``UiDeclaration``.
+    case uiDeclaration = 0x05
     case icon = 0x06
+    /// Which of the peer's declared tags are currently in which state.
+    case tagState = 0x07
 }
 
 /// Session characteristic opcodes, phone -> device.
@@ -89,7 +92,7 @@ public enum BackgroundReason: UInt8, Sendable {
 }
 
 public enum AcquireDeniedReason: UInt8, Sendable {
-    case noButtonMap = 0x00
+    case noUiDeclaration = 0x00
     case unknownSession = 0x01
     case unknown = 0xFF
 
@@ -116,23 +119,25 @@ public enum ImageResult: UInt8, Sendable {
     init(wire: UInt8) { self = ImageResult(rawValue: wire) ?? .unknown }
 }
 
-/// How an indicator slot is drawn. Deliberately visual, not semantic: the device
-/// knows "slot 2 is filled" and nothing else. "Saved", "playing", "unread" are
-/// your app's vocabulary — map them onto slots yourself.
-public enum IndicatorState: UInt8, Sendable {
+/// How a declared tag is drawn. Visual, not semantic — what "on" means is your
+/// app's business, and the device has no opinion.
+public enum TagState: UInt8, Sendable {
+    /// Declared but not drawn at all, and taking no space.
     case hidden = 0x00
     case outline = 0x01
     case filled = 0x02
 }
 
-/// Indicator slots the device draws along the right edge of the title row.
-public enum CompanionIndicator {
-    public static let count = 4
+public enum CompanionTagLimits {
+    /// Tags past this many are dropped by the device.
+    public static let maxTags = 6
+    /// Labels longer than this are truncated on a UTF-8 boundary.
+    public static let maxLabelBytes = 12
 }
 
 /// Raw physical buttons. These mirror the firmware's own HAL indices; they are
 /// not a protocol-specific renumbering, and their *meaning* is entirely the
-/// app's to define via a ``ButtonMap``.
+/// app's to define via a ``UiDeclaration``.
 public enum CompanionButton: UInt8, Sendable, CaseIterable {
     case back = 0x00
     case confirm = 0x01

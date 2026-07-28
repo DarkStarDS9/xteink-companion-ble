@@ -63,10 +63,10 @@ public enum CompanionEvent: Sendable {
 
 /// Supplies the per-peer assets the device stores and versions by tag.
 ///
-/// The button map is mandatory — without one the device refuses `ACQUIRE`. The
-/// icon is optional but is what puts the app on the sleep screen.
+/// The UI declaration is mandatory — without one the device refuses `ACQUIRE`.
+/// The icon is optional but is what puts the app on the sleep screen.
 public protocol CompanionAssetProvider: AnyObject, Sendable {
-    var buttonMap: ButtonMap { get }
+    var uiDeclaration: UiDeclaration { get }
     /// Raw 1-bpp bitmap, row-major, MSB first, exactly
     /// ``CompanionCapabilities/iconByteCount`` bytes for the advertised icon
     /// size. `nil` to not have an icon.
@@ -75,11 +75,11 @@ public protocol CompanionAssetProvider: AnyObject, Sendable {
 
 /// A ``CompanionAssetProvider`` for apps that just want to hand over two values.
 public final class StaticAssetProvider: CompanionAssetProvider, @unchecked Sendable {
-    public let buttonMap: ButtonMap
+    public let uiDeclaration: UiDeclaration
     private let iconBitmap: Data?
 
-    public init(buttonMap: ButtonMap, icon: Data? = nil) {
-        self.buttonMap = buttonMap
+    public init(uiDeclaration: UiDeclaration, icon: Data? = nil) {
+        self.uiDeclaration = uiDeclaration
         self.iconBitmap = icon
     }
 
@@ -94,7 +94,8 @@ public final class StaticAssetProvider: CompanionAssetProvider, @unchecked Senda
 ///
 /// Typical use:
 /// ```swift
-/// let client = CompanionClient(identity: identity, assets: StaticAssetProvider(buttonMap: .readerDefault()))
+/// let client = CompanionClient(identity: identity,
+///                               assets: StaticAssetProvider(uiDeclaration: .readerDefault()))
 /// Task { for await event in client.events { handle(event) } }
 /// client.startScanning()
 /// // ... on `.discovered`:
@@ -276,11 +277,19 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     /// device; content-id over 32 bytes likewise. Pass a fresh `contentId` with
     /// every update if you care about correlating button events to what was on
     /// screen when they were pressed.
-    public func push(title: String? = nil, body: String? = nil, contentId: Data? = nil) async throws {
+    public func push(title: String? = nil,
+                     body: String? = nil,
+                     contentId: Data? = nil,
+                     tags: TagStateUpdate? = nil) async throws {
         var fields: [(CompanionField, Data)] = []
         if let title { fields.append((.title, Data(title.utf8))) }
         if let body { fields.append((.body, Data(body.utf8))) }
         if let contentId { fields.append((.contentId, contentId.prefix(CompanionProtocol.maxContentIdLength))) }
+        // Last, so it shares the batch's final flag: content and its tags then
+        // commit in one redraw and there is never a frame where new content
+        // wears the previous content's tags. Tags are not reset by a push, so
+        // passing them here is the only way to change both atomically.
+        if let tags { fields.append((.tagState, tags.encoded())) }
         guard !fields.isEmpty else { return }
 
         try await serialized { [self] in
@@ -294,9 +303,12 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         }
     }
 
-    /// Convenience over ``push(title:body:contentId:)`` for a string content-id.
-    public func push(title: String? = nil, body: String? = nil, contentId: String) async throws {
-        try await push(title: title, body: body, contentId: Data(contentId.utf8))
+    /// Convenience over ``push(title:body:contentId:tags:)`` for a string content-id.
+    public func push(title: String? = nil,
+                     body: String? = nil,
+                     contentId: String,
+                     tags: TagStateUpdate? = nil) async throws {
+        try await push(title: title, body: body, contentId: Data(contentId.utf8), tags: tags)
     }
 
     /// Pushes an already-dithered, already-encoded PNG and waits for the device
@@ -341,23 +353,23 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         }
     }
 
-    /// Sets one of the device's indicator slots.
+    /// Sets one declared tag, without re-pushing content.
     ///
-    /// The device draws a mark and knows nothing about what it means — "saved",
-    /// "playing", "unread" are your app's vocabulary, mapped onto a slot index.
-    /// Slots do **not** clear themselves when you push new content; set them to
-    /// ``IndicatorState/hidden`` yourself when they no longer apply.
-    public func setIndicator(_ slot: Int, _ state: IndicatorState) {
-        guard slot >= 0, slot < CompanionIndicator.count else { return }
+    /// Use this when a tag changes but the content did not — the user saved the
+    /// article already on screen, playback started, a sync finished. When the
+    /// content is changing too, pass a ``TagStateUpdate`` to
+    /// ``push(title:body:contentId:tags:)`` instead so the two commit together.
+    ///
+    /// `id` must be one your ``UiDeclaration`` declared; the device ignores any
+    /// other. Tags do **not** clear themselves when you push new content.
+    public func setTag(_ id: UInt8, _ state: TagState) {
         lock.lock()
         let session = sessionId
         let characteristic = statusChar
         let target = peripheral
         lock.unlock()
         guard session != CompanionProtocol.noSession, let characteristic, let target else { return }
-        target.writeValue(Data([session, UInt8(slot), state.rawValue]),
-                          for: characteristic,
-                          type: .withoutResponse)
+        target.writeValue(Data([session, id, state.rawValue]), for: characteristic, type: .withoutResponse)
     }
 
     // MARK: Handshake
@@ -428,12 +440,14 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     private func syncAssets(reported: [UInt8: AssetTag],
                             capabilities: CompanionCapabilities,
                             sessionId session: UInt8) async throws {
-        let map = assets.buttonMap
-        if reported[CompanionField.buttonMap.rawValue] != map.tag {
-            let result = try await sendAsset(.buttonMap, payload: map.encodedAsset(), sessionId: session)
-            emit(.assetSynced(field: .buttonMap, result: result))
+        let declaration = assets.uiDeclaration
+        if reported[CompanionField.uiDeclaration.rawValue] != declaration.tag {
+            let result = try await sendAsset(.uiDeclaration,
+                                             payload: declaration.encodedAsset(),
+                                             sessionId: session)
+            emit(.assetSynced(field: .uiDeclaration, result: result))
             guard result == .stored else {
-                throw CompanionError.assetRejected(field: .buttonMap, result: result)
+                throw CompanionError.assetRejected(field: .uiDeclaration, result: result)
             }
         }
 

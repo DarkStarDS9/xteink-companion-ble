@@ -26,7 +26,7 @@ public struct CompanionCapabilities: Equatable, Sendable {
     public let imageGrayLevels: Int
 
     public var supportsImage: Bool { featureFlags & 0x01 != 0 }
-    public var supportsButtonMap: Bool { featureFlags & 0x02 != 0 }
+    public var supportsUiDeclaration: Bool { featureFlags & 0x02 != 0 }
     public var supportsIcons: Bool { featureFlags & 0x04 != 0 }
     public var supportsSessions: Bool { featureFlags & 0x08 != 0 }
 

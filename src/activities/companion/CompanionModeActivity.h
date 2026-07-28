@@ -45,11 +45,23 @@ class CompanionModeActivity final : public Activity {
   bool connected = false;
   bool haveContent = false;
 
-  // Indicator slots set by the foreground app over the Status characteristic.
-  // The device draws a mark per slot and knows nothing about what any of them
-  // mean — "saved", "playing", "unread" are all phone-side semantics. Not reset
-  // by a content push: when an indicator should clear is app meaning too.
-  uint8_t indicators[companionble::kMaxIndicators] = {0};
+  // The foreground app's declared tags: short labelled chips it switches on and
+  // off. The firmware declares none of these — id, label and meaning all come
+  // from the peer's UI declaration, and the device only draws them. Not reset by
+  // a content push: when a tag should clear is app meaning too, so an app that
+  // wants them to change together pushes tag state inside the same atomic batch.
+  //
+  // MEMORY: kMaxTags (6) x (kMaxTagLabelLen + 1 + 2) = 90 bytes, resident only
+  // for the peer that currently owns the screen. Every other peer's declaration
+  // stays on SD.
+  struct TagSpec {
+    uint8_t id = 0;
+    uint8_t state = 0;  // companionble::TagState
+    char label[companionble::kMaxTagLabelLen + 1] = {0};
+  };
+  TagSpec tags[companionble::kMaxTags];
+  uint8_t tagCount = 0;
+  int tagRowWidth = 0;  // measured once per change, so the title wrap can reserve it
 
   // Set when a Status write lands, so the next renderPage() flips the E-ink
   // panel with FAST_REFRESH regardless of the normal per-page-turn refresh
@@ -120,8 +132,11 @@ class CompanionModeActivity final : public Activity {
   const char* screenName() const;
 
   void notifyHeldButton(companionble::ButtonId button);
-  void loadButtonMap();
-  void clearButtonMap();
+  void loadUiDeclaration();
+  void clearUiDeclaration();
+  void applyTagState(const uint8_t* data, size_t len);
+  void setTagState(uint8_t tagId, uint8_t state);
+  void measureTagRow();
   companionble::ButtonRouting routingFor(companionble::ButtonId button) const;
   const char* labelFor(companionble::ButtonId button) const;
   bool handleMappedButton(MappedInputManager::Button role, companionble::ButtonId id);
@@ -138,7 +153,7 @@ class CompanionModeActivity final : public Activity {
   void renderStartFailed();
   void renderPage();
   void renderImage();
-  void renderIndicators(int rightEdgeX, int centerY) const;
+  void renderTags(int rightEdgeX, int centerY) const;
   void checkIdleTimers();
 
  public:

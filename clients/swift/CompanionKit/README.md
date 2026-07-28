@@ -16,8 +16,8 @@ If this package and that document disagree, the document is right.
 - The full `HELLO` handshake: pairing prompt, token enrollment, token persistence, and reconnecting
   silently afterwards.
 - `appId` / `installId` management, with the install id minted once into `UserDefaults`.
-- Asset digests: compares the tags the device reports against your button map and icon, and pushes
-  only what changed.
+- Asset digests: compares the digests the device reports against your UI declaration and icon, and
+  pushes only what changed.
 - `ACQUIRE` / `RELEASE` as explicit calls — see "Screen ownership is not app
   lifecycle" below.
 - An observable session state, including the one state with real UI attached
@@ -84,15 +84,20 @@ import CompanionKit
 let identity = CompanionIdentity(appId: UUID(uuidString: "6E7E0C2A-2B1D-4E44-9F0B-6D5C2E1A9F31")!,
                                  displayName: "Snap2Ink")
 
-let buttons = ButtonMap([
-    ButtonMapEntry(.confirm, .remote, label: "Shoot"),
-    ButtonMapEntry(.left,  .remote, label: "Prev"),
-    ButtonMapEntry(.right, .remote, label: "Next"),
-    ButtonMapEntry(.back,  .localSleep, label: "Sleep")
-])
+// One declaration covers both what the buttons do and what tags exist. The
+// device defines neither — it stores your strings and draws them.
+let ui = UiDeclaration(
+    buttons: [
+        ButtonMapEntry(.confirm, .remote, label: "Shoot"),
+        ButtonMapEntry(.left,  .remote, label: "Prev"),
+        ButtonMapEntry(.right, .remote, label: "Next"),
+        ButtonMapEntry(.back,  .localSleep, label: "Sleep")
+    ],
+    tags: [TagDeclaration(id: 0, label: "Saved")]
+)
 
 let client = CompanionClient(identity: identity,
-                             assets: StaticAssetProvider(buttonMap: buttons, icon: myIconBitmap))
+                             assets: StaticAssetProvider(uiDeclaration: ui, icon: myIconBitmap))
 
 Task {
     for await event in client.events {
@@ -149,9 +154,9 @@ settle. That slowness is wanted, not a defect to design around.
 - **`installId` must persist.** Regenerating it makes a new peer: a new pairing prompt, a new
   directory on the device, and the assets pushed again. The default `UserDefaults` storage handles
   this; if you supply your own, do not lose it across launches.
-- **A button map is mandatory.** The device rejects `ACQUIRE` from a peer that has not declared what
-  its buttons do. There is no default. This package pushes yours automatically, but you must supply
-  one.
+- **A UI declaration is mandatory.** The device rejects `ACQUIRE` from a peer that has not declared
+  what its buttons do. There is no default. This package pushes yours automatically, but you must
+  supply one.
 - **Both apps on a phone see every notification.** One BLE link is shared by the whole device, so
   filtering on `sessionId` is not optional. This package does it for you; if you decode notifications
   yourself, do it too.
@@ -167,7 +172,7 @@ settle. That slowness is wanted, not a defect to design around.
 swift test
 ```
 
-Covers the framer, the session codec, the capability parser, the button map encoder, button-event
-decoding and identity/token storage — everything that is pure bytes. The CoreBluetooth layer is not
+Covers the framer, the session codec, the capability parser, the UI declaration and tag-state
+encoders, button-event decoding and identity/token storage — everything that is pure bytes. The CoreBluetooth layer is not
 unit-tested; it is verified against real hardware with the checklist at the end of the protocol
 document.

@@ -48,7 +48,7 @@ final class CapabilitiesTests: XCTestCase {
         block[5] = 0x0A                      // button map + sessions only
         let capabilities = CompanionCapabilities(block)!
         XCTAssertFalse(capabilities.supportsImage)
-        XCTAssertTrue(capabilities.supportsButtonMap)
+        XCTAssertTrue(capabilities.supportsUiDeclaration)
         XCTAssertFalse(capabilities.supportsIcons)
         XCTAssertTrue(capabilities.supportsSessions)
     }
@@ -60,44 +60,105 @@ final class CapabilitiesTests: XCTestCase {
     }
 }
 
-final class ButtonMapTests: XCTestCase {
+final class UiDeclarationTests: XCTestCase {
     func testEncodedBodyLayout() {
-        let map = ButtonMap([
+        let declaration = UiDeclaration(buttons: [
             ButtonMapEntry(.left, .localPagePrevious, label: "<"),
             ButtonMapEntry(.confirm, .remote, label: "Shutter")
         ])
-        let body = map.encodedBody()
+        let body = declaration.encodedBody()
 
-        XCTAssertEqual(body[0], 2)                                   // entry count
+        XCTAssertEqual(body[0], 2)                                   // button count
         XCTAssertEqual(Array(body[1 ..< 4]), [0x02, 0x02, 0x01])     // LEFT, LOCAL_PAGE_PREV, len 1
         XCTAssertEqual(body[4], UInt8(ascii: "<"))
         XCTAssertEqual(Array(body[5 ..< 8]), [0x01, 0x01, 0x07])     // CONFIRM, REMOTE, len 7
         XCTAssertEqual(String(data: body[8 ..< 15], encoding: .utf8), "Shutter")
+        XCTAssertEqual(body[15], 0, "a declaration with no tags still emits a zero count")
+        XCTAssertEqual(body.count, 16)
+    }
+
+    func testTagSectionLayout() {
+        let declaration = UiDeclaration(
+            buttons: [ButtonMapEntry(.confirm, .remote, label: "S")],
+            tags: [TagDeclaration(id: 7, label: "Saved"), TagDeclaration(id: 9, label: "New")]
+        )
+        let body = declaration.encodedBody()
+        // 1 count + (1+1+1+1) button = 5 bytes, then the tag section.
+        XCTAssertEqual(body[5], 2)                                   // tag count
+        XCTAssertEqual(Array(body[6 ..< 8]), [7, 5])                 // id 7, label len 5
+        XCTAssertEqual(String(data: body[8 ..< 13], encoding: .utf8), "Saved")
+        XCTAssertEqual(Array(body[13 ..< 15]), [9, 3])
+        XCTAssertEqual(String(data: body[15 ..< 18], encoding: .utf8), "New")
+    }
+
+    func testTagLabelsAreTruncatedOnAUTF8Boundary() {
+        let declaration = UiDeclaration(buttons: [],
+                                        tags: [TagDeclaration(id: 0, label: String(repeating: "é", count: 10))])
+        let body = declaration.encodedBody()
+        let labelLength = Int(body[3])
+        XCTAssertLessThanOrEqual(labelLength, CompanionTagLimits.maxLabelBytes)
+        XCTAssertNotNil(String(data: body[4 ..< (4 + labelLength)], encoding: .utf8))
+    }
+
+    func testTagsPastTheCapAreDropped() {
+        let many = (0 ..< 10).map { TagDeclaration(id: UInt8($0), label: "t\($0)") }
+        XCTAssertEqual(UiDeclaration(buttons: [], tags: many).tags.count, CompanionTagLimits.maxTags)
     }
 
     func testPowerEntriesAreDropped() {
         // POWER is firmware-owned. Encoding it would be silently ignored on the
-        // device, which would make the tag disagree with what is stored.
-        let map = ButtonMap([
+        // device, which would make our digest disagree with what is stored.
+        let declaration = UiDeclaration(buttons: [
             ButtonMapEntry(.power, .remote, label: "Nope"),
             ButtonMapEntry(.back, .remote, label: "Back")
         ])
-        XCTAssertEqual(map.entries.count, 1)
-        XCTAssertEqual(map.encodedBody()[0], 1)
+        XCTAssertEqual(declaration.buttons.count, 1)
+        XCTAssertEqual(declaration.encodedBody()[0], 1)
     }
 
-    func testEncodedAssetPrefixesTheTag() {
-        let map = ButtonMap.readerDefault()
-        let asset = map.encodedAsset()
-        XCTAssertEqual(Data(asset.prefix(4)), map.tag.bytes)
-        XCTAssertEqual(Data(asset.dropFirst(4)), map.encodedBody())
-        XCTAssertEqual(map.tag, AssetTag.contentHash(of: map.encodedBody()))
+    func testEncodedAssetPrefixesTheDigest() {
+        let declaration = UiDeclaration.readerDefault()
+        let asset = declaration.encodedAsset()
+        XCTAssertEqual(Data(asset.prefix(4)), declaration.tag.bytes)
+        XCTAssertEqual(Data(asset.dropFirst(4)), declaration.encodedBody())
+        XCTAssertEqual(declaration.tag, AssetTag.contentHash(of: declaration.encodedBody()))
     }
 
-    func testTagChangesWithTheScheme() {
-        let a = ButtonMap([ButtonMapEntry(.confirm, .remote, label: "Save")])
-        let b = ButtonMap([ButtonMapEntry(.confirm, .remote, label: "Queue")])
-        XCTAssertNotEqual(a.tag, b.tag, "an app update that relabels a button must re-push")
+    func testDigestChangesWithButtonsOrTags() {
+        let a = UiDeclaration(buttons: [ButtonMapEntry(.confirm, .remote, label: "Save")])
+        let b = UiDeclaration(buttons: [ButtonMapEntry(.confirm, .remote, label: "Queue")])
+        XCTAssertNotEqual(a.tag, b.tag, "relabelling a button must re-push")
+
+        let c = UiDeclaration(buttons: a.buttons, tags: [TagDeclaration(id: 0, label: "Saved")])
+        XCTAssertNotEqual(a.tag, c.tag, "adding a tag must re-push")
+    }
+}
+
+final class TagStateTests: XCTestCase {
+    func testEncodingIsCountThenPairs() {
+        let update = TagStateUpdate([3: .filled, 1: .hidden])
+        XCTAssertEqual(Array(update.encoded()), [2, 1, 0, 3, 2], "ordered by id, count first")
+    }
+
+    func testEmptyUpdateIsJustAZeroCount() {
+        XCTAssertEqual(Array(TagStateUpdate([:]).encoded()), [0])
+    }
+
+    func testUpdateIsCappedAtTheDeviceLimit() {
+        var states: [UInt8: TagState] = [:]
+        for id in 0 ..< 10 { states[UInt8(id)] = .outline }
+        XCTAssertEqual(Int(TagStateUpdate(states).encoded()[0]), CompanionTagLimits.maxTags)
+    }
+
+    func testTagStateRidesTheContentFraming() {
+        // The point of field 0x07: it is a content field, so it can carry the
+        // final flag and commit with title/body in one redraw.
+        let framer = ContentFramer(field: .tagState,
+                                   sessionId: 1,
+                                   payload: TagStateUpdate([0: .filled]).encoded(),
+                                   isFinal: true,
+                                   maxChunkPayload: 64)
+        XCTAssertEqual(Array(framer)[0][1], 0x07 | 0x80)
     }
 }
 

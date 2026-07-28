@@ -118,7 +118,7 @@ final class SessionCodecTests: XCTestCase {
         XCTAssertEqual(SessionCodec.decode(Data([0x85, 0x01, 0x00])),
                        .background(sessionId: 1, reason: .preempted))
         XCTAssertEqual(SessionCodec.decode(Data([0x86, 0x01, 0x00])),
-                       .acquireDenied(sessionId: 1, reason: .noButtonMap))
+                       .acquireDenied(sessionId: 1, reason: .noUiDeclaration))
     }
 
     func testDecodeAssetAckAndImageStatus() {

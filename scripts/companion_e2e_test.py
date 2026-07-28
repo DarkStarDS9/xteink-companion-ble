@@ -25,11 +25,11 @@ that has been granted access.
 Covered:
   enrollment   first contact, on-device confirm, token issued
   reconnect    stored token, silent reconnect, asset digests reported
-  buttonmap    ACQUIRE denied with no map; accepted after pushing one
+  buttonmap    ACQUIRE denied with no declaration; accepted after pushing one
   content      atomic title+body+content-id, then a held button round trip
   preemption   two sessions on one link, last-requester-wins, in-flight discard
   image        2bpp dithered PNG push and the device's decode verdict
-  indicators   generic indicator slots set and cleared
+  tags         app-declared tags: atomic with content, and state-only writes
 """
 
 import argparse
@@ -59,7 +59,7 @@ SESSION_CHAR_UUID = "7c9c0005-3e4a-4b1a-9c1e-6d8a1f2b0001"
 
 OP_START, OP_CHUNK, OP_END = 0x01, 0x02, 0x03
 FIELD_TITLE, FIELD_BODY, FIELD_CONTENT_ID = 0x01, 0x02, 0x03
-FIELD_IMAGE, FIELD_BUTTON_MAP, FIELD_ICON = 0x04, 0x05, 0x06
+FIELD_IMAGE, FIELD_UI_DECL, FIELD_ICON, FIELD_TAG_STATE = 0x04, 0x05, 0x06, 0x07
 FINAL_FLAG = 0x80
 
 SESS_HELLO, SESS_BYE, SESS_ACQUIRE, SESS_RELEASE = 0x01, 0x02, 0x03, 0x04
@@ -83,12 +83,26 @@ def asset_tag(body: bytes) -> bytes:
     return b"\x00\x00\x00\x01" if tag == b"\x00\x00\x00\x00" else tag
 
 
-def encode_button_map(entries) -> bytes:
+def encode_ui_declaration(entries, tags=()) -> bytes:
     body = bytes([len(entries)])
     for button, routing, label in entries:
         encoded = label.encode("utf-8")
         body += bytes([button, routing, len(encoded)]) + encoded
+    body += bytes([len(tags)])
+    for tag_id, label in tags:
+        encoded = label.encode("utf-8")[:12]
+        body += bytes([tag_id, len(encoded)]) + encoded
     return asset_tag(body) + body
+
+
+def encode_tag_state(states) -> bytes:
+    out = bytes([len(states)])
+    for tag_id, state in states:
+        out += bytes([tag_id, state])
+    return out
+
+
+DEFAULT_TAGS = [(0, "Saved"), (1, "New")]
 
 
 DEFAULT_MAP = [
@@ -303,9 +317,9 @@ class Link:
         await self.push_field(peer, FIELD_IMAGE, png, final=True)
         return await asyncio.wait_for(future, timeout=timeout)
 
-    async def set_indicator(self, peer: Peer, slot: int, state: int) -> None:
+    async def set_tag(self, peer: Peer, tag_id: int, state: int) -> None:
         await self.client.write_gatt_char(
-            STATUS_CHAR_UUID, bytes([peer.session_id, slot, state]), response=True
+            STATUS_CHAR_UUID, bytes([peer.session_id, tag_id, state]), response=True
         )
 
 
@@ -455,7 +469,7 @@ async def run_tests(args, console: Console, results: Results) -> None:
                 results.check("a 16-byte token was issued", len(peer_a.token) == 16)
                 results.check(
                     "asset digests report nothing stored",
-                    peer_a.asset_tags.get(FIELD_BUTTON_MAP) == b"\x00\x00\x00\x00",
+                    peer_a.asset_tags.get(FIELD_UI_DECL) == b"\x00\x00\x00\x00",
                     str(peer_a.asset_tags),
                 )
                 results.check("peer appears in the device's index", len(console.peers()) >= 1)
@@ -465,24 +479,29 @@ async def run_tests(args, console: Console, results: Results) -> None:
             print("\n[buttonmap] ACQUIRE is refused until a button map is stored")
             outcome = await link.acquire(peer_a)
             results.check(
-                "ACQUIRE denied with NO_BUTTON_MAP",
+                "ACQUIRE denied with NO_UI_DECLARATION",
                 outcome == ("denied", 0),
                 f"got {outcome}",
             )
 
-            button_map = encode_button_map(DEFAULT_MAP)
-            result, tag = await link.push_asset(peer_a, FIELD_BUTTON_MAP, button_map)
-            results.check("button map stored", result == 0, f"result {result}")
+            button_map = encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS)
+            result, tag = await link.push_asset(peer_a, FIELD_UI_DECL, button_map)
+            results.check("UI declaration stored", result == 0, f"result {result}")
             results.check("stored tag is the one pushed", tag == button_map[:4])
 
             outcome = await link.acquire(peer_a)
             results.check("ACQUIRE now granted", outcome[0] == "foreground", f"got {outcome}")
             results.check("device reports the foreground peer", console.state().get("foreground") != "0")
 
-            labels = console.send("CBUTTONMAP")
+            labels = console.send("CUI")
             results.check(
                 "device read back the declared labels",
                 any("label=Save" in line for line in labels),
+                str(labels),
+            )
+            results.check(
+                "device read back the declared tags",
+                any("tag id=0" in line and "Saved" in line for line in labels),
                 str(labels),
             )
 
@@ -519,18 +538,36 @@ async def run_tests(args, console: Console, results: Results) -> None:
             await asyncio.sleep(0.5)
             results.check("a locally-routed button sends no BLE event", not link.button_events)
 
-        # --- indicators ------------------------------------------------------ #
-        if enabled("indicators") and peer_a.session_id:
-            print("\n[indicators] generic slots, and no self-clearing")
-            await link.set_indicator(peer_a, 0, 2)
+        # --- tags ------------------------------------------------------------ #
+        if enabled("tags") and peer_a.session_id:
+            print("\n[tags] declared tags, atomic with content and state-only")
+            # State-only write, then a content push that says nothing about tags:
+            # the tag must survive, because when it clears is app meaning.
+            await link.set_tag(peer_a, 0, 2)
             await asyncio.sleep(1.5)
             await link.push_field(peer_a, FIELD_BODY, b"A second body push.", final=True)
             await asyncio.sleep(2.0)
-            # There is no read-back for indicator state by design — it is pure
-            # rendering. This asserts the device survived the sequence and stayed
-            # on text; the visual check is CMD:SCREENSHOT.
-            results.check("device still showing text after indicator + push", console.state().get("screen") == "text")
-            await link.set_indicator(peer_a, 0, 0)
+            results.check("device still on text after a tag write plus a push",
+                          console.state().get("screen") == "text")
+
+            # An undeclared id must be ignored rather than create a tag.
+            await link.set_tag(peer_a, 99, 2)
+            await asyncio.sleep(1.0)
+            results.check("an undeclared tag id does not upset the device",
+                          console.state().get("screen") == "text")
+
+            # Atomic: content and tag state in one batch, one redraw.
+            await link.push_field(peer_a, FIELD_TITLE, b"Tagged article")
+            await link.push_field(peer_a, FIELD_BODY, b"Body for the tagged article.")
+            await link.push_field(peer_a, FIELD_TAG_STATE, encode_tag_state([(0, 1), (1, 2)]), final=True)
+            await asyncio.sleep(2.5)
+            results.check("atomic content + tag push kept the device on text",
+                          console.state().get("screen") == "text")
+
+            # There is no read-back for tag rendering by design — it is pure
+            # drawing. CMD:SCREENSHOT is the visual check.
+            await link.push_field(peer_a, FIELD_TAG_STATE, encode_tag_state([(0, 0), (1, 0)]), final=True)
+            await asyncio.sleep(1.5)
 
         # --- reconnect with the stored token -------------------------------- #
         if enabled("reconnect") and peer_a.token:
@@ -552,7 +589,7 @@ async def run_tests(args, console: Console, results: Results) -> None:
                 peer_a.session_id, _, tags = link.parse_hello_ok(data)
                 results.check(
                     "the stored button-map tag is reported back",
-                    tags.get(FIELD_BUTTON_MAP) == encode_button_map(DEFAULT_MAP)[:4],
+                    tags.get(FIELD_UI_DECL) == encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS)[:4],
                     str(tags),
                 )
                 outcome = await link.acquire(peer_a)
@@ -578,7 +615,7 @@ async def run_tests(args, console: Console, results: Results) -> None:
                     )
                     results.check("device reports two live sessions", console.state().get("sessions") == "2")
 
-                    await link.push_asset(peer_b, FIELD_BUTTON_MAP, encode_button_map(DEFAULT_MAP))
+                    await link.push_asset(peer_b, FIELD_UI_DECL, encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS))
 
                     background_future = link.expect(f"background:{peer_a.session_id}")
                     outcome = await link.acquire(peer_b)
