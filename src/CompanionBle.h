@@ -168,6 +168,16 @@ enum class TagState : uint8_t {
   Filled = 0x02,   // drawn, filled
 };
 
+// How a peer's whole tag row is drawn. Orthogonal to TagState: state says
+// which tag is on, this says what "on"/"off" look like. Declared once per UI
+// declaration rather than per tag — apps pick one look for their tag row, not
+// a mix. An older client that never sends this byte gets Bordered, today's
+// only behaviour, so the field is additive rather than a breaking change.
+enum class TagRenderStyle : uint8_t {
+  Bordered = 0x00,  // outline box when Outline, filled+inverted box when Filled (v6 default)
+  Plain = 0x01,     // Outline draws nothing; Filled draws the label with no box (v5-style)
+};
+
 // Content characteristic field identifiers, matching docs/companion-display-protocol.md.
 inline constexpr uint8_t kFieldTitle = 0x01;
 inline constexpr uint8_t kFieldBody = 0x02;

@@ -656,6 +656,8 @@ byte         tag entry count M          <- optional; absent means "no tags"
 M x {  tagId    : 1
        labelLen : 1
        label    : labelLen bytes, UTF-8  }
+
+byte         tag render style           <- optional; absent means BORDERED
 ```
 
 **Why one asset and not two.** Buttons and tags are the same kind of thing — near
@@ -734,6 +736,22 @@ and draws it, and the runtime message carries only state.
   says it exists, not that it is on.
 - A tag id that was never declared is ignored wherever it appears. The
   declaration is the only place tags come into existence.
+
+**Tag render style.** One more byte after the tag list, choosing how the whole
+row looks — a presentation choice, not per-tag state:
+
+```
+0x00  BORDERED  (default)  OUTLINE draws a box; FILLED draws a filled box with
+                            knocked-out (inverted) label text. The original look.
+0x01  PLAIN                OUTLINE draws nothing at all, same as HIDDEN; FILLED
+                            draws the label as plain text, no box.
+```
+
+Optional and trailing, so it costs nothing for a client that doesn't care: omit
+it (end the declaration after the tag list, as before) and the device treats
+that peer as `BORDERED`. An out-of-range byte is treated the same as absent.
+This is a per-peer, whole-row choice — there is no way to mix styles within one
+app's tag row.
 
 Max 512 bytes total for the whole declaration, which is far more than 7 buttons
 and 6 tags need.

@@ -35,6 +35,11 @@ constexpr int kTagChipPadX = 4;
 constexpr int kTagChipPadY = 2;
 constexpr int kTagChipGap = 5;
 
+// Breathing room between the tag row and the title text it butts up against.
+// Only needed on the row's left (title-facing) side — the right side already
+// sits at the screen's own margin, same as the title's left edge.
+constexpr int kTagRowLeftMargin = 12;
+
 // Title wraps onto at most this many lines before falling back to
 // ellipsis-truncating the last line (see wrapTitleToLines()).
 constexpr int kMaxTitleLines = 2;
@@ -239,6 +244,7 @@ void CompanionModeActivity::clearUiDeclaration() {
     spec.routing = companionble::ButtonRouting::None;
     spec.label.clear();
   }
+  tagRenderStyle = static_cast<uint8_t>(companionble::TagRenderStyle::Bordered);
 }
 
 // Reads the foreground peer's declared control scheme off the SD card. Called
@@ -309,6 +315,15 @@ void CompanionModeActivity::loadUiDeclaration() {
     offset += labelLen;
   }
 
+  // Optional trailing style byte: how this peer's tag row is drawn (see
+  // companionble::TagRenderStyle). Absent — an older client, or a declaration
+  // that ended after its tags — means Bordered, already set by
+  // clearUiDeclaration() above. An out-of-range value is treated the same way
+  // rather than trusted verbatim.
+  if (offset < len && raw[offset] <= static_cast<uint8_t>(companionble::TagRenderStyle::Plain)) {
+    tagRenderStyle = raw[offset];
+  }
+
   // Restore state for every tag that still exists. A tag the new declaration
   // dropped simply goes away; one it added starts hidden.
   for (uint8_t i = 0; i < tagCount; ++i) {
@@ -346,15 +361,33 @@ void CompanionModeActivity::setTagState(uint8_t tagId, uint8_t state) {
   }
 }
 
+// Whether a tag currently occupies any space on screen. Hidden never draws;
+// in Plain style Outline ("not set") draws nothing either, matching Bordered's
+// long-standing Hidden behaviour rather than reserving a box that never shows.
+bool CompanionModeActivity::tagIsDrawn(const TagSpec& tag) const {
+  const auto state = static_cast<companionble::TagState>(tag.state);
+  if (state == companionble::TagState::Hidden) return false;
+  if (state == companionble::TagState::Outline &&
+      tagRenderStyle == static_cast<uint8_t>(companionble::TagRenderStyle::Plain)) {
+    return false;
+  }
+  return true;
+}
+
 // The tag row's width depends on which labels are currently visible, so the
 // title's wrap budget is recomputed whenever either changes rather than
 // reserving a worst case that would permanently narrow every title.
 void CompanionModeActivity::measureTagRow() {
+  const bool plain = tagRenderStyle == static_cast<uint8_t>(companionble::TagRenderStyle::Plain);
   int width = 0;
   for (uint8_t i = 0; i < tagCount; ++i) {
-    if (tags[i].state == static_cast<uint8_t>(companionble::TagState::Hidden)) continue;
-    width += renderer.getTextWidth(UI_10_FONT_ID, tags[i].label) + 2 * kTagChipPadX + kTagChipGap;
+    if (!tagIsDrawn(tags[i])) continue;
+    const int labelWidth = renderer.getTextWidth(UI_10_FONT_ID, tags[i].label);
+    width += plain ? labelWidth + kTagChipGap : labelWidth + 2 * kTagChipPadX + kTagChipGap;
   }
+  // The row-to-title gap only applies once, and only when something is
+  // actually drawn — an empty row must still give the title the full width.
+  if (width > 0) width += kTagRowLeftMargin;
   tagRowWidth = width;
 }
 
@@ -1225,23 +1258,37 @@ void CompanionModeActivity::renderImage() {
   companionble::notifyImageStatus(companionble::ImageResult::Displayed);
 }
 
-// Draws the foreground app's visible tags as a right-aligned row of chips.
+// Draws the foreground app's visible tags as a right-aligned row.
 //
 // The firmware knows none of these strings — they came out of the peer's UI
-// declaration, exactly like button labels, and this only renders them. Outline
-// and filled are the two visible states; hidden tags take no space at all,
-// which is what lets an app declare more tags than it usually shows.
+// declaration, exactly like button labels, and this only renders them. Hidden
+// tags take no space at all, which is what lets an app declare more tags than
+// it usually shows. Two independent things vary per peer: which tag is on
+// (TagState, per tag) and how the row looks (tagRenderStyle, whole row) — see
+// tagIsDrawn() for how Plain also treats an unset (Outline) tag as invisible.
 void CompanionModeActivity::renderTags(int rightEdgeX, int centerY) const {
   const int textHeight = renderer.getLineHeight(UI_10_FONT_ID);
   const int chipHeight = textHeight + 2 * kTagChipPadY;
   const int y = centerY - chipHeight / 2;
+  const bool plain = tagRenderStyle == static_cast<uint8_t>(companionble::TagRenderStyle::Plain);
   int x = rightEdgeX;
 
   for (int i = static_cast<int>(tagCount) - 1; i >= 0; --i) {
     const TagSpec& tag = tags[i];
-    if (tag.state == static_cast<uint8_t>(companionble::TagState::Hidden)) continue;
+    if (!tagIsDrawn(tag)) continue;
 
     const int textWidth = renderer.getTextWidth(UI_10_FONT_ID, tag.label);
+
+    if (plain) {
+      // tagIsDrawn() already filtered Outline out in this style, so whatever
+      // reaches here is Filled — drawn as plain text, no box, no inversion.
+      x -= textWidth;
+      if (x < 0) break;  // ran out of room: drop the leftmost chips rather than overlap the title
+      renderer.drawText(UI_10_FONT_ID, x, y + kTagChipPadY, tag.label, true);
+      x -= kTagChipGap;
+      continue;
+    }
+
     const int chipWidth = textWidth + 2 * kTagChipPadX;
     x -= chipWidth;
     if (x < 0) break;  // ran out of room: drop the leftmost chips rather than overlap the title

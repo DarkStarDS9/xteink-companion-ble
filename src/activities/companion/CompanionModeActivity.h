@@ -63,6 +63,9 @@ class CompanionModeActivity final : public Activity {
   TagSpec tags[companionble::kMaxTags];
   uint8_t tagCount = 0;
   int tagRowWidth = 0;  // measured once per change, so the title wrap can reserve it
+  // How the whole row is drawn (companionble::TagRenderStyle); one choice per
+  // peer, sent as a trailing byte on the UI declaration. Defaults to Bordered.
+  uint8_t tagRenderStyle = 0;
 
   // Set when a Status write lands, so the next renderPage() flips the E-ink
   // panel with FAST_REFRESH regardless of the normal per-page-turn refresh
@@ -152,6 +155,7 @@ class CompanionModeActivity final : public Activity {
   void applyTagState(const uint8_t* data, size_t len);
   void setTagState(uint8_t tagId, uint8_t state);
   void measureTagRow();
+  bool tagIsDrawn(const TagSpec& tag) const;
   companionble::ButtonRouting routingFor(companionble::ButtonId button) const;
   const char* labelFor(companionble::ButtonId button) const;
   bool handleMappedButton(MappedInputManager::Button role, companionble::ButtonId id);
