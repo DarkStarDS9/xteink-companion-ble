@@ -38,7 +38,21 @@ class GfxRenderer {
   };
 
  private:
-  static constexpr size_t BW_BUFFER_CHUNK_SIZE = 8000;  // 8KB chunks to allow for non-contiguous memory
+  // 2KB chunks to allow for non-contiguous memory. Measured on real X3
+  // hardware during a companion-mode image push (2026-07-29): with the prior
+  // 8KB chunk size, storeBwBuffer() failed at chunk 4/7 (32000 of ~52272
+  // bytes allocated). 2KB chunks get further (50000/52272) but still fail
+  // under the same conditions -- free heap measured at 54244 bytes right
+  // before this call, only ~2000 bytes above the ~52272 this needs in total,
+  // so the margin is thin enough that fragmentation alone can still exhaust
+  // it. Going smaller than 2KB (tried 512B) does worse, not better: with
+  // free heap this tight, per-allocation overhead from ~100+ small mallocs
+  // outweighs the fragmentation tolerance gained. This value is the best
+  // fragmentation tolerance available by tuning chunk size alone -- it does
+  // not guarantee success under this heap budget; see storeBwBuffer()'s
+  // fallback behavior and ReaderUtils::renderAntiAliased() for what happens
+  // if it still fails.
+  static constexpr size_t BW_BUFFER_CHUNK_SIZE = 2000;
 
   HalDisplay& display;
   RenderMode renderMode;

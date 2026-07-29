@@ -1177,7 +1177,50 @@ void CompanionModeActivity::renderImage() {
   // cadence, not decode cost. Kept anyway: a visible "developing" draw is
   // thematically wanted here, not a defect to optimise away, and the settle
   // is what actually resolves the panel to its final grayscale state.
-  ReaderUtils::renderAntiAliased(renderer, [&]() { decoder->decodeToFramebuffer(path, renderer, config); });
+  //
+  // Deliberately NOT ReaderUtils::renderAntiAliased(): that helper snapshots
+  // the ~52KB framebuffer in RAM (storeBwBuffer()) before the grayscale
+  // passes and restores it after, because for text/EPUB content a third
+  // re-layout pass to reconstruct the BW plane would be expensive. An image
+  // has no such cost -- the decode above already re-reads straight from the
+  // SD-staged file every pass -- so the BW plane is just as cheaply
+  // reconstructed by decoding a third time in BW mode, and needs no RAM
+  // duplicate at all. Found via real-hardware testing (2026-07-29):
+  // storeBwBuffer()'s chunked allocation could fail under the heap pressure
+  // of an active BLE session (~54KB free against a ~52KB need, thin enough
+  // that fragmentation alone could exhaust it), silently skipping grayscale
+  // and leaving the BW base on screen with only a log line to explain it.
+  renderer.clearScreen(0x00);
+  renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
+  decoder->decodeToFramebuffer(path, renderer, config);
+  renderer.copyGrayscaleLsbBuffers();
+
+  renderer.clearScreen(0x00);
+  renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
+  decoder->decodeToFramebuffer(path, renderer, config);
+  renderer.copyGrayscaleMsbBuffers();
+
+  renderer.displayGrayBuffer();
+  renderer.setRenderMode(GfxRenderer::BW);
+
+  // Reconstruct the BW plane the same way it was originally built (decode,
+  // then tags on top) rather than restoring a snapshot of it. RAM-only --
+  // deliberately no displayBuffer() call, since the panel already shows the
+  // correct grayscale result from displayGrayBuffer() above; this only needs
+  // to leave frameBuffer holding the right bytes for later readers (e.g.
+  // CMD:SCREENSHOT, partial-refresh diffing).
+  //
+  // clearScreen()'s default (0xFF, white) here, NOT the 0x00 the two
+  // grayscale passes above use -- 0x00 is that accumulation convention, not
+  // BW mode's. BW mode's undrawn-pixel value is 0xFF (see writePixel()'s doc
+  // comment in DirectPixelWriter.h), matching how the framebuffer started
+  // out before the very first (pre-settle) decode of this same image.
+  renderer.clearScreen();
+  decoder->decodeToFramebuffer(path, renderer, config);
+  if (tagRowWidth > 0) {
+    const int lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
+    renderTags(renderer.getScreenWidth() - cachedOrientedMarginRight, cachedOrientedMarginTop + lineHeight);
+  }
 
   companionble::notifyImageStatus(companionble::ImageResult::Displayed);
 }
