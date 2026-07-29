@@ -7,6 +7,7 @@
 
 class JpegToFramebufferConverter;
 class PngToFramebufferConverter;
+class RawBitmapToFramebufferConverter;
 
 class ImageDecoderFactory {
  public:
@@ -17,4 +18,7 @@ class ImageDecoderFactory {
  private:
   static std::unique_ptr<JpegToFramebufferConverter> jpegDecoder;
   static std::unique_ptr<PngToFramebufferConverter> pngDecoder;
+  // Serves the BLE companion protocol's field 0x04 (.raw staged files) only —
+  // unrelated to the epub/e-book PNG/JPEG image path above.
+  static std::unique_ptr<RawBitmapToFramebufferConverter> rawDecoder;
 };

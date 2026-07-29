@@ -73,9 +73,10 @@ const char* routingName(companionble::ButtonRouting routing) {
 void reportState() {
   const char* screenName = g_screenNameProvider ? g_screenNameProvider() : "unknown";
   const char* peerKey = companionble::foregroundPeerKey();
-  reply("state screen=%s connected=%d sessions=%u foreground=%u peer=%s", screenName,
+  reply("state screen=%s connected=%d sessions=%u foreground=%u peer=%s heap=%u", screenName,
         companionble::isConnected() ? 1 : 0, static_cast<unsigned>(companionble::activeSessionCount()),
-        static_cast<unsigned>(companionble::foregroundSessionId()), peerKey[0] ? peerKey : "-");
+        static_cast<unsigned>(companionble::foregroundSessionId()), peerKey[0] ? peerKey : "-",
+        static_cast<unsigned>(ESP.getFreeHeap()));
 }
 
 void reportPeers() {

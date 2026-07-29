@@ -7,9 +7,11 @@
 
 #include "JpegToFramebufferConverter.h"
 #include "PngToFramebufferConverter.h"
+#include "RawBitmapToFramebufferConverter.h"
 
 std::unique_ptr<JpegToFramebufferConverter> ImageDecoderFactory::jpegDecoder = nullptr;
 std::unique_ptr<PngToFramebufferConverter> ImageDecoderFactory::pngDecoder = nullptr;
+std::unique_ptr<RawBitmapToFramebufferConverter> ImageDecoderFactory::rawDecoder = nullptr;
 
 ImageToFramebufferDecoder* ImageDecoderFactory::getDecoder(const std::string& imagePath) {
   std::string ext = imagePath;
@@ -33,6 +35,11 @@ ImageToFramebufferDecoder* ImageDecoderFactory::getDecoder(const std::string& im
       pngDecoder.reset(new PngToFramebufferConverter());
     }
     return pngDecoder.get();
+  } else if (RawBitmapToFramebufferConverter::supportsFormat(ext)) {
+    if (!rawDecoder) {
+      rawDecoder.reset(new RawBitmapToFramebufferConverter());
+    }
+    return rawDecoder.get();
   }
 
   LOG_ERR("DEC", "No decoder found for image: %s", imagePath.c_str());

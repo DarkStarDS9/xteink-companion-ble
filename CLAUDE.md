@@ -41,12 +41,15 @@ the wire format. Consumer apps depend on it.
 
 - Changing framing, field ids, or the capability characteristic is a **breaking change** — bump the
   version and update the doc in the same commit.
-- Field ids live in [src/CompanionBle.h](src/CompanionBle.h). Shipped: `0x01` title, `0x02` body,
-  `0x03` content-id. Reserved by design docs, not yet implemented: `0x04` image, `0x05` button map,
-  `0x06` icon. Next free: `0x07`.
-- The planned v6 shape — sessions, phone:app pairing, per-peer SD storage, button labels/routing —
-  is in [docs/companion-multi-app-design.md](docs/companion-multi-app-design.md). It is a **clean
-  break**: v6 requires a handshake, so shipped v5 clients stop working until updated.
+- Field ids live in [src/CompanionBle.h](src/CompanionBle.h). Implemented: `0x01` title, `0x02` body,
+  `0x03` content-id, `0x04` image (raw packed 2bpp, full screen, no header — see
+  `RawBitmapToFramebufferConverter` and the protocol doc's "Image field" section; this replaced an
+  earlier PNG-based format, dropped because PNGdec's ~44 KB working set never fit alongside NimBLE
+  on this part), `0x05` UI declaration, `0x06` icon, `0x07` tag state. Next free: `0x08`.
+- The v6 shape — sessions, phone:app pairing, per-peer SD storage, button labels/routing — is in
+  [docs/companion-multi-app-design.md](docs/companion-multi-app-design.md) and implemented in
+  firmware, though unproven on real hardware (see the protocol doc's status warning). It was a
+  **clean break**: v6 requires a handshake, so a v5 client gets no error, just silence.
 
 ## Upstream relationship
 

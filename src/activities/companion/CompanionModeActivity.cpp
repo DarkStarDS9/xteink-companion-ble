@@ -588,8 +588,9 @@ void CompanionModeActivity::applyForegroundChange() {
   requestUpdate();
 }
 
-// Decodes a staged PNG on the main loop task and reports the outcome back to
-// the app. Never runs on the NimBLE host task: decoding writes the framebuffer.
+// Decodes a staged raw packed 2bpp image (field 0x04) on the main loop task
+// and reports the outcome back to the app. Never runs on the NimBLE host
+// task: decoding writes the framebuffer.
 void CompanionModeActivity::handlePendingImage() {
   const std::string path = pendingImagePath;
   pendingImagePath.clear();
@@ -857,14 +858,17 @@ void CompanionModeActivity::loop() {
         break;
     }
 
+    // Read the held time before wasReleased(): under COMPANION_TEST_CONSOLE,
+    // wasReleased() consumes the injected press's releasePending flag, which
+    // holdInProgress() (and so getHeldTime()) depends on to report anything
+    // but 0. Real hardware has no such coupling, so this ordering is a no-op
+    // there.
+    const uint16_t heldTicks =
+        static_cast<uint16_t>(std::min<unsigned long>(buttonHeldTime(holdButton) / kHoldTickMs, 0xFFFFUL));
     if (buttonWasReleased(trackedRole, holdButton)) {
-      const uint16_t finalTicks =
-          static_cast<uint16_t>(std::min<unsigned long>(buttonHeldTime(holdButton) / kHoldTickMs, 0xFFFFUL));
-      companionble::notifyButtonEvent(holdButton, finalTicks, /*isFinal=*/true);
+      companionble::notifyButtonEvent(holdButton, heldTicks, /*isFinal=*/true);
       holdActive = false;
     } else if (buttonIsPressed(trackedRole, holdButton)) {
-      const uint16_t heldTicks =
-          static_cast<uint16_t>(std::min<unsigned long>(buttonHeldTime(holdButton) / kHoldTickMs, 0xFFFFUL));
       if (heldTicks > holdTicksSent) {
         companionble::notifyButtonEvent(holdButton, heldTicks, /*isFinal=*/false);
         holdTicksSent = heldTicks;
@@ -1166,9 +1170,13 @@ void CompanionModeActivity::renderImage() {
   // land on the wrong base.
   renderer.displayBuffer();
 
-  // Two-pass grayscale settle. This re-decodes the image twice more, which is
-  // slow — several seconds — and that is fine: a visible "developing" draw is
-  // thematically wanted here, not a defect to optimise away.
+  // Two-pass grayscale settle. This re-decodes the image twice more. With the
+  // raw packed 2bpp decoder (see RawBitmapToFramebufferConverter) the decode
+  // itself is now close to free — no PNGdec inflate, just an unpack loop — so
+  // the remaining seconds are almost entirely the e-ink panel's own refresh
+  // cadence, not decode cost. Kept anyway: a visible "developing" draw is
+  // thematically wanted here, not a defect to optimise away, and the settle
+  // is what actually resolves the panel to its final grayscale state.
   ReaderUtils::renderAntiAliased(renderer, [&]() { decoder->decodeToFramebuffer(path, renderer, config); });
 
   companionble::notifyImageStatus(companionble::ImageResult::Displayed);

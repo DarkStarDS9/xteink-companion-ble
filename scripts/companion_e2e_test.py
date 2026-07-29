@@ -28,7 +28,7 @@ Covered:
   buttonmap    ACQUIRE denied with no declaration; accepted after pushing one
   content      atomic title+body+content-id, then a held button round trip
   preemption   two sessions on one link, last-requester-wins, in-flight discard
-  image        2bpp dithered PNG push and the device's decode verdict
+  image        raw packed 2bpp full-screen push and the device's decode verdict
   tags         app-declared tags: atomic with content, and state-only writes
 """
 
@@ -42,7 +42,6 @@ import struct
 import sys
 import time
 import uuid
-import zlib
 from dataclasses import dataclass, field
 
 try:
@@ -344,9 +343,9 @@ class Link:
         await self.push_field(peer, field_id, payload)
         return await asyncio.wait_for(future, timeout=timeout)
 
-    async def push_image(self, peer: Peer, png: bytes, timeout: float = 180.0):
+    async def push_image(self, peer: Peer, raw: bytes, timeout: float = 180.0):
         future = self.expect(f"image:{peer.session_id}")
-        await self.push_field(peer, FIELD_IMAGE, png, final=True)
+        await self.push_field(peer, FIELD_IMAGE, raw, final=True)
         return await asyncio.wait_for(future, timeout=timeout)
 
     async def set_tag(self, peer: Peer, tag_id: int, state: int) -> None:
@@ -356,47 +355,31 @@ class Link:
 
 
 # --------------------------------------------------------------------------- #
-# 2bpp PNG encoder (no Pillow dependency)
+# Raw packed 2bpp encoder for field 0x04 (protocol v7+)
 # --------------------------------------------------------------------------- #
 
 
-def make_test_png(width: int, height: int) -> bytes:
-    """A 2-bit grayscale PNG with an ordered-dither gradient.
+def make_test_raw_image(width: int, height: int) -> bytes:
+    """A raw packed 2bpp ordered-dither gradient, in field 0x04's wire format.
 
-    Hand-rolled rather than pulled from Pillow so the harness has no optional
-    dependency for its most interesting test. 2 bpp because the decoder expands
-    a 2-bit sample as s*255/3 = {0,85,170,255}, exactly the values its own
-    bucketing maps back to levels 0-3.
+    No header, no compression: bytesPerRow = ceil(width/4) bytes, 4 samples per
+    byte, MSB-first (sample 0 in bits 7-6), rows top to bottom. Value 0..3 is
+    the final display level directly -- 0 black, 3 white -- with no further
+    gray-level math on the device side. See docs/companion-display-protocol.md
+    "Image field (0x04)" for the authoritative spec.
     """
     bayer = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]]
-    rows = bytearray()
-    row_bytes = (width * 2 + 7) // 8
+    row_bytes = (width + 3) // 4
+    out = bytearray(row_bytes * height)
     for y in range(height):
-        rows.append(0)  # filter type: none
-        packed = bytearray(row_bytes)
+        row = memoryview(out)[y * row_bytes : (y + 1) * row_bytes]
         for x in range(width):
             intensity = (x * 255) // max(1, width - 1)
             threshold = (bayer[y % 4][x % 4] * 255) // 16
             level = min(3, (intensity * 4 + threshold // 4) // 256)
             shift = 6 - (x % 4) * 2
-            packed[x // 4] |= level << shift
-        rows.extend(packed)
-
-    def chunk(kind: bytes, payload: bytes) -> bytes:
-        return (
-            struct.pack(">I", len(payload))
-            + kind
-            + payload
-            + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
-        )
-
-    header = struct.pack(">IIBBBBB", width, height, 2, 0, 0, 0, 0)  # depth 2, colour type 0
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", header)
-        + chunk(b"IDAT", zlib.compress(bytes(rows), 9))
-        + chunk(b"IEND", b"")
-    )
+            row[x // 4] |= level << shift
+    return bytes(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -673,8 +656,11 @@ async def run_tests(args, console: Console, results: Results) -> None:
                     background_future = link.expect(f"background:{peer_a.session_id}")
                     outcome = await link.acquire(peer_b)
                     results.check("the second app took the screen", outcome[0] == "foreground", str(outcome))
-                    reason = await asyncio.wait_for(background_future, timeout=5.0)
-                    results.check("the first app was told it was preempted", reason == 0, f"reason {reason}")
+                    try:
+                        reason = await asyncio.wait_for(background_future, timeout=5.0)
+                        results.check("the first app was told it was preempted", reason == 0, f"reason {reason}")
+                    except asyncio.TimeoutError:
+                        results.check("the first app was told it was preempted", False, "no background notification arrived")
 
                     # A push from the now-background app must not change the screen.
                     await link.push_field(peer_b, FIELD_TITLE, b"App B owns the screen", final=True)
@@ -704,16 +690,16 @@ async def run_tests(args, console: Console, results: Results) -> None:
             if enabled("image"):
                 owner = peer_b if peer_b.session_id else peer_a
                 if owner.session_id:
-                    print("\n[image] 2bpp dithered PNG")
-                    png = make_test_png(caps["px_wide"], caps["px_high"])
-                    print(f"  {len(png)} bytes of 2bpp PNG for {caps['px_wide']}x{caps['px_high']}")
+                    print("\n[image] raw packed 2bpp, full screen")
+                    raw = make_test_raw_image(caps["px_wide"], caps["px_high"])
+                    print(f"  {len(raw)} bytes of raw 2bpp for {caps['px_wide']}x{caps['px_high']}")
                     results.check(
                         "the encoded print fits the device's image cap",
-                        len(png) <= caps["max_image"],
-                        f"{len(png)} > {caps['max_image']}",
+                        len(raw) <= caps["max_image"],
+                        f"{len(raw)} > {caps['max_image']}",
                     )
                     started = time.time()
-                    verdict = await link.push_image(owner, png)
+                    verdict = await link.push_image(owner, raw)
                     results.check("device reported the image displayed", verdict == 0, f"IMAGE_STATUS {verdict}")
                     print(f"  transfer + develop took {time.time() - started:.1f}s")
                     results.check("device is showing an image", console.state().get("screen") == "image")

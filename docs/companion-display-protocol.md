@@ -14,11 +14,14 @@ Home/reader entry path in normal operation.
 
 ## Status
 
-**v6 — the current contract.** v6 is a **clean break**: the session handshake
+**v7 — the current contract.** v6 was a **clean break**: the session handshake
 is mandatory, and a client that pushes content without a valid session is
-ignored. A v5 client will connect, push, and see nothing happen. Both sides
-must be released together; see "v6 changes from v5" below for the migration
-list.
+ignored. A v5 client will connect, push, and see nothing happen. v7 keeps that
+shape unchanged and makes one further breaking change on top of it: field
+`0x04` (image) is no longer PNG, see "v7 changes from v6" below. Since nothing
+built against v6 has ever executed on the wire (see the warning box below),
+this is a wire-format redesign, not a migration with real clients to
+accommodate.
 
 This document is **authoritative** and is written first on purpose: consumer
 apps are built against it while the firmware side lands. Where the firmware and
@@ -325,7 +328,7 @@ ASSET_ACK result         0x00 STORED
                          0x03 REJECTED_STORAGE  SD write failed
 
 IMAGE_STATUS result      0x00 DISPLAYED
-                         0x01 DECODE_FAILED     not a readable PNG / decode error
+                         0x01 DECODE_FAILED     wrong byte count for a raw 2bpp full-screen image
                          0x02 REJECTED_SIZE     exceeded max image length
                          0x03 STORAGE_FAILED    could not stage to SD
 ```
@@ -515,8 +518,8 @@ timeout (3 s) rather than sitting on stale content indefinitely.
 On the client side this is a small, fully synchronous send loop — there is no
 per-chunk ack. If reliable delivery matters, use "Write" (not "Write Without
 Response") for the CHUNK packets so BLE's own link-layer ack applies. For the
-image field, **always** use Write-with-response: a dropped chunk produces a
-corrupt PNG and a wasted transfer.
+image field, **always** use Write-with-response: a dropped chunk shifts every
+byte after it, corrupting the raw 2bpp payload, and wastes the transfer.
 
 ### Content-id field (`0x03`) — opaque correlation token
 
@@ -536,71 +539,71 @@ content-id with every title/body update.
 Max length: **32 bytes** (`kMaxContentIdLen` in `src/CompanionBle.h`) — see
 "Content-id budget" below for why it is so much smaller than title/body.
 
-### Image field (`0x04`) — pre-dithered PNG
+### Image field (`0x04`) — raw packed 2bpp, full screen, no header
 
-The client captures/crops a photo, **dithers it itself** to the panel's palette,
-encodes it as PNG, and pushes it as field `0x04`. The device streams the bytes
-straight to `peers/<peerKey>/data/incoming.png` on the SD card as they arrive —
-it never holds the image in RAM — and on `END` decodes it to the framebuffer
-with the firmware's own dither **disabled**, then runs the two-pass grayscale
-settle. `IMAGE_STATUS` reports the outcome.
+The client captures/crops a photo, **dithers it itself** to the panel's
+four-level palette, packs it into this field's raw wire format (below), and
+pushes it as field `0x04`. The device streams the bytes straight to
+`peers/<peerKey>/data/incoming.raw` on the SD card as they arrive — it never
+holds the image in RAM — and on `END` unpacks it directly to the framebuffer
+(no decompression, no gray-level math: each 2-bit sample already *is* the
+final display level 0–3), then runs the two-pass grayscale settle.
+`IMAGE_STATUS` reports the outcome.
 
-The transfer plus the grayscale settle takes several seconds. That is expected
-and is not optimised for; a slow "developing" draw is thematically wanted.
+This replaced an earlier PNG-based format (protocol v6 and before). PNG
+decoding needs PNGdec's ~44 KB working set (decoder object + inflate window)
+plus a 16 KB safety margin — but measured free heap with one BLE peer
+connected is only ~47–50 KB on this part, below that floor. Every PNG push
+failed with "not enough heap for PNG decoder"; it was a hard wall, not a flaky
+threshold. This format's entire device-side working set is one packed row
+(a few hundred bytes), so it has no such floor. See "v7 changes from v6" in
+the version history for the full rationale, and
+`lib/Epub/Epub/converters/RawBitmapToFramebufferConverter.{h,cpp}` for the
+device-side decoder.
 
-**Quantization contract.** The device's non-dithered decode path buckets an
-8-bit grayscale sample into four levels by integer division:
+The transfer plus the grayscale settle still takes a few seconds (the settle
+re-decodes twice more by design). That is expected and is not optimised for; a
+slow "developing" draw is thematically wanted, and this format made the actual
+decode step itself effectively free — the settle's cost is now almost entirely
+the e-ink refresh, not decoding.
 
-```c
-level = gray / 85;   if (level > 3) level = 3;
-```
+**Wire format.**
 
-For a client-side dither to land exactly where intended, **encode each already
-dithered pixel as one of the four values `{0, 85, 170, 255}`** — not merely
-"some value inside each bucket". Anything else re-quantizes unpredictably at
-the boundaries.
+- No header. The payload is exactly `bytesPerRow * screenHeightPx` bytes —
+  nothing else. Both sides already know the dimensions from the capability
+  characteristic (bytes 17..20), so a length/width/height header would be
+  redundant weight on every single push.
+- `bytesPerRow = ceil(screenWidthPx / 4)` — 4 pixels per byte, each row padded
+  out to a whole byte (so a new row always starts at a byte boundary; there is
+  no bit-level carry between rows).
+- Each pixel is a 2-bit sample, value `0..3`, packed **MSB-first**: within a
+  byte, pixel 0 (the leftmost of the 4 it covers) occupies bits 7–6, the next
+  pixel bits 5–4, then bits 3–2, then bits 1–0 for the rightmost. This matches
+  the packing this codebase already uses on-disk for its pixel cache (see
+  `PixelCache.h`) — not a new scheme.
+- Pixel value meaning: `0` = black, `3` = white, `1`/`2` = the two mid gray
+  levels — the same 4-level scale the old PNG path's `gray / 85` bucketing
+  produced. Because the client already dithers to this exact palette before
+  encoding, no further gray-level math happens on decode; the 2-bit sample
+  *is* the display level.
+- Rows are stored top to bottom, left to right, in the same orientation-corrected
+  logical coordinate space `getScreenWidth()`/`getScreenHeight()` (and the
+  capability characteristic's pixel-dimension bytes) already use — the same
+  space a client already targets for centering text.
 
-**Format.** Grayscale PNG (colour type 0), not interlaced. **Bit depth 2 is
-recommended**; depths 1, 4 and 8 also decode. Colour type 0 is the contract —
-anything else may work and may stop working.
+**Dimensions are exact, not "up to."** The payload must be **exactly**
+`screenWidthPx x screenHeightPx` as read from the capability characteristic
+(bytes 17..20) — **do not assume a panel size**; a measured X3 in Companion
+Mode reports **528 x 792**, not the 800 x 480 that older notes in this repo
+assume. Unlike the old PNG path, there is **no scaling and no centering**: a
+payload of the wrong byte count is rejected outright (`IMAGE_STATUS`
+`DECODE_FAILED`) rather than resampled or cropped. Cropping, scaling and
+rotation are entirely the phone's job; the device never does any of the
+three for an image push.
 
-Use 2 bits per pixel unless you have a reason not to. It is exact and roughly
-four times smaller:
-
-- **Exact.** The decoder expands a packed sample with `sample * 255 / maxSample`,
-  which for a 2-bit sample is `s * 255 / 3` = `{0, 85, 170, 255}` — precisely the
-  values the subsequent `gray / 85` bucketing maps back to levels 0–3. There is
-  no rounding anywhere on the round trip. Feeding 8-bit samples of the same four
-  values is equally exact but says the same thing in four times the space.
-- **Smaller — though by much less than the bit ratio suggests.** Raw, 2 bpp is
-  3.98x smaller (105,336 bytes against 418,968 for a full panel). After deflate
-  that mostly evaporates: an 8-bit buffer holding only four distinct values is
-  hugely redundant and deflate removes most of that on its own. Measured on real
-  dithered full-panel prints, same image, only depth changed:
-
-  | Dither | 2 bpp | 8 bpp | Saving |
-  |---|---|---|---|
-  | Atkinson | 31.8 KB | 38.6 KB | 17.6% |
-  | Floyd–Steinberg | 38.5 KB | 45.8 KB | 15.9% |
-  | Ordered Bayer | 5.9 KB | 13.0 KB | 54.4% |
-
-  So expect **16–18% for error diffusion**, and much better for ordered dither,
-  whose periodic pattern compresses well at both depths. 2 bpp is never larger,
-  and on a link this slow a sixth off every print is a sixth off the wait — but
-  it is not the 4x the raw ratio implies, and a client author should not plan
-  around one.
-
-The device validates bit depth in exactly one place and accepts 1/2/4/8 for
-grayscale; there is no second check to trip over.
-
-**Dimensions.** Encode at exactly the pixel size the capability characteristic
-advertises (bytes 17..20). **Do not assume a panel size** — a measured X3 in
-Companion Mode reports **528 x 792**, not the 800 x 480 that older notes in this
-repo assume. That mismatch is exactly why these bytes exist; read them. The device centres the image and, if it is larger
-than the screen in either axis, scales it down to fit — which resamples and
-therefore *destroys the dither you carefully applied*. Smaller images are
-centred, not scaled up. Rotation and cropping are the phone's job; the device
-never rotates.
+For this device's measured 528 x 792 panel: `bytesPerRow = ceil(528/4) = 132`,
+so every push is exactly `132 * 792 = 104544` bytes — fixed, with no
+compression-dependent variance and no worst-case blowup risk.
 
 **Interaction with text.** An image push replaces the screen entirely — title,
 body and paging are not drawn while an image is displayed. Pushing a body
@@ -888,10 +891,12 @@ string or a short opaque token. Treat 32 bytes as the contract.
 ## Capability characteristic — introspection
 
 A single read-only value clients query instead of hardcoding assumptions about
-the device. **23 bytes** in v6:
+the device. **23 bytes**, unchanged in layout since v6 — v7 only bumped the
+version number itself (byte 0) because field `0x04`'s payload format changed;
+see "v7 changes from v6":
 
 ```
-byte 0        protocol version = 6
+byte 0        protocol version = 7
 byte 1        screen width in characters, at the font Companion Mode uses
 byte 2        screen height in characters (lines per page)
 bytes 3..4    max text field length, uint16 LE — title/body only
@@ -915,16 +920,16 @@ future revision. It is the one thing a client can rely on before it knows
 whether it can talk to the device at all.
 
 That makes it the graceful-degradation path across the v5 break, which is the
-whole reason to guarantee it. A v6 client should:
+whole reason to guarantee it. A v7 client should:
 
 1. Read the characteristic immediately after connecting.
-2. Check byte 0. If it is not 6, tell the user *"this reader's firmware is too
+2. Check byte 0. If it is not 7, tell the user *"this reader's firmware is too
    old for this version of <app>"* (or too new) and stop. Do not attempt the
-   handshake, and do not guess at the layout — v6's 23-byte value shares nothing
+   handshake, and do not guess at the layout — the 23-byte value shares nothing
    past byte 4 with v5's 5-byte one.
 
 The reverse direction fails quietly, and clients should know it: a **v5 client
-talking to a v6 device gets no error**. Its content writes are dropped (no
+talking to a v6-or-later device gets no error**. Its content writes are dropped (no
 session), its Session characteristic does not exist to it, and the screen simply
 never changes. There is no notification, because there is no session to notify.
 Version-check first; it is the only signal there is.
@@ -994,6 +999,25 @@ growth would make `peers.json` unbounded, and it is parsed into RAM.
 ---
 
 ## Version history
+
+### v7 changes from v6 — **breaking**
+
+1. **Field `0x04` (image) is raw packed 2bpp, not PNG.** See "Image field
+   (`0x04`)" above for the full wire-format spec. This replaces PNG entirely —
+   there is no format-sniffing and no fallback to the old format.
+2. **Capability byte 0 bumped from 6 to 7.** No other capability bytes moved;
+   this bump exists solely so a client can tell the two image formats apart by
+   version rather than by guessing at file content.
+
+Why: PNG decoding needs PNGdec's ~44 KB working set (decoder + inflate
+window) plus a 16 KB margin, but measured free heap with one BLE peer
+connected is only ~47–50 KB on this part — below that floor. Every PNG image
+push failed with "not enough heap for PNG decoder"; it was not a flaky
+threshold; it could never succeed. Raw packed 2bpp needs one packed row of
+scratch (well under 1 KB), so it has no such floor. Since v6 never executed on
+real hardware (see the warning near the top of this document), there was no
+shipped image behaviour to preserve, so the fix is a clean replacement of the
+wire format rather than a heap workaround.
 
 ### v6 changes from v5 — **breaking**
 
@@ -1147,16 +1171,19 @@ Content and sessions:
 
 Images:
 
-24. Push a correctly-sized grayscale PNG using only `{0,85,170,255}`:
-    confirm it renders full-screen, the grayscale settle runs, and
+24. Push an exactly-sized raw packed 2bpp image (see "Image field (`0x04`)"
+    for the byte layout) using only sample values `{0, 1, 2, 3}`: confirm it
+    renders full-screen, the grayscale settle runs, and
     `IMAGE_STATUS(DISPLAYED)` arrives.
 23b. **Bisect the image path with two encoders.** Snap2Ink ships a calibration
     target (eight bands answering "count the distinct greys", "is this band
     striped or flat", "is the border one pixel or two") that bypasses its own
-    rasterizer and dither. Push that *and* the harness's own generated PNG
-    (`make_test_png()` in `scripts/companion_e2e_test.py`). If only theirs is
-    wrong the fault is phone-side; if both are wrong it is the firmware's decode
-    or settle. Do this before debugging either side in isolation.
+    rasterizer and dither. Push that *and* a harness-generated raw payload of
+    the same target (`scripts/companion_e2e_test.py`'s image-generation helper
+    needs updating from PNG to raw packed 2bpp for this protocol version — see
+    the wire format above). If only theirs is wrong the fault is phone-side;
+    if both are wrong it is the firmware's decode or settle. Do this before
+    debugging either side in isolation.
 24. Confirm the staged file lands under `peers/<peerKey>/data/` and that free
     heap during the transfer stays near its idle value (nothing image-sized was
     allocated).

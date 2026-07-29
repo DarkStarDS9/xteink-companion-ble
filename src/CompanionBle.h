@@ -55,9 +55,19 @@ inline constexpr uint16_t kMaxFieldLen = 4096;
 // peer's data/ directory as they arrive, so this bounds SD usage and transfer
 // time rather than heap. That is the whole reason it can be this large on a
 // part with no room for a third big allocation — see the memory discussion in
-// docs/companion-image-protocol-sketch.md. Comfortably above a real dithered
-// full-panel dithered grayscale PNG, which is why v6 widened the START length
-// field from uint16 to uint32.
+// docs/companion-image-protocol-sketch.md, and why v6 widened the START
+// length field from uint16 to uint32.
+//
+// Field 0x04 is raw packed 2bpp (see RawBitmapToFramebufferConverter and
+// docs/companion-display-protocol.md), not PNG — a fixed, exact size for a
+// given panel with no compression blowup risk. This measured X4 panel is
+// 528x792: bytesPerRow = ceil(528/4) = 132, so a full push is exactly
+// 132 * 792 = 104544 bytes. This cap is set with ~24KB (~24%) of headroom
+// above that so a slightly different panel/orientation still fits comfortably
+// without this constant needing to track the exact figure — the real gate is
+// RawBitmapToFramebufferConverter's own runtime size check against the live
+// renderer's screen dimensions, which rejects anything that isn't an exact
+// match regardless of this cap.
 inline constexpr uint32_t kMaxImageFieldLen = 128 * 1024;
 
 // Sleep-screen icon dimensions, 1 bit per pixel. Advertised in the capability
@@ -162,6 +172,8 @@ enum class TagState : uint8_t {
 inline constexpr uint8_t kFieldTitle = 0x01;
 inline constexpr uint8_t kFieldBody = 0x02;
 inline constexpr uint8_t kFieldContentId = 0x03;
+// Raw packed 2bpp full-screen image, no header — see
+// RawBitmapToFramebufferConverter and docs/companion-display-protocol.md.
 inline constexpr uint8_t kFieldImage = 0x04;
 // The peer's UI declaration: button labels/routing AND tag labels, in one
 // versioned asset. One declaration rather than two because both halves are

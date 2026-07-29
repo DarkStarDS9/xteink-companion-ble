@@ -12,6 +12,7 @@
 
 #include "CompanionPeerStore.h"
 #include "Memory.h"
+#include "Epub/converters/RawBitmapToFramebufferConverter.h"
 
 namespace companionble {
 
@@ -59,7 +60,9 @@ constexpr uint32_t kTeardownDisconnectWaitMs = 600;
 // Name of the staged image inside the pushing peer's data/ directory. Per-peer
 // rather than one global scratch file, so two apps staging at once cannot
 // collide — the answer to the image sketch's "where does the staging file go".
-constexpr const char* kStagedImageName = "incoming.png";
+// ".raw" because field 0x04 is now raw packed 2bpp, not PNG — see
+// RawBitmapToFramebufferConverter and docs/companion-display-protocol.md.
+constexpr const char* kStagedImageName = "incoming.raw";
 
 // Full advertised name buffer: kDeviceNamePrefix + " " + 4 hex chars (2 bytes
 // of the eFuse MAC tail) + NUL. Built once in ensureStarted() from
@@ -156,10 +159,14 @@ uint8_t allocateSession(const char* peerKey) {
   return kNoSession;
 }
 
+// notify(data, len) builds and queues its own buffer immediately
+// (ble_gattc_notify_custom), unlike the no-arg notify(), which defers to
+// ble_gatts_chr_updated() and reads whatever setValue() last wrote when the
+// host task eventually drains it — back-to-back calls would race and the
+// earlier payload could be overwritten before it is ever sent.
 void notifySession(const uint8_t* data, size_t len) {
   if (!g_sessionChar) return;
-  g_sessionChar->setValue(data, len);
-  g_sessionChar->notify();
+  g_sessionChar->notify(data, len);
 }
 
 void notifyHelloDenied(uint16_t helloTag, uint8_t reason) {
@@ -355,6 +362,12 @@ void computeCapabilityValue(const GfxRenderer& renderer, int fontId) {
   g_capabilityValue[offset++] = static_cast<uint8_t>((screenHeightPx >> 8) & 0xFF);
   g_capabilityValue[offset++] = static_cast<uint8_t>(kMaxContentIdLen);
   g_capabilityValue[offset++] = 4;  // grey levels the panel renders
+
+  // The field 0x04 image decoder has no header of its own (see
+  // RawBitmapToFramebufferConverter) — its expected file size is derived
+  // from these same screenWidthPx/screenHeightPx values, so it must learn
+  // them from the one place they're computed rather than guessing.
+  RawBitmapToFramebufferConverter::setScreenDimensions(screenWidthPx, screenHeightPx);
 }
 
 // ---------------------------------------------------------------------------
