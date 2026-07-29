@@ -337,8 +337,21 @@ void setup() {
       // device deep-sleeps (dropping the serial port) immediately after every
       // single flash.
       LOG_DBG("MAIN", "Wakeup reason: After USB Power");
-      if (!usb_serial_jtag_is_connected()) {
-        powerManager.startDeepSleep(gpio);
+      // usb_serial_jtag_is_connected() needs the host to have resumed sending
+      // SOF traffic, which can still be settling this soon after a hard reset
+      // -- the same enumeration race the 250 ms pre-Serial.begin() delay above
+      // exists for. A single instantaneous check here can read false (no
+      // debug cable detected) even with one plugged in, undoing this whole
+      // guard. Poll briefly instead of trusting one sample.
+      {
+        bool connected = false;
+        for (int i = 0; i < 10 && !connected; i++) {
+          connected = usb_serial_jtag_is_connected();
+          if (!connected) delay(50);
+        }
+        if (!connected) {
+          powerManager.startDeepSleep(gpio);
+        }
       }
       break;
     case HalGPIO::WakeupReason::AfterFlash:
