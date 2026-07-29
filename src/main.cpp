@@ -328,9 +328,18 @@ void setup() {
       }
       break;
     case HalGPIO::WakeupReason::AfterUSBPower:
-      // If USB power caused a cold boot, go back to sleep
+      // If USB power caused a cold boot, go back to sleep -- unless there's an
+      // active USB Serial/JTAG connection, which a plain charge cable never
+      // has (see the auto-sleep check below for why isUsbConnected() alone
+      // can't tell "charging" from "debug cable"). Every `pio run -t upload`
+      // ends with a hard reset via the RTS pin, which this chip reports as
+      // ESP_RST_POWERON while still USB-connected -- without this check, the
+      // device deep-sleeps (dropping the serial port) immediately after every
+      // single flash.
       LOG_DBG("MAIN", "Wakeup reason: After USB Power");
-      powerManager.startDeepSleep(gpio);
+      if (!usb_serial_jtag_is_connected()) {
+        powerManager.startDeepSleep(gpio);
+      }
       break;
     case HalGPIO::WakeupReason::AfterFlash:
       // After flashing, just proceed to boot
