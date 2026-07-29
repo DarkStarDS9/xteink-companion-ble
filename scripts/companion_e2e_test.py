@@ -38,8 +38,10 @@ import argparse
 import asyncio
 import hashlib
 import os
+import queue
 import struct
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -120,19 +122,64 @@ DEFAULT_MAP = [
 
 
 class Console:
-    """Thin wrapper over the CMD:/CT: serial protocol in docs/companion-test-console.md."""
+    """Thin wrapper over the CMD:/CT: serial protocol in docs/companion-test-console.md.
+
+    A background thread continuously drains the serial port for the whole
+    session, not just while a send() is in flight: `[ERR]` log lines (see
+    lib/Logging/Logging.h) can be emitted at any point, including during a
+    multi-second BLE-only wait like an image push's render+settle, when
+    nothing would otherwise be reading the port. `CT:` reply lines go to a
+    queue for send() to consume; `[ERR]` lines accumulate for pop_errors().
+    Everything else (INF/DBG lines) is dropped, same as before.
+    """
 
     def __init__(self, port: str, baud: int = 115200):
         self.serial = serial.Serial(port, baud, timeout=0.2)
         time.sleep(0.3)
         self.serial.reset_input_buffer()
+        self._ct_queue: queue.Queue[str] = queue.Queue()
+        self._errors: list[str] = []
+        self._errors_lock = threading.Lock()
+        self._reader_paused = threading.Event()
+        self._stop = threading.Event()
+        self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader_thread.start()
+
+    def _read_loop(self) -> None:
+        while not self._stop.is_set():
+            if self._reader_paused.is_set():
+                time.sleep(0.02)
+                continue
+            raw = self.serial.readline()
+            if not raw:
+                continue
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                continue
+            if "CT:" in line:
+                self._ct_queue.put(line[line.index("CT:") + 3 :])
+            elif "[ERR]" in line:
+                with self._errors_lock:
+                    self._errors.append(line)
 
     def close(self) -> None:
+        self._stop.set()
+        self._reader_thread.join(timeout=1.0)
         self.serial.close()
+
+    def pop_errors(self) -> list[str]:
+        """Returns and clears any `[ERR]` log lines captured since the last call."""
+        with self._errors_lock:
+            errors, self._errors = self._errors, []
+        return errors
 
     def send(self, command: str, expect: str | None = None, timeout: float = 5.0) -> list[str]:
         """Sends one command and collects `CT:` replies until the stream goes quiet."""
-        self.serial.reset_input_buffer()
+        while not self._ct_queue.empty():
+            try:
+                self._ct_queue.get_nowait()
+            except queue.Empty:
+                break
         self.serial.write(f"CMD:{command}\n".encode())
         self.serial.flush()
 
@@ -140,18 +187,17 @@ class Console:
         deadline = time.time() + timeout
         last_line = time.time()
         while time.time() < deadline:
-            raw = self.serial.readline()
-            if not raw:
+            try:
+                reply = self._ct_queue.get(timeout=0.1)
+            except queue.Empty:
                 # Replies arrive together; a quiet gap after at least one means done.
                 if replies and time.time() - last_line > 0.4:
                     break
                 continue
-            line = raw.decode("utf-8", "replace").strip()
+            replies.append(reply)
             last_line = time.time()
-            if "CT:" in line:
-                replies.append(line[line.index("CT:") + 3 :])
-                if expect and replies[-1].startswith(expect):
-                    deadline = min(deadline, time.time() + 0.4)
+            if expect and reply.startswith(expect):
+                deadline = min(deadline, time.time() + 0.4)
         return replies
 
     def ping(self) -> bool:
@@ -234,48 +280,60 @@ class Console:
         after 30s if the host doesn't drain fast enough) -- that way a
         truncated dump is caught here as a short read/missing footer rather
         than this method timing out first and masking the firmware-side cause.
+
+        Pauses the background reader thread for the duration: it and this
+        method's raw reads would otherwise race for the same bytes on the
+        wire. The 0.25s pause-settle wait is comfortably longer than the
+        reader thread's own 0.2s readline() timeout, so it's guaranteed to
+        have noticed the pause and stopped touching the port before this
+        method starts reading it directly.
         """
-        self.serial.reset_input_buffer()
-        self.serial.write(b"CMD:SCREENSHOT\n")
-        self.serial.flush()
+        self._reader_paused.set()
+        try:
+            time.sleep(0.25)
+            self.serial.reset_input_buffer()
+            self.serial.write(b"CMD:SCREENSHOT\n")
+            self.serial.flush()
 
-        deadline = time.time() + timeout
+            deadline = time.time() + timeout
 
-        header_line = ""
-        while time.time() < deadline:
-            raw = self.serial.readline()
-            if raw:
-                header_line = raw.decode("ascii", "replace").strip()
-                if header_line:
-                    break
-        if not header_line.startswith("SCREENSHOT_START:"):
-            raise ValueError(f"expected SCREENSHOT_START:<size>, got {header_line!r}")
-        size = int(header_line.split(":", 1)[1])
+            header_line = ""
+            while time.time() < deadline:
+                raw = self.serial.readline()
+                if raw:
+                    header_line = raw.decode("ascii", "replace").strip()
+                    if header_line:
+                        break
+            if not header_line.startswith("SCREENSHOT_START:"):
+                raise ValueError(f"expected SCREENSHOT_START:<size>, got {header_line!r}")
+            size = int(header_line.split(":", 1)[1])
 
-        data = bytearray()
-        while len(data) < size and time.time() < deadline:
-            chunk = self.serial.read(size - len(data))
-            if chunk:
-                data.extend(chunk)
-        if len(data) < size:
-            raise TimeoutError(f"screenshot truncated: got {len(data)} of {size} bytes before timeout")
+            data = bytearray()
+            while len(data) < size and time.time() < deadline:
+                chunk = self.serial.read(size - len(data))
+                if chunk:
+                    data.extend(chunk)
+            if len(data) < size:
+                raise TimeoutError(f"screenshot truncated: got {len(data)} of {size} bytes before timeout")
 
-        # Confirm the trailing marker actually arrived rather than assuming
-        # the byte count alone means the dump completed cleanly -- a host that
-        # falls behind mid-dump is exactly the case the firmware's own 30s
-        # send-side timeout guards against, and a truncated/garbled footer is
-        # the tell for it.
-        footer_line = ""
-        while time.time() < deadline:
-            raw = self.serial.readline()
-            if raw:
-                footer_line = raw.decode("ascii", "replace").strip()
-                if footer_line:
-                    break
-        if footer_line != "SCREENSHOT_END":
-            raise ValueError(f"expected SCREENSHOT_END after {len(data)} bytes, got {footer_line!r}")
+            # Confirm the trailing marker actually arrived rather than assuming
+            # the byte count alone means the dump completed cleanly -- a host that
+            # falls behind mid-dump is exactly the case the firmware's own 30s
+            # send-side timeout guards against, and a truncated/garbled footer is
+            # the tell for it.
+            footer_line = ""
+            while time.time() < deadline:
+                raw = self.serial.readline()
+                if raw:
+                    footer_line = raw.decode("ascii", "replace").strip()
+                    if footer_line:
+                        break
+            if footer_line != "SCREENSHOT_END":
+                raise ValueError(f"expected SCREENSHOT_END after {len(data)} bytes, got {footer_line!r}")
 
-        return bytes(data)
+            return bytes(data)
+        finally:
+            self._reader_paused.clear()
 
 
 # --------------------------------------------------------------------------- #
@@ -544,6 +602,29 @@ def verify_screenshot_matches(raw2bpp: bytes, width: int, height: int, actual_fr
 # Tests
 # --------------------------------------------------------------------------- #
 
+# [ERR]-level log lines (lib/Logging/Logging.h's LOG_ERR) expected during
+# normal operation, if a scenario is ever added that deliberately drives the
+# device into an error path (e.g. exhausting session slots). Empty for now --
+# nothing any current scenario does is expected to log an ERR line, so any
+# that appear are a real bug, not test noise. Add a substring here (matched
+# with `in`, not exact-match) alongside the scenario that expects it, with a
+# comment explaining why it's expected.
+ALLOWED_ERR_SUBSTRINGS: tuple[str, ...] = ()
+
+
+def check_no_errors(console: "Console", results: "Results", section: str) -> None:
+    """Fails if the device logged an unexpected [ERR] line during `section`.
+
+    Self-reported status codes (IMAGE_STATUS, screen state, etc.) only prove
+    the device *thinks* it succeeded. A failure path that logs an error and
+    then silently falls back -- e.g. the grayscale settle's storeBwBuffer()
+    OOM fallback, which leaves the prior BW frame on screen and returns
+    without ever setting an error status -- is invisible to every other check
+    in this script. This is the check that catches that shape of bug.
+    """
+    unexpected = [e for e in console.pop_errors() if not any(a in e for a in ALLOWED_ERR_SUBSTRINGS)]
+    results.check(f"no unexpected [ERR] log lines during [{section}]", not unexpected, "; ".join(unexpected))
+
 
 class Results:
     def __init__(self):
@@ -649,6 +730,7 @@ async def run_tests(args, console: Console, results: Results) -> None:
                     str(peer_a.asset_tags),
                 )
                 results.check("peer appears in the device's index", len(console.peers()) >= 1)
+            check_no_errors(console, results, "enrollment")
 
         # --- ACQUIRE gating ------------------------------------------------ #
         if enabled("buttonmap") and peer_a.session_id:
@@ -685,6 +767,7 @@ async def run_tests(args, console: Console, results: Results) -> None:
                 any("tag id=0" in line and "Saved" in line for line in labels),
                 str(labels),
             )
+            check_no_errors(console, results, "buttonmap")
 
         # --- content + button round trip ------------------------------------ #
         if enabled("content") and peer_a.session_id:
@@ -718,6 +801,7 @@ async def run_tests(args, console: Console, results: Results) -> None:
             console.press(BTN_LEFT)
             await asyncio.sleep(0.5)
             results.check("a locally-routed button sends no BLE event", not link.button_events)
+            check_no_errors(console, results, "content")
 
         # --- tags ------------------------------------------------------------ #
         if enabled("tags") and peer_a.session_id:
@@ -762,6 +846,7 @@ async def run_tests(args, console: Console, results: Results) -> None:
             # drawing. CMD:SCREENSHOT is the visual check.
             await link.push_field(peer_a, FIELD_TAG_STATE, encode_tag_state([(0, 0), (1, 0)]), final=True)
             await asyncio.sleep(1.5)
+            check_no_errors(console, results, "tags")
 
         # --- reconnect with the stored token -------------------------------- #
         if enabled("reconnect") and peer_a.token:
@@ -788,6 +873,7 @@ async def run_tests(args, console: Console, results: Results) -> None:
                 )
                 outcome = await link.acquire(peer_a)
                 results.check("ACQUIRE granted with no re-push", outcome[0] == "foreground", str(outcome))
+            check_no_errors(console, results, "reconnect")
 
             # --- preemption between two apps on one link -------------------- #
             if enabled("preemption"):
@@ -848,6 +934,7 @@ async def run_tests(args, console: Console, results: Results) -> None:
                     results.check("tags cleared on the handover",
                                   all(state == "hidden" for state in console.tags().values()),
                                   str(console.tags()))
+                check_no_errors(console, results, "preemption")
 
             # --- image push -------------------------------------------------- #
             if enabled("image"):
@@ -899,6 +986,7 @@ async def run_tests(args, console: Console, results: Results) -> None:
                             diff is None,
                             diff or "",
                         )
+                    check_no_errors(console, results, "image")
 
 
 def main() -> None:
