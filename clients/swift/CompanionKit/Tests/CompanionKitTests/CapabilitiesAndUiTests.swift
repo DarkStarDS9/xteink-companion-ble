@@ -74,7 +74,8 @@ final class UiDeclarationTests: XCTestCase {
         XCTAssertEqual(Array(body[5 ..< 8]), [0x01, 0x01, 0x07])     // CONFIRM, REMOTE, len 7
         XCTAssertEqual(String(data: body[8 ..< 15], encoding: .utf8), "Shutter")
         XCTAssertEqual(body[15], 0, "a declaration with no tags still emits a zero count")
-        XCTAssertEqual(body.count, 16)
+        XCTAssertEqual(body[16], 0, "bordered is the default render style")
+        XCTAssertEqual(body.count, 17)
     }
 
     func testTagSectionLayout() {
@@ -89,6 +90,18 @@ final class UiDeclarationTests: XCTestCase {
         XCTAssertEqual(String(data: body[8 ..< 13], encoding: .utf8), "Saved")
         XCTAssertEqual(Array(body[13 ..< 15]), [9, 3])
         XCTAssertEqual(String(data: body[15 ..< 18], encoding: .utf8), "New")
+        XCTAssertEqual(body[18], 0, "bordered is the default render style")
+        XCTAssertEqual(body.count, 19)
+    }
+
+    func testTagRenderStyleByteIsTrailingAndOptIn() {
+        let bordered = UiDeclaration(buttons: [], tags: [TagDeclaration(id: 0, label: "Saved")])
+        XCTAssertEqual(bordered.encodedBody().last, TagRenderStyle.bordered.rawValue)
+
+        let plain = UiDeclaration(buttons: [], tags: [TagDeclaration(id: 0, label: "Saved")], tagRenderStyle: .plain)
+        XCTAssertEqual(plain.encodedBody().last, TagRenderStyle.plain.rawValue)
+        XCTAssertEqual(plain.encodedBody().count, bordered.encodedBody().count,
+                       "the style byte replaces nothing else in the body -- same shape, different trailing value")
     }
 
     func testTagLabelsAreTruncatedOnAUTF8Boundary() {
@@ -131,6 +144,9 @@ final class UiDeclarationTests: XCTestCase {
 
         let c = UiDeclaration(buttons: a.buttons, tags: [TagDeclaration(id: 0, label: "Saved")])
         XCTAssertNotEqual(a.tag, c.tag, "adding a tag must re-push")
+
+        let d = UiDeclaration(buttons: a.buttons, tags: c.tags, tagRenderStyle: .plain)
+        XCTAssertNotEqual(c.tag, d.tag, "switching render style must re-push")
     }
 }
 

@@ -128,6 +128,18 @@ public enum TagState: UInt8, Sendable {
     case filled = 0x02
 }
 
+/// How a peer's whole tag row is drawn. Orthogonal to ``TagState``: state says
+/// which tag is on, this says what "on"/"off" look like for the whole row —
+/// one choice per peer, not per tag.
+public enum TagRenderStyle: UInt8, Sendable {
+    /// Outline draws a box; filled draws a filled box with knocked-out
+    /// (inverted) label text. The device's default when this byte is absent.
+    case bordered = 0x00
+    /// Outline draws nothing at all, same as hidden; filled draws the label
+    /// as plain text, no box.
+    case plain = 0x01
+}
+
 public enum CompanionTagLimits {
     /// Tags past this many are dropped by the device.
     public static let maxTags = 6

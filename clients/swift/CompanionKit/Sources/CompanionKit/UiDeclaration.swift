@@ -47,12 +47,15 @@ public struct TagDeclaration: Equatable, Sendable {
 public struct UiDeclaration: Equatable, Sendable {
     public let buttons: [ButtonMapEntry]
     public let tags: [TagDeclaration]
+    /// Whole-row look for `tags`. A per-peer choice, not per-tag.
+    public let tagRenderStyle: TagRenderStyle
 
-    public init(buttons: [ButtonMapEntry], tags: [TagDeclaration] = []) {
+    public init(buttons: [ButtonMapEntry], tags: [TagDeclaration] = [], tagRenderStyle: TagRenderStyle = .bordered) {
         // POWER is firmware-owned; encoding it would be ignored on the device,
         // which would make our digest disagree with what is stored.
         self.buttons = buttons.filter { $0.button != .power }
         self.tags = Array(tags.prefix(CompanionTagLimits.maxTags))
+        self.tagRenderStyle = tagRenderStyle
     }
 
     /// The asset body, without its 4-byte digest prefix.
@@ -77,6 +80,11 @@ public struct UiDeclaration: Equatable, Sendable {
             out.append(UInt8(label.count))
             out.append(label)
         }
+        // Trailing and optional on the wire (absent means Bordered), but
+        // always emitted here for the same reason as the tag count above:
+        // the digest is a function of the declaration, not of how it was
+        // serialized.
+        out.append(tagRenderStyle.rawValue)
         return out
     }
 
@@ -95,7 +103,8 @@ public struct UiDeclaration: Equatable, Sendable {
     /// bottom page buttons, forward the rest. Provided as a convenience, not as
     /// a default — there is no implicit declaration on the device.
     public static func readerDefault(confirmLabel: String = "Save",
-                                     tags: [TagDeclaration] = []) -> UiDeclaration {
+                                     tags: [TagDeclaration] = [],
+                                     tagRenderStyle: TagRenderStyle = .bordered) -> UiDeclaration {
         UiDeclaration(buttons: [
             ButtonMapEntry(.left, .localPagePrevious, label: "<"),
             ButtonMapEntry(.right, .localPageNext, label: ">"),
@@ -103,7 +112,7 @@ public struct UiDeclaration: Equatable, Sendable {
             ButtonMapEntry(.back, .remote, label: "Back"),
             ButtonMapEntry(.up, .remote),
             ButtonMapEntry(.down, .remote)
-        ], tags: tags)
+        ], tags: tags, tagRenderStyle: tagRenderStyle)
     }
 }
 
