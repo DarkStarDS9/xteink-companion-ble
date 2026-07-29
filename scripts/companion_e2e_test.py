@@ -219,6 +219,64 @@ class Console:
         self.send("CRESET", expect="reset")
         time.sleep(0.5)
 
+    def screenshot(self, timeout: float = 35.0) -> bytes:
+        """Issues CMD:SCREENSHOT and returns the raw framebuffer bytes.
+
+        The device's response isn't a CT:-prefixed line like every other
+        command -- it's a binary dump framed as `SCREENSHOT_START:<size>\\n`,
+        then exactly `<size>` raw bytes, then `SCREENSHOT_END\\n` (see the
+        SCREENSHOT handler in src/main.cpp). send()'s reader assumes one line
+        per reply and filters for "CT:", so it can't carry this; this method
+        parses the wire directly instead.
+
+        The 35s budget is deliberately a bit more than the firmware's own 30s
+        send-side timeout (main.cpp retries in 256-byte chunks and gives up
+        after 30s if the host doesn't drain fast enough) -- that way a
+        truncated dump is caught here as a short read/missing footer rather
+        than this method timing out first and masking the firmware-side cause.
+        """
+        self.serial.reset_input_buffer()
+        self.serial.write(b"CMD:SCREENSHOT\n")
+        self.serial.flush()
+
+        deadline = time.time() + timeout
+
+        header_line = ""
+        while time.time() < deadline:
+            raw = self.serial.readline()
+            if raw:
+                header_line = raw.decode("ascii", "replace").strip()
+                if header_line:
+                    break
+        if not header_line.startswith("SCREENSHOT_START:"):
+            raise ValueError(f"expected SCREENSHOT_START:<size>, got {header_line!r}")
+        size = int(header_line.split(":", 1)[1])
+
+        data = bytearray()
+        while len(data) < size and time.time() < deadline:
+            chunk = self.serial.read(size - len(data))
+            if chunk:
+                data.extend(chunk)
+        if len(data) < size:
+            raise TimeoutError(f"screenshot truncated: got {len(data)} of {size} bytes before timeout")
+
+        # Confirm the trailing marker actually arrived rather than assuming
+        # the byte count alone means the dump completed cleanly -- a host that
+        # falls behind mid-dump is exactly the case the firmware's own 30s
+        # send-side timeout guards against, and a truncated/garbled footer is
+        # the tell for it.
+        footer_line = ""
+        while time.time() < deadline:
+            raw = self.serial.readline()
+            if raw:
+                footer_line = raw.decode("ascii", "replace").strip()
+                if footer_line:
+                    break
+        if footer_line != "SCREENSHOT_END":
+            raise ValueError(f"expected SCREENSHOT_END after {len(data)} bytes, got {footer_line!r}")
+
+        return bytes(data)
+
 
 # --------------------------------------------------------------------------- #
 # BLE side: one simulated app
@@ -380,6 +438,106 @@ def make_test_raw_image(width: int, height: int) -> bytes:
             shift = 6 - (x % 4) * 2
             row[x // 4] |= level << shift
     return bytes(out)
+
+
+# --------------------------------------------------------------------------- #
+# BW-plane ground truth: what CMD:SCREENSHOT should read back after the raw
+# 2bpp bytes above are pushed and rendered.
+#
+# CMD:SCREENSHOT dumps display.getFrameBuffer(), which after a normal
+# displayBuffer() push only ever holds the 1-bit black/white plane -- the two
+# intermediate gray levels are written straight to the physical panel in a
+# transient GRAYSCALE_MSB/LSB pass (see DirectPixelWriter::writePixel()) and
+# never land in a readable buffer. So an exact 4-level match isn't possible
+# via this mechanism: this only checks the BW plane, i.e. that levels 0-2
+# rendered black and level 3 rendered white.
+#
+# Framebuffer layout (DirectPixelWriter::writePixel(), lib/Epub/Epub/
+# converters/DirectPixelWriter.h): 1 bit/pixel, MSB-first,
+# byteIndex = phyY * displayWidthBytes + (phyX >> 3), state=true (BW mode)
+# clears the bit to draw black; undrawn pixels are left as whatever
+# clearScreen() set (0xFF, i.e. white).
+#
+# Orientation (GfxRenderer::Portrait, the default -- nothing in
+# CompanionModeActivity or its setup changes it): phyX = y, phyY =
+# (physicalHeight - 1) - x, where physicalHeight is the *logical* width
+# reported by the capability characteristic (Portrait swaps physical
+# width/height into logical height/width -- see GfxRenderer::getScreenWidth/
+# Height()). physicalWidth is therefore the logical height, and the
+# framebuffer stride is ceil(physicalWidth / 8) = ceil(logical_height / 8).
+# --------------------------------------------------------------------------- #
+
+
+def compute_expected_bw_framebuffer(raw2bpp: bytes, width: int, height: int) -> bytes:
+    """Expected readable-framebuffer bytes for a raw2bpp image pushed at width x height (logical).
+
+    width/height are the logical dimensions from the capability characteristic
+    (caps["px_wide"]/["px_high"]), matching what make_test_raw_image() encoded
+    and what RawBitmapToFramebufferConverter reads via
+    renderer.getScreenWidth()/getScreenHeight(). Thresholds each 2-bit sample
+    the same way DirectPixelWriter::writePixel() does in BW render mode:
+    sample < 3 -> black (bit cleared), sample == 3 -> left white (bit set).
+    """
+    src_row_bytes = (width + 3) // 4
+    # Portrait: phyH = width (logical width becomes the physical row count),
+    # phyW = height (logical height becomes the physical column count).
+    stride = (height + 7) // 8
+    phys_rows = width
+    fb = bytearray(b"\xff" * (stride * phys_rows))
+
+    for y in range(height):
+        phy_x = y  # Portrait: phyX = y
+        byte_col = phy_x >> 3
+        bit_mask = 1 << (7 - (phy_x & 7))
+        src_row = memoryview(raw2bpp)[y * src_row_bytes : (y + 1) * src_row_bytes]
+        for x in range(width):
+            phy_y = (width - 1) - x  # Portrait: phyY = (phyH - 1) - x
+            sample = (src_row[x >> 2] >> (6 - (x % 4) * 2)) & 0x03
+            if sample < 3:
+                idx = phy_y * stride + byte_col
+                fb[idx] &= ~bit_mask & 0xFF
+
+    return bytes(fb)
+
+
+def diff_bw_framebuffer(expected: bytes, actual: bytes, stride: int) -> str | None:
+    """Returns None on an exact match, else a short debugging summary.
+
+    Row/col in the summary are physical framebuffer coordinates (post-
+    orientation-transform), not the logical image coordinates the source
+    bytes were encoded in -- that's what CMD:SCREENSHOT's layout is in.
+    """
+    if len(expected) != len(actual):
+        return f"size mismatch: expected {len(expected)} bytes, got {len(actual)}"
+    if expected == actual:
+        return None
+
+    n_diff = 0
+    first_row = first_col = first_expected = first_actual = None
+    for i, (e, a) in enumerate(zip(expected, actual)):
+        if e == a:
+            continue
+        n_diff += 1
+        if first_row is None:
+            diff_bits = e ^ a
+            bit_offset = next(b for b in range(8) if diff_bits & (1 << (7 - b)))
+            first_row = i // stride
+            first_col = (i % stride) * 8 + bit_offset
+            first_expected, first_actual = e, a
+
+    pct = 100.0 * n_diff / len(expected)
+    return (
+        f"{n_diff} of {len(expected)} bytes differ ({pct:.2f}%); "
+        f"first mismatch at physical row {first_row}, pixel-col {first_col} "
+        f"(byte expected 0x{first_expected:02x}, got 0x{first_actual:02x})"
+    )
+
+
+def verify_screenshot_matches(raw2bpp: bytes, width: int, height: int, actual_framebuffer: bytes) -> str | None:
+    """None if the screenshot's BW plane matches the pushed image, else a diff summary."""
+    expected = compute_expected_bw_framebuffer(raw2bpp, width, height)
+    stride = (height + 7) // 8
+    return diff_bw_framebuffer(expected, actual_framebuffer, stride)
 
 
 # --------------------------------------------------------------------------- #
@@ -649,6 +807,11 @@ async def run_tests(args, console: Console, results: Results) -> None:
                         peer_b.session_id != peer_a.session_id,
                         f"{peer_a.session_id} vs {peer_b.session_id}",
                     )
+                    # The device's own serial-reportable session count settles on its next
+                    # main-loop iteration, not the instant the BLE notify is sent -- checking
+                    # immediately races that, same class as the render-lock delay await_screen()
+                    # already retries for.
+                    await asyncio.sleep(0.3)
                     results.check("device reports two live sessions", console.state().get("sessions") == "2")
 
                     await link.push_asset(peer_b, FIELD_UI_DECL, encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS))
@@ -688,7 +851,19 @@ async def run_tests(args, console: Console, results: Results) -> None:
 
             # --- image push -------------------------------------------------- #
             if enabled("image"):
-                owner = peer_b if peer_b.session_id else peer_a
+                # Content/image pushes are silently dropped from a non-foreground
+                # session (CompanionBle.cpp only lets the foreground app push visible
+                # content; assets like UI declarations are the exception). The
+                # preemption block above ends with foreground handed back to peer_a,
+                # so picking "peer_b if it has a session" here would push from a
+                # backgrounded peer -- silently dropped, hanging forever waiting for
+                # an IMAGE_STATUS that will never come. Use whichever peer the device
+                # actually reports as foreground right now.
+                current_foreground = console.state().get("foreground")
+                if peer_b.session_id and str(peer_b.session_id) == current_foreground:
+                    owner = peer_b
+                else:
+                    owner = peer_a
                 if owner.session_id:
                     print("\n[image] raw packed 2bpp, full screen")
                     raw = make_test_raw_image(caps["px_wide"], caps["px_high"])
@@ -703,6 +878,27 @@ async def run_tests(args, console: Console, results: Results) -> None:
                     results.check("device reported the image displayed", verdict == 0, f"IMAGE_STATUS {verdict}")
                     print(f"  transfer + develop took {time.time() - started:.1f}s")
                     results.check("device is showing an image", console.state().get("screen") == "image")
+
+                    # The two checks above are the device's own self-report
+                    # (an IMAGE_STATUS notification and a screen-state string)
+                    # -- a decode bug that produced garbage pixels but still
+                    # flipped those flags would still pass both. Pull the
+                    # actual framebuffer over CMD:SCREENSHOT and diff it
+                    # against ground truth computed from the exact bytes that
+                    # were pushed, for real pixel-level verification.
+                    try:
+                        actual_fb = console.screenshot()
+                    except (TimeoutError, ValueError) as exc:
+                        results.check("framebuffer screenshot round-tripped over serial", False, str(exc))
+                    else:
+                        diff = verify_screenshot_matches(raw, caps["px_wide"], caps["px_high"], actual_fb)
+                        results.check(
+                            "the framebuffer's BW plane matches the pushed image "
+                            "(levels 0-2 black, level 3 white; the two gray levels "
+                            "aren't checked -- see compute_expected_bw_framebuffer)",
+                            diff is None,
+                            diff or "",
+                        )
 
 
 def main() -> None:
