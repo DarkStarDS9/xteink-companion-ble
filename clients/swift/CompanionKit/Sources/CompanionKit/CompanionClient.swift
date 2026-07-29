@@ -464,7 +464,10 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     }
 
     private func acquire() async throws {
-        let session = try requireSession()
+        // needsScreen: false — acquiring the screen is how ownsScreen becomes
+        // true in the first place; requiring it here made ACQUIRE impossible
+        // to ever call after a preemption (see requireSession(needsScreen:)).
+        let session = try requireSession(needsScreen: false)
         try await withPendingAcquire {
             self.writeSession(SessionCodec.encodeAcquire(sessionId: session))
         }
@@ -484,8 +487,11 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard peripheral != nil, contentChar != nil else { throw CompanionError.notConnected }
         guard sessionId != CompanionProtocol.noSession else { throw CompanionError.noSession }
+        // Assets must be reconciled before ACQUIRE is legal (the device
+        // refuses it otherwise) as well as before any content push.
+        guard assetsReconciled else { throw CompanionError.noScreen }
         if needsScreen {
-            guard assetsReconciled, ownsScreen else { throw CompanionError.noScreen }
+            guard ownsScreen else { throw CompanionError.noScreen }
         }
         return sessionId
     }
