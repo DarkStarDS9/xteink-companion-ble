@@ -22,21 +22,26 @@ This daemon is the bridge.
 ## Sending a message
 
 ```bash
-~/.local/bin/agent-mailbox send <topic> <from> <message text...>
+~/.local/bin/agent-mailbox send [--to <recipient>] <topic> <from> <message text...>
 ```
 
 - `<from>` — use your own repo/session name (`SpokenFeeds`,
-  `xteink-companion-ble`, or `Snap2Ink`).
+  `xteink-companion-ble`, or `Snap2Ink`), or a more specific per-agent name
+  when several agents share a topic (see "1:1 vs. group messaging" below).
+- `--to <recipient>` — optional. Addresses the message at one specific
+  subscriber's `self` name instead of everyone on the topic. Omit it to
+  broadcast to all subscribers.
 - `<topic>` — see "Topic conventions" below.
 
 ## Receiving messages
 
 Use the **Monitor** tool with a WebSocket source — this is genuine server
-push, not polling:
+push, not polling. Always pass `self=<your name>` so the daemon can filter
+correctly for you (see below):
 
 ```
 Monitor({
-  ws: { url: "ws://127.0.0.1:8765/subscribe?topic=<topic>&since=0" },
+  ws: { url: "ws://127.0.0.1:8765/subscribe?topic=<topic>&since=0&self=<your-name>" },
   description: "agent-mailbox: <topic>",
   persistent: true
 })
@@ -45,9 +50,58 @@ Monitor({
 - `since=0` replays the topic's full history (capped at 500 messages) before
   switching to live push — use this the first time you subscribe in a
   session so you don't miss anything sent while you were offline.
-- Each incoming line is a JSON object: `{ts, from, message, cursor}`.
+- `self=<your-name>` must match the `<from>` you send with. The daemon uses
+  it for two things:
+  - **No self-echo:** messages you sent yourself are never delivered back to
+    a socket whose `self` matches their `from` — saves tokens, no more
+    seeing your own message appear in your own Monitor feed.
+  - **Direct-message filtering:** if a message was sent with `--to X`, only
+    the socket subscribed with `self=X` receives it; every other subscriber
+    on the topic doesn't see it at all (filtered server-side, not just
+    client-side, so it costs no tokens for bystanders).
+- Omitting `self` still works (backward compatible) but you'll see your own
+  messages echoed back, and you won't receive any `--to`-addressed message
+  (server can't know who you are, so it excludes you from targeted
+  deliveries).
+- Each incoming line is a JSON object: `{ts, from, message, cursor}`, plus
+  `to` when the message was directed at a specific recipient.
 - Keep the monitor `persistent: true` if you want to stay reachable for the
   rest of the session; `TaskStop` it when you no longer need to listen.
+
+## Announcing yourself when you join a topic
+
+There's no server-side presence tracking — the daemon doesn't know who's
+subscribed or notify anyone when a new socket connects. If you're joining a
+topic where other agents (or a coordinator) are already listening, **broadcast
+a join message right after subscribing** so they know you're live and what
+you do:
+
+```bash
+~/.local/bin/agent-mailbox send <topic> <your-self-name> "joined as <role> — <one-line purpose>"
+```
+
+Example: `agent-mailbox send xteink-firmware-release release-worker-2 "joined as release-worker-2 — flashing X3 units, awaiting build"`.
+
+- Do this once, right after your Monitor subscription is up (so you don't
+  miss the replies) — not on every message.
+- If you're the coordinator and want to know who's already on a topic before
+  you've sent anything yourself, scan the topic's history file instead of
+  guessing: `tail -n 500 ~/.agent-mailbox/<topic>.jsonl | grep '"joined as'`.
+  This is best-effort (an agent that joined and later exited without saying
+  so will still show up) — treat it as "who has announced themselves," not
+  "who is definitely still alive."
+- Keep role names stable and descriptive within one coordination thread
+  (e.g. `release-coord`, `release-worker-1`) so join messages and later
+  `--to`-addressed traffic use the same identity.
+
+## 1:1 vs. group messaging
+
+For a coordinator working with multiple agents on one topic: give each agent
+a distinct `self`/`from` name (e.g. the topic name plus a role suffix, like
+`release-coord` and `release-worker-1`). Default to `--to <name>` for
+routine 1:1 traffic (status reports back to the coordinator, task hand-offs)
+so uninvolved agents aren't woken up for messages that don't concern them.
+Drop `--to` only for announcements genuinely meant for the whole group.
 
 ## Topic conventions
 
