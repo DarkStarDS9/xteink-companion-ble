@@ -2,17 +2,17 @@
 """
 Drive a Companion Mode device over BLE from a dev machine, without a phone app.
 
-Implements the client side of docs/companion-display-protocol.md v6: the HELLO
+Implements the client side of docs/companion-display-protocol.md v7: the HELLO
 handshake, token persistence, the button map, icons, text and image pushes. This
 is the fastest way to exercise the firmware — it does not depend on either iOS
-app being ready, and it can produce inputs (a 40 KB image, a 10-page body, a
-deliberately malformed asset) that are awkward to trigger from an app.
+app being ready, and it can produce inputs (a full-panel raw image, a 10-page
+body, a deliberately malformed asset) that are awkward to trigger from an app.
 
 Usage:
     python scripts/push_companion_content.py                        # push default text
     python scripts/push_companion_content.py --body-file article.txt
-    python scripts/push_companion_content.py --image photo.png      # pre-dithered 8-bit grayscale
-    python scripts/push_companion_content.py --image-from photo.jpg # dither it here first (needs Pillow)
+    python scripts/push_companion_content.py --image photo.raw      # pre-packed raw 2bpp
+    python scripts/push_companion_content.py --image-from photo.jpg # dither + pack it here first (needs Pillow)
     python scripts/push_companion_content.py --icon icon.png        # 1-bpp sleep-screen icon (needs Pillow)
     python scripts/push_companion_content.py --listen               # stay connected, print button events
     python scripts/push_companion_content.py --forget               # drop the stored token, re-pair
@@ -329,11 +329,17 @@ class Session:
         print(f"  asset {field:#04x}: {ASSET_RESULTS.get(result, result)} (tag {tag.hex()})")
         return result
 
-    async def push_image(self, png: bytes) -> int:
-        if len(png) > self.caps["max_image"]:
-            raise SystemExit(f"Image is {len(png)} bytes, device cap is {self.caps['max_image']}.")
+    async def push_image(self, raw_bitmap: bytes) -> int:
+        expected = ((self.caps["px_wide"] + 3) // 4) * self.caps["px_high"]
+        if len(raw_bitmap) != expected:
+            raise SystemExit(
+                f"Raw bitmap is {len(raw_bitmap)} bytes, device expects exactly {expected} "
+                f"({self.caps['px_wide']}x{self.caps['px_high']}, packed 2bpp)."
+            )
+        if len(raw_bitmap) > self.caps["max_image"]:
+            raise SystemExit(f"Image is {len(raw_bitmap)} bytes, device cap is {self.caps['max_image']}.")
         self.image_future = self.loop.create_future()
-        await self.push_field(FIELD_IMAGE, png, final=True, progress=True)
+        await self.push_field(FIELD_IMAGE, raw_bitmap, final=True, progress=True)
         print("  Waiting for the device to develop it (decode + grayscale settle)...")
         result = await asyncio.wait_for(self.image_future, timeout=180)
         print(f"  image: {IMAGE_RESULTS.get(result, result)}")
@@ -351,18 +357,20 @@ class Session:
 # --------------------------------------------------------------------------- #
 
 
-def dither_to_png(path: str, width: int, height: int) -> bytes:
-    """Crop-to-fill, dither to the panel's 4 levels, encode 8-bit grayscale PNG.
+def dither_to_raw_bitmap(path: str, width: int, height: int) -> bytes:
+    """Crop-to-fill, dither to the panel's 4 levels, pack as field 0x04's wire
+    format: raw 2-bit samples, no header, bytesPerRow = ceil(width/4), each
+    byte MSB-first (bits 7-6 = leftmost sample), rows top-to-bottom.
 
-    Deliberately simple — this is a bring-up tool, not the Polaroid app. The real
-    aesthetic decision belongs to the phone app; the only contract this has to
-    honour is that every pixel ends up as one of {0, 85, 170, 255}.
+    Deliberately simple — this is a bring-up tool, not the Polaroid app. The
+    real aesthetic decision belongs to the phone app; the only contract this
+    has to honour is that every pixel ends up as one of the four levels 0-3
+    (0=black..3=white), packed exactly as the device expects.
     """
     try:
         from PIL import Image
     except ImportError:
         raise SystemExit("--image-from needs Pillow: pip install Pillow")
-    import io
 
     source = Image.open(path).convert("L")
     scale = max(width / source.width, height / source.height)
@@ -371,18 +379,21 @@ def dither_to_png(path: str, width: int, height: int) -> bytes:
     top = (resized.height - height) // 2
     cropped = resized.crop((left, top, left + width, top + height))
 
-    # Floyd-Steinberg onto a 4-entry palette, then map palette indices back to
-    # the exact byte values the device buckets on (gray / 85).
+    # Floyd-Steinberg onto a 4-entry palette, then map palette indices to the
+    # 2-bit sample values 0-3 the device unpacks directly (no gray-expansion).
     palette = Image.new("P", (1, 1))
     palette.putpalette([0, 0, 0, 85, 85, 85, 170, 170, 170, 255, 255, 255] + [0] * (768 - 12))
     quantized = cropped.convert("RGB").quantize(palette=palette, dither=Image.FLOYDSTEINBERG)
-    levels = [0, 85, 170, 255]
-    out = Image.new("L", (width, height))
-    out.putdata([levels[index] for index in quantized.getdata()])
+    levels = list(quantized.getdata())  # already palette indices 0-3
 
-    buffer = io.BytesIO()
-    out.save(buffer, format="PNG", optimize=True)
-    return buffer.getvalue()
+    row_bytes = (width + 3) // 4
+    out = bytearray(row_bytes * height)
+    for y in range(height):
+        base = y * row_bytes
+        for x in range(width):
+            shift = 6 - (x % 4) * 2  # MSB-first: sample 0 at bits 7-6
+            out[base + x // 4] |= levels[y * width + x] << shift
+    return bytes(out)
 
 
 def encode_icon(path: str, width: int, height: int) -> bytes:
@@ -458,11 +469,11 @@ async def run(args) -> None:
 
         if args.image or args.image_from:
             if args.image:
-                png = Path(args.image).read_bytes()
+                raw_bitmap = Path(args.image).read_bytes()
             else:
-                png = dither_to_png(args.image_from, caps["px_wide"], caps["px_high"])
-                print(f"  dithered to {len(png)} bytes of PNG")
-            await session.push_image(png)
+                raw_bitmap = dither_to_raw_bitmap(args.image_from, caps["px_wide"], caps["px_high"])
+                print(f"  dithered to {len(raw_bitmap)} bytes of raw packed-2bpp")
+            await session.push_image(raw_bitmap)
         elif not args.no_text:
             body = Path(args.body_file).read_text(encoding="utf-8") if args.body_file else (args.body or DEFAULT_BODY)
             print("Pushing title + body + content-id as one atomic batch...")
@@ -502,7 +513,10 @@ def main() -> None:
     parser.add_argument("--body", default=None, help="Body text (default: a short placeholder)")
     parser.add_argument("--body-file", default=None, help="Read body text from this file instead of --body")
     parser.add_argument("--content-id", default="test-script", help="Opaque content-id (truncated to 32 bytes)")
-    parser.add_argument("--image", default=None, help="Push this PNG as-is (must already be 8-bit grayscale, 4 levels)")
+    parser.add_argument(
+        "--image", default=None,
+        help="Push this file as-is: raw packed 2bpp, no header, bytesPerRow=ceil(width/4) x height bytes exactly",
+    )
     parser.add_argument("--image-from", default=None, help="Dither this image here, then push it (needs Pillow)")
     parser.add_argument("--icon", default=None, help="Encode this image as the 1-bpp sleep-screen icon (needs Pillow)")
     parser.add_argument("--no-text", action="store_true", help="Handshake and push assets, but push no content")
