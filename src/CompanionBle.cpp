@@ -703,7 +703,11 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // content stays up until the idle timeout, so a photo stays a photo after
     // the phone walks away (docs/companion-display-protocol.md, "On-screen
     // behaviour").
-    if (g_begun && server) server->startAdvertising();
+    if (g_begun && server) {
+      const bool restarted = server->startAdvertising();
+      LOG_DBG("CBLE", "advertising restart after disconnect: start()=%d isAdvertising()=%d", restarted ? 1 : 0,
+              NimBLEDevice::getAdvertising()->isAdvertising() ? 1 : 0);
+    }
   }
 };
 
