@@ -555,9 +555,8 @@ final display level 0–3), then runs the two-pass grayscale settle.
 `kMaxImagesPerPeer` = 6 entries, oldest overwritten once full — see
 `CompanionPeerStore.h`) instead of being left as a single scratch file the
 next push would silently clobber. The user can page back and forth through a
-peer's own gallery with whichever of `LEFT`/`RIGHT` or `UP`/`DOWN` the peer's
-own button map leaves free while a photo is on screen — see the button-pair
-note under "UI declaration field" above. This is entirely
+peer's own gallery with `UP`/`DOWN` while a photo is on screen — see the
+`UP`/`DOWN` note under "UI declaration field" above. This is entirely
 device-local: there is no wire opcode for it, no capability bit, and the app
 is never told navigation happened, so this paragraph is the only thing an app
 author needs to read about it.
@@ -716,23 +715,20 @@ Notes:
   disconnected.
 - Ship a new tag when an app update changes the scheme; the device picks it up
   on the next connect without re-pairing.
-- **Whichever of `LEFT`/`RIGHT` or `UP`/`DOWN` is left as `NONE` (or
-  `LOCAL_PAGE_PREV`/`LOCAL_PAGE_NEXT`) on *both* sides is used by the device
-  for image gallery navigation** while a pushed photo (field `0x04`) is on
-  screen: the device keeps the last several images an app has pushed (see
-  "Image field" above) and lets the user page back and forth through them
-  locally. There is no single pair that's safe to hardcode — apps disagree
-  about which one they want for themselves (e.g. a camera-control app
-  routing `UP`/`DOWN` to `REMOTE` for shutter/redevelop, vs. a text-reading
-  app routing `LEFT`/`RIGHT` to local paging) — so the device tries
-  `LEFT`/`RIGHT` first, then `UP`/`DOWN`, and uses the first pair where
-  neither side is claimed for something that actually applies outside image
-  content. This is not a wire behaviour — no notification is sent, no
-  capability bit exists for it — so it costs an app nothing to be unaware of
-  it. A pair with either side routed to `REMOTE` or `LOCAL_SLEEP` is never
-  overridden; the gallery only engages on a pair the app's own map leaves
-  fully unclaimed (or routed to local paging, which is already a no-op
-  outside text content).
+- **`UP`/`DOWN` left as `NONE` (or `LOCAL_PAGE_PREV`/`LOCAL_PAGE_NEXT`) are used
+  by the device for image gallery navigation** while a pushed photo (field
+  `0x04`) is on screen: the device keeps the last several images an app has
+  pushed (see "Image field" above) and lets the user page back and forth
+  through them locally with the side buttons. `LEFT`/`RIGHT` were deliberately
+  not used for this: they're the buttons most apps already route to
+  `LOCAL_PAGE_PREV`/`LOCAL_PAGE_NEXT` for paging text, so `UP`/`DOWN` are the
+  pair actually free in practice. This is not a wire behaviour — no
+  notification is sent, no capability bit exists for it — so it costs an app
+  nothing to be unaware of it. An app that declares its own routing for
+  `UP`/`DOWN` (e.g. `REMOTE`, for something like camera control) is never
+  overridden; the gallery only engages on whichever of those two buttons the
+  app's own map leaves unclaimed (or routes to local paging, which is already
+  a no-op outside text content).
 
 #### Tags
 
