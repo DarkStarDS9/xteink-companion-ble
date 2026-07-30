@@ -326,10 +326,16 @@ void setPairingRequestCallback(PairingRequestCallback cb);
 using ForegroundChangeCallback = void (*)(const char* peerKey, const char* displayName);
 void setForegroundChangeCallback(ForegroundChangeCallback cb);
 
-// A complete image has been staged to SD at `path` and is ready to decode. The
-// activity decodes it on the main loop (never on the host task — decoding
-// touches the framebuffer) and then calls notifyImageStatus().
-using ImageStagedCallback = void (*)(const char* path);
+// A complete image has been staged to SD at `path` (the pushing peer's
+// data/incoming.raw scratch file) and is ready to decode. `peerKey` is the
+// pushing (always foreground — image is a screen-owning field, not an asset)
+// peer, and `contentId`/`contentIdLen` are that peer's last-pushed content-id,
+// for the activity to hand to CompanionPeerStore::commitImage() so the
+// gallery's sidecar index can record it. The activity decodes on the main loop
+// (never on the host task — decoding touches the framebuffer) and then calls
+// notifyImageStatus().
+using ImageStagedCallback = void (*)(const char* peerKey, const char* path, const uint8_t* contentId,
+                                     size_t contentIdLen);
 void setImageStagedCallback(ImageStagedCallback cb);
 
 }  // namespace companionble

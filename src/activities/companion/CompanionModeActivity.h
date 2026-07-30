@@ -85,11 +85,19 @@ class CompanionModeActivity final : public Activity {
   std::string body;
   std::vector<std::string> titleLines;  // title wrapped to at most kMaxTitleLines lines
 
-  // Staged PNG waiting to be decoded on the main loop. Decoding touches the
-  // framebuffer, so it can never happen on the NimBLE host task where the
-  // transfer completes.
-  std::string pendingImagePath;
   std::string displayedImagePath;
+
+  // Firmware-local browsing of the foreground peer's previously pushed images
+  // (CompanionPeerStore's bounded per-peer gallery, kMaxImagesPerPeer entries,
+  // oldest first). Refreshed whenever a new image is committed
+  // (refreshGalleryForForeground()) and cleared on foreground handover — an
+  // app's gallery does not follow it off screen. No protocol involvement: the
+  // phone is never told navigation happened, same as text pagination's
+  // currentPage/totalPages, which are also purely on-device state (see
+  // docs/companion-display-protocol.md and this feature's commit message for
+  // why that's the right call here too).
+  std::vector<std::string> galleryImages;
+  size_t galleryIndex = 0;
 
   std::string pairingAppName;
   unsigned long pairingDeadlineMs = 0;
@@ -160,7 +168,11 @@ class CompanionModeActivity final : public Activity {
   const char* labelFor(companionble::ButtonId button) const;
   bool handleMappedButton(MappedInputManager::Button role, companionble::ButtonId id);
   void applyForegroundChange();
-  void handlePendingImage();
+  void handlePendingImage(const std::string& stagedPath, const std::string& peerKey, const uint8_t* contentId,
+                          size_t contentIdLen);
+  void refreshGalleryForForeground();
+  bool handleGalleryNav();
+  void showGalleryImage(size_t index);
   void computeViewport();
   void updateTitleLayout();
   std::vector<std::string> wrapTitleToLines(const std::string& text) const;

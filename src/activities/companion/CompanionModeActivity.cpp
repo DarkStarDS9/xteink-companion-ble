@@ -87,6 +87,9 @@ volatile bool g_pendingForegroundReady = false;
 char g_pendingPairingName[companionpeer::kMaxNameLen + 1] = {0};
 volatile bool g_pendingPairingReady = false;
 char g_pendingImagePath[96] = {0};
+char g_pendingImagePeerKey[companionpeer::kPeerKeyLen] = {0};
+uint8_t g_pendingImageContentId[companionble::kMaxContentIdLen] = {0};
+uint8_t g_pendingImageContentIdLen = 0;
 volatile bool g_pendingImageReady = false;
 
 // Set once a field's END arrives with kFinalFieldFlag set. loop() only applies
@@ -153,9 +156,13 @@ void onForegroundChange(const char* peerKey, const char* displayName) {
   portEXIT_CRITICAL(&g_mux);
 }
 
-void onImageStaged(const char* path) {
+void onImageStaged(const char* peerKey, const char* path, const uint8_t* contentId, size_t contentIdLen) {
   portENTER_CRITICAL(&g_mux);
   snprintf(g_pendingImagePath, sizeof(g_pendingImagePath), "%s", path ? path : "");
+  snprintf(g_pendingImagePeerKey, sizeof(g_pendingImagePeerKey), "%s", peerKey ? peerKey : "");
+  const size_t n = contentIdLen > sizeof(g_pendingImageContentId) ? sizeof(g_pendingImageContentId) : contentIdLen;
+  if (n > 0) memcpy(g_pendingImageContentId, contentId, n);
+  g_pendingImageContentIdLen = static_cast<uint8_t>(n);
   g_pendingImageReady = true;
   portEXIT_CRITICAL(&g_mux);
 }
@@ -177,6 +184,8 @@ void CompanionModeActivity::onEnter() {
   currentPage = 0;
   totalPages = 0;
   pages.clear();
+  galleryImages.clear();
+  galleryIndex = 0;
   clearUiDeclaration();
   cachedFontId = kCompanionFontId;
   computeViewport();
@@ -615,6 +624,8 @@ void CompanionModeActivity::applyForegroundChange() {
     currentPage = 0;
     haveContent = false;
     displayedImagePath.clear();
+    galleryImages.clear();
+    galleryIndex = 0;
     updateTitleLayout();
     screen = Screen::Text;
   }
@@ -624,9 +635,21 @@ void CompanionModeActivity::applyForegroundChange() {
 // Decodes a staged raw packed 2bpp image (field 0x04) on the main loop task
 // and reports the outcome back to the app. Never runs on the NimBLE host
 // task: decoding writes the framebuffer.
-void CompanionModeActivity::handlePendingImage() {
-  const std::string path = pendingImagePath;
-  pendingImagePath.clear();
+//
+// Before decoding, the staged file is moved into the pushing peer's bounded
+// image gallery (CompanionPeerStore::commitImage) so it survives the next
+// push instead of being overwritten by it — see this feature's commit message
+// for why that lives in firmware rather than the phone.
+void CompanionModeActivity::handlePendingImage(const std::string& stagedPath, const std::string& peerKey,
+                                               const uint8_t* contentId, size_t contentIdLen) {
+  std::string path = companionpeer::commitImage(peerKey.c_str(), stagedPath, contentId, contentIdLen);
+  if (path.empty()) {
+    // The gallery move failed (e.g. SD write error); fall back to displaying
+    // straight from the scratch file so a storage hiccup doesn't also cost the
+    // app the push it just made. It just won't be in the gallery afterward.
+    LOG_ERR("CMA", "could not commit staged image for peer %s; displaying from scratch path", peerKey.c_str());
+    path = stagedPath;
+  }
 
   ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(path);
   if (!decoder) {
@@ -643,8 +666,65 @@ void CompanionModeActivity::handlePendingImage() {
 
   RenderLock lock;
   displayedImagePath = path;
+  refreshGalleryForForeground();
   screen = Screen::Image;
   requestUpdate();
+}
+
+// Rebuilds the in-memory gallery list from the foreground peer's stored
+// images and points galleryIndex at whichever one is currently displayed.
+// Called whenever a new image is committed; the list itself lives on SD
+// (CompanionPeerStore), so this is just re-reading a few dozen bytes of JSON,
+// not holding a second copy of anything image-sized.
+void CompanionModeActivity::refreshGalleryForForeground() {
+  galleryImages.clear();
+  galleryIndex = 0;
+  if (foregroundPeerKey.empty()) return;
+
+  companionpeer::ImageEntry entries[companionpeer::kMaxImagesPerPeer];
+  const size_t count =
+      companionpeer::listImages(foregroundPeerKey.c_str(), entries, companionpeer::kMaxImagesPerPeer);
+  galleryImages.reserve(count);
+  for (size_t i = 0; i < count; ++i) galleryImages.push_back(entries[i].path);
+
+  for (size_t i = 0; i < galleryImages.size(); ++i) {
+    if (galleryImages[i] == displayedImagePath) {
+      galleryIndex = i;
+      break;
+    }
+  }
+}
+
+// Redraws the image at `index` in the current gallery without touching BLE:
+// this is firmware-local browsing of already-pushed images, not new content.
+void CompanionModeActivity::showGalleryImage(size_t index) {
+  if (index >= galleryImages.size()) return;
+  RenderLock lock;
+  galleryIndex = index;
+  displayedImagePath = galleryImages[index];
+  requestUpdate();
+}
+
+// Button::Left/Right gallery prev/next, active only in Screen::Image and only
+// for a button the foreground peer's own map has left unclaimed (routing
+// None) — an app that declared Left/Right for its own use (e.g. Remote) is
+// never overridden. See MappedInputManager.h: Left/Right are front buttons,
+// physically distinct from the PageBack/PageForward side buttons the reader
+// uses, so this cannot collide with page-turn handling anywhere else.
+bool CompanionModeActivity::handleGalleryNav() {
+  if (screen != Screen::Image || galleryImages.size() < 2) return false;
+
+  if (routingFor(companionble::ButtonId::Left) == companionble::ButtonRouting::None &&
+      buttonWasPressed(MappedInputManager::Button::Left, companionble::ButtonId::Left)) {
+    showGalleryImage(galleryIndex == 0 ? galleryImages.size() - 1 : galleryIndex - 1);
+    return true;
+  }
+  if (routingFor(companionble::ButtonId::Right) == companionble::ButtonRouting::None &&
+      buttonWasPressed(MappedInputManager::Button::Right, companionble::ButtonId::Right)) {
+    showGalleryImage(galleryIndex + 1 >= galleryImages.size() ? 0 : galleryIndex + 1);
+    return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +783,9 @@ void CompanionModeActivity::loop() {
   char newForegroundName[companionpeer::kMaxNameLen + 1] = {0};
   char newPairingName[companionpeer::kMaxNameLen + 1] = {0};
   char newImagePath[sizeof(g_pendingImagePath)] = {0};
+  char newImagePeerKey[sizeof(g_pendingImagePeerKey)] = {0};
+  uint8_t newImageContentId[sizeof(g_pendingImageContentId)] = {0};
+  uint8_t newImageContentIdLen = 0;
 
   portENTER_CRITICAL(&g_mux);
   if (g_pendingTitleReady) {
@@ -755,6 +838,9 @@ void CompanionModeActivity::loop() {
   }
   if (g_pendingImageReady) {
     memcpy(newImagePath, g_pendingImagePath, sizeof(newImagePath));
+    memcpy(newImagePeerKey, g_pendingImagePeerKey, sizeof(newImagePeerKey));
+    memcpy(newImageContentId, g_pendingImageContentId, sizeof(newImageContentId));
+    newImageContentIdLen = g_pendingImageContentIdLen;
     g_pendingImageReady = false;
     gotImage = true;
   }
@@ -776,8 +862,7 @@ void CompanionModeActivity::loop() {
   }
 
   if (gotImage) {
-    pendingImagePath = newImagePath;
-    handlePendingImage();
+    handlePendingImage(newImagePath, newImagePeerKey, newImageContentId, newImageContentIdLen);
   }
 
   if (commit && (gotTitle || gotBody)) {
@@ -854,8 +939,11 @@ void CompanionModeActivity::loop() {
 
   // Route each button through the foreground app's declared map. Nothing here
   // decides what a button means — routingFor() is the app's own answer, read
-  // back off the SD card.
-  const bool handled = handleMappedButton(MappedInputManager::Button::Left, companionble::ButtonId::Left) ||
+  // back off the SD card. Gallery nav is tried first but only ever engages on
+  // a button the app's own map left unclaimed (see handleGalleryNav()), so it
+  // cannot steal a press an app declared a use for.
+  const bool handled = handleGalleryNav() ||
+                       handleMappedButton(MappedInputManager::Button::Left, companionble::ButtonId::Left) ||
                        handleMappedButton(MappedInputManager::Button::Right, companionble::ButtonId::Right) ||
                        handleMappedButton(MappedInputManager::Button::Up, companionble::ButtonId::Up) ||
                        handleMappedButton(MappedInputManager::Button::Down, companionble::ButtonId::Down) ||
