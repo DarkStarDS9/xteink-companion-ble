@@ -62,6 +62,14 @@ the wire format. Consumer apps depend on it.
 - The boot path in `src/main.cpp` is the one deliberate divergence and conflicts on most syncs.
   Keep the companion side.
 
+## Agent worktrees
+
+Work done in a `.claude/worktrees/*` checkout lives on a throwaway `worktree-*` branch. It is not
+done until it lands on `companion` in the **main repo checkout**
+(`/Users/rainer/Git/xteink-companion-ble`, not the worktree path) — commit in the worktree, then
+merge or cherry-pick onto `companion` there. Don't leave finished work stranded on a worktree
+branch; don't push a `worktree-*` branch as the deliverable.
+
 ## Docs that are upstream's, not ours
 
 `GOVERNANCE.md`, `docs/contributing/`, and `docs/translators.md` describe upstream's community
