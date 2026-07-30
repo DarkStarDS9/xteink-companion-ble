@@ -715,20 +715,38 @@ void CompanionModeActivity::showGalleryImage(size_t index) {
 }
 
 // Button::Left/Right gallery prev/next, active only in Screen::Image and only
-// for a button the foreground peer's own map has left unclaimed (routing
-// None) — an app that declared Left/Right for its own use (e.g. Remote) is
-// never overridden. See MappedInputManager.h: Left/Right are front buttons,
+// for a button the foreground peer's own map hasn't claimed for something
+// that actually applies on this screen. Remote and LocalSleep always defer to
+// the app — those are meaningful regardless of what's on screen. LocalPagePrev/
+// LocalPageNext are different: handleMappedButton() already scopes them to
+// Screen::Text only and no-ops (while still consuming the press) anywhere
+// else, including Image — most apps declare one button map covering both text
+// and image content, so on-screen paging routing is exactly the common case
+// here, not an edge case. Treating that as "claimed" left gallery nav dead on
+// every app that pages text with Left/Right (confirmed on hardware: the
+// original None-only guard never engaged with docs/../scripts/
+// push_companion_content.py's default map). Since those routings are already
+// no-ops outside Text, it's safe for gallery nav to claim them while an image
+// is on screen. See MappedInputManager.h: Left/Right are front buttons,
 // physically distinct from the PageBack/PageForward side buttons the reader
 // uses, so this cannot collide with page-turn handling anywhere else.
+namespace {
+bool isGalleryClaimable(companionble::ButtonRouting routing) {
+  return routing == companionble::ButtonRouting::None ||
+         routing == companionble::ButtonRouting::LocalPagePrev ||
+         routing == companionble::ButtonRouting::LocalPageNext;
+}
+}  // namespace
+
 bool CompanionModeActivity::handleGalleryNav() {
   if (screen != Screen::Image || galleryImages.size() < 2) return false;
 
-  if (routingFor(companionble::ButtonId::Left) == companionble::ButtonRouting::None &&
+  if (isGalleryClaimable(routingFor(companionble::ButtonId::Left)) &&
       buttonWasPressed(MappedInputManager::Button::Left, companionble::ButtonId::Left)) {
     showGalleryImage(galleryIndex == 0 ? galleryImages.size() - 1 : galleryIndex - 1);
     return true;
   }
-  if (routingFor(companionble::ButtonId::Right) == companionble::ButtonRouting::None &&
+  if (isGalleryClaimable(routingFor(companionble::ButtonId::Right)) &&
       buttonWasPressed(MappedInputManager::Button::Right, companionble::ButtonId::Right)) {
     showGalleryImage(galleryIndex + 1 >= galleryImages.size() ? 0 : galleryIndex + 1);
     return true;
