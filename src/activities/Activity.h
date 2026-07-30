@@ -43,6 +43,13 @@ class Activity {
 
   virtual bool skipLoopDelay() { return false; }
   virtual bool preventAutoSleep() { return false; }
+  // Called instead of ActivityManager::goToSleep()/SleepActivity when deep
+  // sleep is about to happen (idle timeout, timed-out screenshot combo, or a
+  // power-button long-press — see main.cpp's enterDeepSleep()). Returning
+  // true means this activity already painted whatever should be on screen
+  // through deep sleep and the generic sleep screen must be skipped; false
+  // falls back to the normal SleepActivity render.
+  virtual bool customDeepSleep() { return false; }
   virtual bool isReaderActivity() const { return false; }
   // Returns true when the activity schedules its own forced refresh.
   virtual bool handleForcedRefresh() { return false; }

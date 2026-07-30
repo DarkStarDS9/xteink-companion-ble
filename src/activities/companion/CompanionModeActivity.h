@@ -178,13 +178,31 @@ class CompanionModeActivity final : public Activity {
   std::vector<std::string> wrapTitleToLines(const std::string& text) const;
   void paginate();
   void chooseIdleScreen();
-  void renderWaiting();
-  void renderIconGrid();
+  // inverted flips the whole frame (renderer.invertScreen()) before flipping
+  // the panel; label, if non-null/non-empty, is drawn as a status word below
+  // the grid (or below the waiting text, for renderWaiting()). Used both for
+  // the plain idle screen (inverted=false, label=nullptr) and for the
+  // sleep/boot variants — see renderPreSleepScreen() and onEnter().
+  void renderWaiting(bool inverted = false, const char* label = nullptr);
+  void renderIconGrid(bool inverted = false, const char* label = nullptr);
   void renderPairingPrompt();
   void renderStartFailed();
   void renderPage();
   void renderImage();
   void renderTags(int rightEdgeX, int centerY) const;
+  // Draws a small sleeping indicator (bottom-left, same corner text mode's
+  // battery percentage occupies) over the currently-displayed image, without
+  // touching the rest of the framebuffer.
+  void drawSleepIndicator();
+  // Paints whatever should be on screen the instant before deep sleep, for
+  // every trigger that reaches this activity (idle timeout, app-mapped sleep
+  // button, and the physical power button via customDeepSleep()) — so all
+  // three agree. Screen::Image keeps the photo and adds drawSleepIndicator();
+  // every other screen (including Text — see the protocol doc) falls back to
+  // the inverted grid. Does not itself sleep: callers decide how (direct
+  // powerManager.startDeepSleep(), or main.cpp's enterDeepSleep() finishing
+  // its teardown sequence after customDeepSleep() returns true).
+  void renderPreSleepScreen();
   void checkIdleTimers();
 
  public:
@@ -201,7 +219,17 @@ class CompanionModeActivity final : public Activity {
   // point of companion mode is phone-driven, button-free operation) — without
   // this, a battery-powered device with an app connected but no button presses
   // hits the inactivity timeout and deep-sleeps mid-session, dropping the BLE
-  // link. `connected` mirrors companionble::isConnected() once per loop() (see
-  // above), so this stays cheap to call every main-loop iteration.
-  bool preventAutoSleep() override { return connected; }
+  // link. Beyond that, this activity fully owns its own idle-to-sleep timing
+  // (checkIdleTimers()'s 5-minute countdown) regardless of connection state,
+  // so it always returns true — letting main.cpp's generic timer run here too
+  // would race checkIdleTimers() and could sleep mid-countdown with the wrong
+  // (generic) sleep screen.
+  bool preventAutoSleep() override { return true; }
+
+  // See Activity::customDeepSleep()'s doc comment. Renders the appropriate
+  // pre-sleep screen for whatever's currently up (renderPreSleepScreen()) and
+  // returns true, unless nothing sensible can be drawn (StartFailed), in
+  // which case the generic SleepActivity is a better fallback than a blank
+  // panel.
+  bool customDeepSleep() override;
 };

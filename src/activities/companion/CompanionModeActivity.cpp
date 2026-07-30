@@ -49,6 +49,31 @@ constexpr int kMaxTitleLines = 2;
 constexpr int kIconGridColumns = 6;
 constexpr int kIconGridGap = 24;
 
+// Sleeping-indicator geometry: bottom-left corner, same footprint text mode's
+// battery percentage occupies, sized as a small square rather than a bitmap
+// (no ready-made small "sleeping" glyph exists in the icon set — see the
+// design discussion this came out of).
+constexpr int kSleepIndicatorRadius = 16;
+constexpr int kSleepIndicatorMargin = 16;
+
+// Solid filled disc, built the same way GfxRenderer's private fillArc<> scans
+// (no sqrt: shrink x while it overshoots the radius as dy grows), just
+// exposed here as a two-circle primitive for the crescent below rather than
+// GfxRenderer's public API, since nothing else in the codebase needs a full
+// filled circle.
+void fillCircle(GfxRenderer& renderer, int cx, int cy, int radius, bool state) {
+  if (radius <= 0) return;
+  const int radiusSq = radius * radius;
+  int x = radius;
+  for (int dy = 0; dy <= radius; ++dy) {
+    while (x > 0 && (x * x + dy * dy) > radiusSq) --x;
+    if (x < 0) break;
+    const int width = 2 * x + 1;
+    renderer.fillRect(cx - x, cy + dy, width, 1, state);
+    if (dy != 0) renderer.fillRect(cx - x, cy - dy, width, 1, state);
+  }
+}
+
 // UTF-8-safe: drop one full codepoint (a lead byte plus any continuation
 // bytes), matching the boundary-walk CompanionModeActivity::paginate() uses.
 void popUtf8Char(std::string& s) {
@@ -210,12 +235,27 @@ void CompanionModeActivity::onEnter() {
     LOG_ERR("CMA", "ensureStarted() failed (heap floor or NimBLE init)");
     screen = Screen::StartFailed;
     idleSinceMs = 0;
+    requestUpdate();
   } else {
     chooseIdleScreen();
     idleSinceMs = millis();  // start the "nobody is driving the screen" idle timer
-  }
 
-  requestUpdate();
+    // Paint the idle frame directly instead of requestUpdate()-ing: this is
+    // the device's first paint every boot (a deep-sleep wake is a full chip
+    // reset, so onEnter() runs fresh every time, cold boot or wake alike),
+    // and main.cpp no longer calls goToBoot() for the companion path. By the
+    // time this runs, ensureStarted() above has already finished (BLE is
+    // live and advertising), so there is no actual "booting" state left to
+    // report — this is just the plain idle screen, painted here instead of
+    // through goToBoot()'s now-removed upstream splash to avoid flashing
+    // that splash for one full refresh only to immediately overwrite it.
+    renderer.clearScreen();
+    if (screen == Screen::IconGrid) {
+      renderIconGrid();
+    } else {
+      renderWaiting();
+    }
+  }
 }
 
 void CompanionModeActivity::onExit() {
@@ -606,7 +646,26 @@ void CompanionModeActivity::checkIdleTimers() {
   if (gpio.isUsbConnected() || usb_serial_jtag_is_connected()) return;
 
   LOG_INF("CMA", "No app driving the screen for %lu ms, deep-sleeping", kWaitingIdleSleepMs);
+  {
+    RenderLock lock;
+    renderPreSleepScreen();
+  }
   powerManager.startDeepSleep(gpio);  // [[noreturn]] — wakes on power button, panel keeps its last image
+}
+
+// See Activity::customDeepSleep()'s doc comment. Reached only from main.cpp's
+// enterDeepSleep() — i.e. the physical power-button long-press, or the
+// general idle-timeout path if it were ever reached here (preventAutoSleep()
+// always returns true while this activity is active, so in practice it is
+// not). checkIdleTimers() and the app-mapped LocalSleep button already paint
+// their own pre-sleep screen and call powerManager.startDeepSleep() directly
+// (see above and handleMappedButton()) without going through
+// enterDeepSleep()/customDeepSleep() at all.
+bool CompanionModeActivity::customDeepSleep() {
+  if (screen == Screen::StartFailed) return false;  // nothing sensible to draw; SleepActivity is the better fallback
+  RenderLock lock;
+  renderPreSleepScreen();
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1143,6 +1202,10 @@ bool CompanionModeActivity::handleMappedButton(MappedInputManager::Button role, 
 
     case companionble::ButtonRouting::LocalSleep:
       LOG_INF("CMA", "app-mapped sleep button");
+      {
+        RenderLock lock;
+        renderPreSleepScreen();
+      }
       powerManager.startDeepSleep(gpio);  // [[noreturn]]
       return true;
   }
@@ -1203,7 +1266,7 @@ void CompanionModeActivity::render(RenderLock&&) {
   }
 }
 
-void CompanionModeActivity::renderWaiting() {
+void CompanionModeActivity::renderWaiting(bool inverted, const char* label) {
   // "Waiting for <app>" once an app holds the screen but has pushed nothing;
   // the generic "Waiting for phone..." before that.
   const int centerY = renderer.getScreenHeight() / 2;
@@ -1214,6 +1277,10 @@ void CompanionModeActivity::renderWaiting() {
   } else {
     renderer.drawCenteredText(kCompanionFontId, centerY, tr(STR_COMPANION_WAITING), true, EpdFontFamily::BOLD);
   }
+  if (label && *label) {
+    renderer.drawCenteredText(SMALL_FONT_ID, centerY + renderer.getLineHeight(kCompanionFontId) * 2, label, true);
+  }
+  if (inverted) renderer.invertScreen();
   renderer.displayBuffer();
 }
 
@@ -1240,11 +1307,11 @@ void CompanionModeActivity::renderPairingPrompt() {
 // the connected app's tile marked. Not a launcher — the device cannot start an
 // app on the phone, so a selectable grid would promise something it cannot
 // deliver.
-void CompanionModeActivity::renderIconGrid() {
+void CompanionModeActivity::renderIconGrid(bool inverted, const char* label) {
   char keys[companionpeer::kMaxIconTiles][companionpeer::kPeerKeyLen];
   const size_t count = companionpeer::listIconTiles(keys, companionpeer::kMaxIconTiles);
   if (count == 0) {
-    renderWaiting();
+    renderWaiting(inverted, label);
     return;
   }
 
@@ -1281,7 +1348,77 @@ void CompanionModeActivity::renderIconGrid() {
       renderer.drawRect(x0 - 4, y0 - 4, tile + 8, tile + 8, true);
     }
   }
+
+  if (label && *label) {
+    renderer.drawCenteredText(SMALL_FONT_ID, originY + gridHeight + kIconGridGap, label, true);
+  }
+
+  if (inverted) renderer.invertScreen();
   renderer.displayBuffer();
+}
+
+void CompanionModeActivity::drawSleepIndicator() {
+  const int cx = kSleepIndicatorMargin + kSleepIndicatorRadius;
+  const int cy = renderer.getScreenHeight() - kSleepIndicatorMargin - kSleepIndicatorRadius;
+  fillCircle(renderer, cx, cy, kSleepIndicatorRadius, /*state=*/true);
+  // Carve a waxing crescent out of the disc above: an offset same-size disc,
+  // erased, biased up-and-right. Same hand-drawn-primitive approach as the
+  // battery gauge (BaseTheme::drawBatteryOutline) rather than a bitmap — no
+  // small "sleeping" glyph exists in the icon set at this footprint.
+  fillCircle(renderer, cx + kSleepIndicatorRadius / 2, cy - kSleepIndicatorRadius / 3, kSleepIndicatorRadius,
+             /*state=*/false);
+}
+
+// See the doc comment on the declaration (CompanionModeActivity.h).
+//
+// The image branch mirrors renderImage()'s own sequence exactly (BW base
+// push, then the two grayscale planes, then the composite push) rather than
+// just drawing the indicator into whatever's currently in the framebuffer:
+// displayGrayBuffer() composites against the BW plane's *current* contents,
+// and skipping a fresh base push here (an earlier version of this code did)
+// left it compositing against a stale/wrong base — the photo came back
+// visibly lighter and the indicator never showed at all (found via real-
+// hardware testing, 2026-07-31). renderImage() also only ever bakes overlays
+// (tags) into the BW base pass, never into the LSB/MSB decodes — those carry
+// only the photo's tone data — so the indicator is drawn once, there, too.
+void CompanionModeActivity::renderPreSleepScreen() {
+  if (screen == Screen::Image && !displayedImagePath.empty()) {
+    ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(displayedImagePath);
+    if (decoder) {
+      RenderConfig config;
+      config.x = 0;
+      config.y = 0;
+      config.maxWidth = renderer.getScreenWidth();
+      config.maxHeight = renderer.getScreenHeight();
+      config.useGrayscale = true;
+      config.useDithering = false;
+      config.performanceMode = false;
+      const std::string path = displayedImagePath;
+
+      renderer.clearScreen();
+      decoder->decodeToFramebuffer(path, renderer, config);
+      drawSleepIndicator();
+      renderer.displayBuffer();
+
+      renderer.clearScreen(0x00);
+      renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
+      decoder->decodeToFramebuffer(path, renderer, config);
+      renderer.copyGrayscaleLsbBuffers();
+
+      renderer.clearScreen(0x00);
+      renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
+      decoder->decodeToFramebuffer(path, renderer, config);
+      renderer.copyGrayscaleMsbBuffers();
+
+      renderer.displayGrayBuffer();
+      renderer.setRenderMode(GfxRenderer::BW);
+      return;
+    }
+    // Decoder vanished since the image was displayed (shouldn't happen —
+    // fall through to the grid rather than sleep on a stale/blank panel).
+  }
+  renderer.clearScreen();
+  renderIconGrid(/*inverted=*/true, tr(STR_COMPANION_SLEEPING));
 }
 
 void CompanionModeActivity::renderImage() {

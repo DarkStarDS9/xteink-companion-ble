@@ -210,7 +210,14 @@ void enterDeepSleep(bool fromTimeout = false) {
   // Commit to sleeping before goToSleep() runs the outgoing activity's onExit():
   // a WiFi activity would otherwise silentRestart() here and reboot instead.
   deepSleepInProgress = true;
-  activityManager.goToSleep(fromTimeout);
+  // Give the current activity first refusal on what the panel shows through
+  // sleep (CompanionModeActivity uses this to keep an on-screen image visible
+  // with a small indicator instead of being replaced by the generic sleep
+  // screen — see Activity::customDeepSleep()'s doc comment). Only activities
+  // that opt in skip goToSleep()/SleepActivity; everything else is unchanged.
+  if (!activityManager.customDeepSleep()) {
+    activityManager.goToSleep(fromTimeout);
+  }
 
   if (isQuickResumeSleep) {
     saveSleepFrameBuffer();
@@ -426,7 +433,11 @@ void setup() {
       }
       break;
     case BootResume::Splash:
-      activityManager.goToBoot();
+      // No activityManager.goToBoot() here: companion-only firmware always
+      // replaces the current activity with CompanionModeActivity below, whose
+      // own onEnter() paints the idle grid/waiting screen directly. Calling
+      // goToBoot() first would flash the generic upstream splash for one full
+      // refresh only to have it immediately overwritten.
       break;
   }
 

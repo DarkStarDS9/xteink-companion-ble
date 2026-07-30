@@ -1016,6 +1016,26 @@ Not wire format, but client-visible, and decided here so apps can rely on it:
 - **A session holds the foreground but has pushed nothing** — "Waiting for
   `<name>`", using that peer's display name.
 
+### Deep sleep and boot
+
+Deep sleep can be reached three ways: the idle timeout above, an app-mapped
+button routed `LOCAL_SLEEP`, or the device's own power button. All three
+agree on what the panel shows going into sleep:
+
+- **An image is on screen** — the photo is left untouched; the device adds a
+  small crescent indicator in the bottom-left corner (the same corner text
+  mode's battery percentage occupies) and sleeps. Nothing else changes, so a
+  photo stays recognisable through sleep, not replaced by a generic screen.
+- **Anything else on screen** (icon grid, waiting text, an open text
+  print) — the icon grid (or waiting text, if no peer has an icon yet) is
+  drawn **inverted**, with "Sleeping" underneath, and the device sleeps on
+  that frame.
+- **Waking** always repaints once, immediately, straight to the plain idle
+  screen (the icon grid, or waiting text) — not upstream CrossPoint's
+  splash/logo, and with no "booting" label either: BLE is already up and
+  advertising by the time this first paint happens, so there is nothing left
+  to report as still in progress.
+
 ---
 
 ## Storage layout (device side)

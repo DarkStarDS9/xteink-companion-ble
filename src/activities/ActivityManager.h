@@ -101,6 +101,7 @@ class ActivityManager {
   void popActivity();
 
   bool preventAutoSleep() const;
+  bool customDeepSleep();
   bool isReaderActivity() const;
   bool handleForcedRefresh();
   bool skipLoopDelay() const;
