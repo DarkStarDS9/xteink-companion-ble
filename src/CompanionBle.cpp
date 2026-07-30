@@ -739,7 +739,10 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
               g_activeImageFile.close();
               // Decoding touches the framebuffer, so it happens on the main loop
               // task, not here. The activity answers with notifyImageStatus().
-              if (g_imageStagedCb) g_imageStagedCb(g_activeImagePath.c_str());
+              if (g_imageStagedCb) {
+                g_imageStagedCb(session->peerKey, g_activeImagePath.c_str(), session->contentId,
+                                session->contentIdLen);
+              }
               g_activeImagePath.clear();  // ownership passes to the activity
             }
             break;

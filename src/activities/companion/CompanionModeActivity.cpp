@@ -87,6 +87,9 @@ volatile bool g_pendingForegroundReady = false;
 char g_pendingPairingName[companionpeer::kMaxNameLen + 1] = {0};
 volatile bool g_pendingPairingReady = false;
 char g_pendingImagePath[96] = {0};
+char g_pendingImagePeerKey[companionpeer::kPeerKeyLen] = {0};
+uint8_t g_pendingImageContentId[companionble::kMaxContentIdLen] = {0};
+uint8_t g_pendingImageContentIdLen = 0;
 volatile bool g_pendingImageReady = false;
 
 // Set once a field's END arrives with kFinalFieldFlag set. loop() only applies
@@ -153,9 +156,13 @@ void onForegroundChange(const char* peerKey, const char* displayName) {
   portEXIT_CRITICAL(&g_mux);
 }
 
-void onImageStaged(const char* path) {
+void onImageStaged(const char* peerKey, const char* path, const uint8_t* contentId, size_t contentIdLen) {
   portENTER_CRITICAL(&g_mux);
   snprintf(g_pendingImagePath, sizeof(g_pendingImagePath), "%s", path ? path : "");
+  snprintf(g_pendingImagePeerKey, sizeof(g_pendingImagePeerKey), "%s", peerKey ? peerKey : "");
+  const size_t n = contentIdLen > sizeof(g_pendingImageContentId) ? sizeof(g_pendingImageContentId) : contentIdLen;
+  if (n > 0) memcpy(g_pendingImageContentId, contentId, n);
+  g_pendingImageContentIdLen = static_cast<uint8_t>(n);
   g_pendingImageReady = true;
   portEXIT_CRITICAL(&g_mux);
 }
@@ -177,6 +184,8 @@ void CompanionModeActivity::onEnter() {
   currentPage = 0;
   totalPages = 0;
   pages.clear();
+  galleryImages.clear();
+  galleryIndex = 0;
   clearUiDeclaration();
   cachedFontId = kCompanionFontId;
   computeViewport();
@@ -624,6 +633,8 @@ void CompanionModeActivity::applyForegroundChange() {
     currentPage = 0;
     haveContent = false;
     displayedImagePath.clear();
+    galleryImages.clear();
+    galleryIndex = 0;
     updateTitleLayout();
     screen = Screen::Text;
   }
@@ -633,9 +644,21 @@ void CompanionModeActivity::applyForegroundChange() {
 // Decodes a staged raw packed 2bpp image (field 0x04) on the main loop task
 // and reports the outcome back to the app. Never runs on the NimBLE host
 // task: decoding writes the framebuffer.
-void CompanionModeActivity::handlePendingImage() {
-  const std::string path = pendingImagePath;
-  pendingImagePath.clear();
+//
+// Before decoding, the staged file is moved into the pushing peer's bounded
+// image gallery (CompanionPeerStore::commitImage) so it survives the next
+// push instead of being overwritten by it — see this feature's commit message
+// for why that lives in firmware rather than the phone.
+void CompanionModeActivity::handlePendingImage(const std::string& stagedPath, const std::string& peerKey,
+                                               const uint8_t* contentId, size_t contentIdLen) {
+  std::string path = companionpeer::commitImage(peerKey.c_str(), stagedPath, contentId, contentIdLen);
+  if (path.empty()) {
+    // The gallery move failed (e.g. SD write error); fall back to displaying
+    // straight from the scratch file so a storage hiccup doesn't also cost the
+    // app the push it just made. It just won't be in the gallery afterward.
+    LOG_ERR("CMA", "could not commit staged image for peer %s; displaying from scratch path", peerKey.c_str());
+    path = stagedPath;
+  }
 
   ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(path);
   if (!decoder) {
@@ -652,8 +675,84 @@ void CompanionModeActivity::handlePendingImage() {
 
   RenderLock lock;
   displayedImagePath = path;
+  refreshGalleryForForeground();
   screen = Screen::Image;
   requestUpdate();
+}
+
+// Rebuilds the in-memory gallery list from the foreground peer's stored
+// images and points galleryIndex at whichever one is currently displayed.
+// Called whenever a new image is committed; the list itself lives on SD
+// (CompanionPeerStore), so this is just re-reading a few dozen bytes of JSON,
+// not holding a second copy of anything image-sized.
+void CompanionModeActivity::refreshGalleryForForeground() {
+  galleryImages.clear();
+  galleryIndex = 0;
+  if (foregroundPeerKey.empty()) return;
+
+  companionpeer::ImageEntry entries[companionpeer::kMaxImagesPerPeer];
+  const size_t count =
+      companionpeer::listImages(foregroundPeerKey.c_str(), entries, companionpeer::kMaxImagesPerPeer);
+  galleryImages.reserve(count);
+  for (size_t i = 0; i < count; ++i) galleryImages.push_back(entries[i].path);
+
+  for (size_t i = 0; i < galleryImages.size(); ++i) {
+    if (galleryImages[i] == displayedImagePath) {
+      galleryIndex = i;
+      break;
+    }
+  }
+}
+
+// Redraws the image at `index` in the current gallery without touching BLE:
+// this is firmware-local browsing of already-pushed images, not new content.
+void CompanionModeActivity::showGalleryImage(size_t index) {
+  if (index >= galleryImages.size()) return;
+  RenderLock lock;
+  galleryIndex = index;
+  displayedImagePath = galleryImages[index];
+  requestUpdate();
+}
+
+// Button::Up/Down gallery prev/next, active only in Screen::Image and only
+// for a button the foreground peer's own map hasn't claimed for something
+// that actually applies on this screen. Remote and LocalSleep always defer to
+// the app — those are meaningful regardless of what's on screen.
+//
+// This deliberately does NOT use Left/Right: on real hardware those are the
+// bottom front buttons, and every app map seen so far (including scripts/
+// push_companion_content.py's default) routes them to LOCAL_PAGE_PREV/NEXT for
+// paging buffered text — i.e. what users call "the page-turn buttons".
+// Up/Down are the side buttons, physically the pair toward the top of the
+// device, and are otherwise unclaimed by a typical text/image app's button
+// map, which is exactly why they're free for this. (An app that legitimately
+// wants Up/Down for its own purpose, e.g. a camera-control app, still keeps
+// them — the None-only guard below never overrides a declared routing.)
+// LocalPagePrev/LocalPageNext are still accepted here too: handleMappedButton()
+// already scopes them to Screen::Text and no-ops elsewhere, so claiming them
+// on Image costs nothing if some future app reuses those routings on Up/Down.
+namespace {
+bool isGalleryClaimable(companionble::ButtonRouting routing) {
+  return routing == companionble::ButtonRouting::None ||
+         routing == companionble::ButtonRouting::LocalPagePrev ||
+         routing == companionble::ButtonRouting::LocalPageNext;
+}
+}  // namespace
+
+bool CompanionModeActivity::handleGalleryNav() {
+  if (screen != Screen::Image || galleryImages.size() < 2) return false;
+
+  if (isGalleryClaimable(routingFor(companionble::ButtonId::Up)) &&
+      buttonWasPressed(MappedInputManager::Button::Up, companionble::ButtonId::Up)) {
+    showGalleryImage(galleryIndex == 0 ? galleryImages.size() - 1 : galleryIndex - 1);
+    return true;
+  }
+  if (isGalleryClaimable(routingFor(companionble::ButtonId::Down)) &&
+      buttonWasPressed(MappedInputManager::Button::Down, companionble::ButtonId::Down)) {
+    showGalleryImage(galleryIndex + 1 >= galleryImages.size() ? 0 : galleryIndex + 1);
+    return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -722,6 +821,9 @@ void CompanionModeActivity::loop() {
   char newForegroundName[companionpeer::kMaxNameLen + 1] = {0};
   char newPairingName[companionpeer::kMaxNameLen + 1] = {0};
   char newImagePath[sizeof(g_pendingImagePath)] = {0};
+  char newImagePeerKey[sizeof(g_pendingImagePeerKey)] = {0};
+  uint8_t newImageContentId[sizeof(g_pendingImageContentId)] = {0};
+  uint8_t newImageContentIdLen = 0;
 
   portENTER_CRITICAL(&g_mux);
   if (g_pendingTitleReady) {
@@ -774,6 +876,9 @@ void CompanionModeActivity::loop() {
   }
   if (g_pendingImageReady) {
     memcpy(newImagePath, g_pendingImagePath, sizeof(newImagePath));
+    memcpy(newImagePeerKey, g_pendingImagePeerKey, sizeof(newImagePeerKey));
+    memcpy(newImageContentId, g_pendingImageContentId, sizeof(newImageContentId));
+    newImageContentIdLen = g_pendingImageContentIdLen;
     g_pendingImageReady = false;
     gotImage = true;
   }
@@ -795,8 +900,7 @@ void CompanionModeActivity::loop() {
   }
 
   if (gotImage) {
-    pendingImagePath = newImagePath;
-    handlePendingImage();
+    handlePendingImage(newImagePath, newImagePeerKey, newImageContentId, newImageContentIdLen);
   }
 
   if (commit && (gotTitle || gotBody)) {
@@ -868,6 +972,18 @@ void CompanionModeActivity::loop() {
     }
     return;
   }
+
+  // Gallery browsing is tried before the foreground check and works even with
+  // nobody connected: pushed images already survive disconnect (see the
+  // "nobody holds the screen" branch of applyForegroundChange(), which leaves
+  // Screen::Image and galleryImages alone) — requiring a live peer here would
+  // make a persisted gallery unbrowsable exactly when there's no app around to
+  // re-push anything, which defeats the point of persisting more than one
+  // image. routingFor() still reflects the last foreground peer's declared
+  // map after it disconnects (buttons[] is only reset by the *next* peer's
+  // loadUiDeclaration()), so the "don't steal a claimed button" gate keeps
+  // working the same whether or not that peer is still connected.
+  handleGalleryNav();
 
   if (foregroundPeerKey.empty()) return;  // no app owns the buttons
 

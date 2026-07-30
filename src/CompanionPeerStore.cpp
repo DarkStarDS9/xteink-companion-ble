@@ -27,6 +27,34 @@ std::string assetPath(const char* peerKey, uint8_t assetId) {
 
 std::string tokenPath(const char* peerKey) { return peerDir(peerKey) + "/token.bin"; }
 
+constexpr const char* kImagesIndexName = "images.json";
+
+std::string imagesDir(const char* peerKey) { return peerDir(peerKey) + "/images"; }
+std::string imagesIndexPath(const char* peerKey) { return peerDir(peerKey) + "/" + kImagesIndexName; }
+
+std::string imageSlotPath(const char* peerKey, uint32_t slot) {
+  char name[24];
+  snprintf(name, sizeof(name), "img_%u.raw", static_cast<unsigned>(slot));
+  return imagesDir(peerKey) + "/" + name;
+}
+
+// The images index is read/mutated/written on demand, same discipline as
+// peers.json — see the header's "NOTHING HERE IS RESIDENT" note.
+bool loadImagesIndex(const char* peerKey, JsonDocument& doc) {
+  if (!PersistableStoreBase::readDocFromFile(imagesIndexPath(peerKey).c_str(), doc)) {
+    doc.to<JsonObject>();
+    doc["nextSeq"] = 0;
+    doc["images"].to<JsonArray>();
+    return false;
+  }
+  if (!doc["images"].is<JsonArray>()) doc["images"].to<JsonArray>();
+  return true;
+}
+
+bool saveImagesIndex(const char* peerKey, const JsonDocument& doc) {
+  return PersistableStoreBase::writeDocToFile(imagesIndexPath(peerKey).c_str(), doc);
+}
+
 bool ensureRootDirs() {
   if (!Storage.ready()) {
     LOG_ERR("CPEER", "SD not ready");
@@ -130,6 +158,9 @@ void removePeerDir(const char* peerKey) {
   Storage.remove((dir + "/token.bin").c_str());
   Storage.remove((dir + "/ui.bin").c_str());
   Storage.remove((dir + "/icon.bin").c_str());
+  Storage.remove((dir + "/" + kImagesIndexName).c_str());
+  for (uint32_t slot = 0; slot < kMaxImagesPerPeer; ++slot) Storage.remove(imageSlotPath(peerKey, slot).c_str());
+  Storage.removeDir((dir + "/images").c_str());
   Storage.removeDir((dir + "/data").c_str());
   Storage.rmdir(dir.c_str());
 }
@@ -273,6 +304,95 @@ std::string dataFilePath(const char* peerKey, const char* fileName) {
   const std::string dir = peerDir(peerKey) + "/data";
   Storage.ensureDirectoryExists(dir.c_str());
   return dir + "/" + fileName;
+}
+
+std::string commitImage(const char* peerKey, const std::string& stagedPath, const uint8_t* contentId,
+                        size_t contentIdLen) {
+  if (!Storage.ensureDirectoryExists(imagesDir(peerKey).c_str())) {
+    LOG_ERR("CPEER", "could not create images dir for %s", peerKey);
+    return std::string();
+  }
+
+  JsonDocument doc;
+  loadImagesIndex(peerKey, doc);
+  const uint32_t seq = doc["nextSeq"] | 0u;
+  doc["nextSeq"] = seq + 1;
+  const uint32_t slot = seq % kMaxImagesPerPeer;
+  const std::string destPath = imageSlotPath(peerKey, slot);
+
+  // Every slot is reused every kMaxImagesPerPeer pushes, so the index is keyed
+  // on slot, not append-only — the stale entry for this slot (if any) must be
+  // dropped before adding the new one, or the array would grow without bound.
+  JsonArray images = doc["images"].as<JsonArray>();
+  for (size_t i = 0; i < images.size(); ++i) {
+    if ((images[i]["slot"] | 0xFFFFFFFFu) == slot) {
+      images.remove(i);
+      break;
+    }
+  }
+
+  // Renaming over an existing path is not guaranteed on every filesystem;
+  // clear the slot first so this behaves the same whether or not it's reused.
+  Storage.remove(destPath.c_str());
+  if (!Storage.rename(stagedPath.c_str(), destPath.c_str())) {
+    LOG_ERR("CPEER", "could not move staged image %s to %s", stagedPath.c_str(), destPath.c_str());
+    return std::string();
+  }
+
+  JsonObject entry = images.add<JsonObject>();
+  entry["slot"] = slot;
+  entry["seq"] = seq;
+  if (contentIdLen > 0) {
+    const size_t n = contentIdLen > kMaxImageContentIdLen ? kMaxImageContentIdLen : contentIdLen;
+    char hex[kMaxImageContentIdLen * 2 + 1];
+    hexEncode(contentId, n, hex);
+    entry["cid"] = hex;
+  }
+
+  if (!saveImagesIndex(peerKey, doc)) {
+    LOG_ERR("CPEER", "could not save images index for %s", peerKey);
+    // The image itself is safely on disk at destPath even if the index write
+    // failed; worst case is a gallery that briefly forgets this one entry
+    // (it will be overwritten in kMaxImagesPerPeer more pushes regardless),
+    // not a lost or corrupt image.
+  }
+  return destPath;
+}
+
+size_t listImages(const char* peerKey, ImageEntry* out, size_t maxImages) {
+  JsonDocument doc;
+  if (!loadImagesIndex(peerKey, doc) || maxImages == 0) return 0;
+  if (maxImages > kMaxImagesPerPeer) maxImages = kMaxImagesPerPeer;
+  JsonArray images = doc["images"].as<JsonArray>();
+
+  // Selection sort by seq ascending (oldest first) over at most
+  // kMaxImagesPerPeer entries — trivially cheap, and avoids allocating a
+  // sorted copy of the index. `used` is sized to the same cap because
+  // commitImage() guarantees at most one entry per slot value.
+  bool used[kMaxImagesPerPeer] = {false};
+  size_t written = 0;
+  while (written < maxImages) {
+    int bestIndex = -1;
+    uint32_t bestSeq = 0;
+    for (size_t i = 0; i < images.size() && i < kMaxImagesPerPeer; ++i) {
+      if (used[i]) continue;
+      const uint32_t seq = images[i]["seq"] | 0u;
+      if (bestIndex < 0 || seq < bestSeq) {
+        bestIndex = static_cast<int>(i);
+        bestSeq = seq;
+      }
+    }
+    if (bestIndex < 0) break;
+    used[bestIndex] = true;
+
+    const uint32_t slot = images[bestIndex]["slot"] | 0u;
+    out[written].path = imageSlotPath(peerKey, slot);
+    out[written].seq = bestSeq;
+    const char* cid = images[bestIndex]["cid"] | "";
+    snprintf(out[written].contentIdHex, sizeof(out[written].contentIdHex), "%s", cid);
+    ++written;
+  }
+  return written;
 }
 
 std::string displayName(const char* peerKey) {

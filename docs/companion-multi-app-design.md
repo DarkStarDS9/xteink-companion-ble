@@ -68,15 +68,34 @@ The firmware never parses or validates these beyond byte equality. An app that r
     peer.json                    display name, auth token, protocol prefs
     icon.bin                     1-bpp sleep-screen icon
     buttons.json                 button map (labels + routing) — see §7
-    data/                        app-owned scratch: staged images, event logs
+    data/                        scratch: the in-flight image transfer only
+    images.json                  gallery index: slot -> seq, content-id
+    images/                      up to kMaxImagesPerPeer (6) stored pushes, img_<slot>.raw
 ```
 
 Consistent with the existing `/.crosspoint/` convention (`settings.json`, `state.json`,
-`bookmarks/`, `epub_<hash>/`). `peers.json`, `peer.json` and `buttons.json` go through the existing
-`PersistableStore`; `icon.bin` and `data/` are raw `HalStorage` files.
+`bookmarks/`, `epub_<hash>/`). `peers.json`, `peer.json`, `buttons.json` and `images.json` go
+through the existing `PersistableStore`; `icon.bin`, `data/` and `images/` are raw `HalStorage`
+files.
 
 `data/` is the answer to "where does the Polaroid staging file go" — per-peer rather than a single
 global `incoming_image.png`, so two apps staging at once cannot collide.
+
+**Images are not single-shot anymore.** A push completes into `data/incoming.raw` as before, but
+once whole, `CompanionPeerStore::commitImage()` renames it into a bounded per-peer gallery
+(`images/`, `kMaxImagesPerPeer` slots reused oldest-first, indexed by `images.json`) instead of
+leaving one scratch file that the next push would silently overwrite. `CompanionModeActivity` browses
+that gallery with `Button::Up`/`Down` — the side buttons, not `Left`/`Right`: on real hardware those
+are the bottom front buttons, and every button map seen so far routes them to local text paging, so
+`Up`/`Down` are the pair actually free for this (see `MappedInputManager.h`) — while `Screen::Image`
+is showing, and only on whichever of those two buttons the foreground peer's own button map has left unclaimed
+(routing `None` or `LocalPagePrev`/`LocalPageNext`, which is already a no-op outside `Screen::Text`);
+a peer that declared its own use for Up/Down (e.g. `Remote`, for something like camera control) is
+never overridden. This is deliberately **firmware-local**: no protocol opcode, no capability bit, nothing
+reported to the phone, exactly like the existing `currentPage`/`totalPages` text pagination that
+`LocalPagePrev`/`LocalPageNext` already drive with no BLE notification. Six images per peer costs
+~612 KB of SD space at the measured panel's ~102 KB/image (trivial against a multi-GB card) and no
+RAM: only one image is ever decoded into the framebuffer at a time, same as before this feature.
 
 ## 5. Pairing / enrollment
 
@@ -306,6 +325,8 @@ Called out explicitly so it does not get over-built. Nothing else here is for it
 | Icon render buffer | stack, transient | 512 B |
 | Content reassembly | unchanged — foreground only | no change |
 | Image staging | streamed to `peers/<peerKey>/data/`, per the image sketch | no change |
+| Image gallery (up to 6/peer) | SD (`peers/<peerKey>/images/` + `images.json`) | 0 RAM |
+| Gallery nav state (path list + index) | RAM, foreground peer only | ~200 B (6 × short path) |
 
 Net new steady-state RAM: **under 1 KB.** No new large allocation, which is what §3 actually asks.
 The design deliberately pushes every per-app structure to SD for this reason.

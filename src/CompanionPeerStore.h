@@ -21,7 +21,15 @@
 //   /.crosspoint/companion/peers/<key>/token.bin    16 raw bytes
 //   /.crosspoint/companion/peers/<key>/buttons.bin  the wire asset: 4-byte tag + body
 //   /.crosspoint/companion/peers/<key>/icon.bin     the wire asset: 4-byte tag + bitmap
-//   /.crosspoint/companion/peers/<key>/data/        scratch (staged image)
+//   /.crosspoint/companion/peers/<key>/data/        scratch (in-flight image staging only)
+//   /.crosspoint/companion/peers/<key>/images.json  gallery index: slot -> seq, content-id
+//   /.crosspoint/companion/peers/<key>/images/       up to kMaxImagesPerPeer stored pushes,
+//                                                    img_<slot>.raw, slot = seq % kMaxImagesPerPeer
+//
+// A pushed image is staged into data/incoming.raw as it streams in (see
+// CompanionBle.cpp), then, once complete, moved (renamed, not copied) into an
+// images/ slot by commitImage() below. data/ therefore never holds more than
+// one in-flight transfer; the gallery is what survives across pushes.
 //
 // Assets are stored as the exact bytes the phone pushed, tag included, rather
 // than re-encoded as JSON. The tag has to survive verbatim anyway (the device
@@ -57,6 +65,35 @@ inline constexpr size_t kMaxIconTiles = 18;
 
 // Longest display name stored, matching the protocol's own 24-byte cap.
 inline constexpr size_t kMaxNameLen = 24;
+
+// Bound on how many pushed images each peer's gallery keeps.
+//
+// SD cost: a full raw packed 2bpp push is ~102 KB on the measured 528x792
+// panel (132 bytes/row x 792 rows = 104544 bytes -- see kMaxImageFieldLen's
+// derivation in CompanionBle.h), so 6 images is ~612 KB per peer, and
+// ~19.6 MB in the pathological case of all kMaxPeers=32 peers fully
+// populated -- trivial against a multi-GB SD card, and nothing this firmware
+// needs to budget the way it budgets RAM.
+//
+// RAM cost: none. Unlike kMaxPeers/kMaxSessions, this cap does not multiply
+// any resident allocation -- CompanionModeActivity decodes and holds at most
+// one image in the framebuffer at a time (see showGalleryImage()), streaming
+// straight from whichever gallery slot is on screen, exactly as it already
+// does for the single `incoming.raw` file today.
+inline constexpr size_t kMaxImagesPerPeer = 6;
+
+// Longest content-id recorded per stored image, hex-encoded in images.json.
+// Matches companionble::kMaxContentIdLen (32) without including
+// CompanionBle.h here -- CompanionBle.cpp depends on this header, not the
+// other way around.
+inline constexpr size_t kMaxImageContentIdLen = 32;
+
+// One entry in a peer's image gallery, oldest first by `seq`.
+struct ImageEntry {
+  std::string path;                                        // full SD path to the stored image file
+  uint32_t seq = 0;                                        // monotonic per-peer push counter
+  char contentIdHex[kMaxImageContentIdLen * 2 + 1] = {0};  // opaque, hex-encoded; may be empty
+};
 
 // Asset ids, matching the content field ids they arrive as. The UI declaration
 // carries button labels/routing and tag labels together — see
@@ -121,6 +158,23 @@ size_t readAssetBody(const char* peerKey, uint8_t assetId, uint8_t* buf, size_t 
 // if needed. Used for the staged image — per-peer rather than one global
 // scratch file, so two apps staging at once cannot collide.
 std::string dataFilePath(const char* peerKey, const char* fileName);
+
+// Moves a just-staged image (already fully written at `stagedPath`, normally
+// the peer's data/incoming.raw scratch file) into that peer's bounded image
+// gallery (kMaxImagesPerPeer, oldest slot reused once full). Takes ownership
+// of the file at `stagedPath` via rename on success -- the caller must not
+// touch it afterward. `contentId`/`contentIdLen` are recorded hex-encoded
+// (may be zero-length) purely for diagnostics; navigation only needs `path`.
+//
+// Returns the path the image now lives at (for immediate display), or an
+// empty string if the move failed, in which case `stagedPath` is untouched
+// and still owned by the caller.
+std::string commitImage(const char* peerKey, const std::string& stagedPath, const uint8_t* contentId,
+                        size_t contentIdLen);
+
+// Fills `out` with this peer's stored images, oldest first. Returns how many
+// were written (<= kMaxImagesPerPeer, and <= maxImages).
+size_t listImages(const char* peerKey, ImageEntry* out, size_t maxImages);
 
 // Display name from the index, or an empty string.
 std::string displayName(const char* peerKey);
