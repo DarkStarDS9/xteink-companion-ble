@@ -2,6 +2,7 @@
 
 #ifdef COMPANION_TEST_CONSOLE
 
+#include <HalStorage.h>
 #include <Logging.h>
 
 #include <cstdio>
@@ -186,6 +187,20 @@ bool handleCommand(const String& command) {
     reply("reset ok");
     return true;
   }
+  if (command.startsWith("CLS")) {
+    // Ad hoc SD directory listing for debugging the image gallery on real
+    // hardware — not something a client needs, so it's not wired through the
+    // BLE protocol at all, just this serial console.
+    String path = command.substring(3);
+    path.trim();
+    if (path.isEmpty()) path = "/";
+    const std::vector<String> entries = Storage.listFiles(path.c_str(), 64);
+    reply("ls %s count=%u", path.c_str(), static_cast<unsigned>(entries.size()));
+    for (const auto& entry : entries) {
+      reply("  %s", entry.c_str());
+    }
+    return true;
+  }
   if (command.startsWith("CBTN")) {
     String args = command.substring(4);
     args.trim();
@@ -209,8 +224,10 @@ bool handleCommand(const String& command) {
     }
     return true;
   }
-  if (command == "CUI") {
-    const char* peerKey = companionble::foregroundPeerKey();
+  if (command == "CUI" || command.startsWith("CUI ")) {
+    String arg = command == "CUI" ? "" : command.substring(4);
+    arg.trim();
+    const char* peerKey = arg.length() ? arg.c_str() : companionble::foregroundPeerKey();
     if (peerKey[0] == '\0') {
       reply("ui none: no foreground peer");
       return true;
