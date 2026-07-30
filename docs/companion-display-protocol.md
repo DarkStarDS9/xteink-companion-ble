@@ -550,6 +550,17 @@ holds the image in RAM — and on `END` unpacks it directly to the framebuffer
 final display level 0–3), then runs the two-pass grayscale settle.
 `IMAGE_STATUS` reports the outcome.
 
+**The device keeps more than the last push.** Once a transfer completes,
+`incoming.raw` is moved into a bounded per-peer gallery (`images/`, up to
+`kMaxImagesPerPeer` = 6 entries, oldest overwritten once full — see
+`CompanionPeerStore.h`) instead of being left as a single scratch file the
+next push would silently clobber. The user can page back and forth through a
+peer's own gallery with `LEFT`/`RIGHT` while a photo is on screen — see the
+`LEFT`/`RIGHT` note under "UI declaration field" above. This is entirely
+device-local: there is no wire opcode for it, no capability bit, and the app
+is never told navigation happened, so this paragraph is the only thing an app
+author needs to read about it.
+
 This replaced an earlier PNG-based format (protocol v6 and before). PNG
 decoding needs PNGdec's ~44 KB working set (decoder object + inflate window)
 plus a 16 KB safety margin — but measured free heap with one BLE peer
@@ -704,6 +715,15 @@ Notes:
   disconnected.
 - Ship a new tag when an app update changes the scheme; the device picks it up
   on the next connect without re-pairing.
+- **`LEFT`/`RIGHT` left as `NONE` are used by the device for image gallery
+  navigation** while a pushed photo (field `0x04`) is on screen: the device
+  keeps the last several images an app has pushed (see "Image field" above)
+  and lets the user page back and forth through them locally. This is not a
+  wire behaviour — no notification is sent, no capability bit exists for it —
+  so it costs an app nothing to be unaware of it. An app that declares its own
+  routing for `LEFT`/`RIGHT` (e.g. `REMOTE`) is never overridden; the gallery
+  only engages on whichever of those two buttons the app's own map leaves
+  unclaimed.
 
 #### Tags
 
