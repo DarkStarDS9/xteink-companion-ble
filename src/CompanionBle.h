@@ -245,6 +245,15 @@ void stop();
 
 bool isConnected();
 
+// Polls whether the link has been idle (no content/status/session write and
+// no outgoing button notify) long enough to relax the connection interval
+// and slave latency. Cheap (a millis() subtraction on every call, an actual
+// GAP request only on the busy->idle edge) — call it once per main loop
+// iteration, e.g. from CompanionModeActivity::loop(). Tightening back to the
+// busy profile happens automatically and immediately on the next write or
+// notify, so nothing needs to call the inverse of this.
+void tick();
+
 // The capability characteristic's bytes, for diagnostics and for a test host
 // that wants to assert on them without a BLE read. Never mutated after
 // ensureStarted().

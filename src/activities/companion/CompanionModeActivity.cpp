@@ -254,6 +254,15 @@ void CompanionModeActivity::clearUiDeclaration() {
     spec.label.clear();
   }
   tagRenderStyle = static_cast<uint8_t>(companionble::TagRenderStyle::Bordered);
+  // Tags are re-populated from scratch by loadUiDeclaration() right after this
+  // call (which captures the pre-clear state to restore by id). Without this
+  // reset, every reload — a re-pushed declaration, a fresh ACQUIRE after a
+  // reconnect — appended a second copy on top of tagCount instead of replacing
+  // it, and setTagState()'s first-match update could end up shadowed by a
+  // stale duplicate later in the array. Confirmed on hardware: after two
+  // enrollment cycles in the same boot, CTAGS reported `tags count=4` with
+  // tag ids 0 and 1 each appearing twice.
+  tagCount = 0;
 }
 
 // Reads the foreground peer's declared control scheme off the SD card. Called
@@ -734,6 +743,11 @@ bool CompanionModeActivity::handleGalleryNav() {
 void CompanionModeActivity::loop() {
   if (screen == Screen::StartFailed) return;  // nothing to poll: BLE never came up
 
+  // Relax the connection interval/slave latency once the link has been idle
+  // for a while; tightening back happens automatically on the next write or
+  // notify (see CompanionBle.h's tick() doc comment).
+  companionble::tick();
+
   const bool nowConnected = companionble::isConnected();
   if (nowConnected != connected) {
     // RenderLock: screen/pages gate which branch render() takes and renderPage()
@@ -761,7 +775,12 @@ void CompanionModeActivity::loop() {
       g_pendingBatchStartMs = 0;
       portEXIT_CRITICAL(&g_mux);
     }
-    requestUpdate();
+    // A displayed image is already on the panel and unaffected by the link
+    // dropping — redrawing it here just re-decodes and re-flips the same
+    // pixels, flickering the panel for nothing. Everything else (text,
+    // waiting, pairing) still needs a redraw: the connection badge/prompt
+    // they show depends on `connected`.
+    if (!(screen == Screen::Image && !connected)) requestUpdate();
   }
 
   // Drain the host-task handoffs.

@@ -90,6 +90,19 @@ bool g_begun = false;
 // completed. Confirmed by reproducing on real hardware: advertising ran and
 // was independently discoverable (byte-verified UUID), but no central ever
 // completed a connection until this lock was made session-scoped.
+//
+// NOT removed by platformio.ini's new CONFIG_BT_CTRL_MODEM_SLEEP block (see
+// that file's comment). Modem sleep is a BT-controller radio-power state
+// (the controller stops the radio between BLE events, still clocked off the
+// main XTAL) and needs no esp_pm lock coordination and no CPU-frequency
+// change to work -- CONFIG_PM_ENABLE is deliberately NOT enabled here (see
+// platformio.ini: it doesn't link against this project's prebuilt
+// libfreertos.a). So nothing about this rollout touches the CPU-frequency
+// mechanism this lock exists to hold steady; the hang this guards against is
+// exactly as reachable as before, and this lock is unambiguously still
+// required. If a future change does bring in esp_pm/tickless idle, re-read
+// this comment before assuming that supersedes it -- see the git history for
+// the fuller reasoning that was here when this rollout still attempted that.
 std::unique_ptr<HalPowerManager::Lock> g_powerLock;
 
 NimBLEServer* g_server = nullptr;
@@ -104,6 +117,87 @@ StatusCallback g_statusCb = nullptr;
 PairingRequestCallback g_pairingCb = nullptr;
 ForegroundChangeCallback g_foregroundCb = nullptr;
 ImageStagedCallback g_imageStagedCb = nullptr;
+
+// ---------------------------------------------------------------------------
+// Adaptive connection interval / slave latency
+// ---------------------------------------------------------------------------
+//
+// Two link-layer profiles, requested via NimBLEServer::updateConnParams (a
+// peripheral can only ever *request* new parameters -- the central, iOS here,
+// grants or ignores it). This is transport tuning, not a protocol change: no
+// wire field, byte layout, or characteristic is affected, so it carries no
+// version bump.
+//
+// Units match the BLE spec directly (updateConnParams forwards them straight
+// into ble_gap_upd_params): interval in 1.25 ms units, latency as a skipped-
+// event count, supervision timeout in 10 ms units.
+//
+// Bounds are iOS's accessory-design-guidelines envelope, since the real
+// central here is a phone (CompanionKit/Snap2Ink/SpokenFeeds), and a request
+// outside it is simply ignored, leaving iOS's own defaults in place:
+//   - peripheral latency <= 30 intervals
+//   - supervision timeout 6-18 s
+//   - interval >= 15 ms, in 15 ms multiples
+//   - maxInterval * (latency+1) <= 6 s
+//   - timeout(ms) > maxInterval(ms) * (latency+1) * 3
+//
+// "Busy": tight interval, no latency skipping -- lowest round-trip time while
+// a button press or a content/image chunk sequence is actively in flight.
+// 30 ms satisfies interval>=15ms/15ms-multiple; latency 0 means
+// maxInterval*(latency+1)=30ms and the timeout floor (6s) clears
+// 30ms*1*3=90ms by a wide margin.
+constexpr uint16_t kConnIntervalBusyUnits = 24;  // 30 ms (24 * 1.25 ms)
+constexpr uint16_t kConnLatencyBusy = 0;
+constexpr uint16_t kConnTimeoutBusyUnits = 600;  // 6 s (10 ms units) -- iOS's floor
+
+// "Idle": relaxed interval + latency skip once nothing has moved for a
+// while -- the "slave latency" lever from the platform research this change
+// is based on, which alone (independent of modem/light-sleep) measurably cuts
+// average current by letting the peripheral skip waking for idle connection
+// events. 150 ms * (4+1) = 750 ms, comfortably under the 6 s cap; the 6 s
+// timeout is unchanged from the busy profile so relaxing/tightening never
+// crosses a supervision-timeout boundary.
+constexpr uint16_t kConnIntervalIdleUnits = 120;  // 150 ms (120 * 1.25 ms)
+constexpr uint16_t kConnLatencyIdle = 4;
+constexpr uint16_t kConnTimeoutIdleUnits = 600;  // 6 s
+
+// How long the link must go without a content/status/session write or an
+// outgoing button notify before it relaxes to the idle profile. Matches
+// HalPowerManager::IDLE_POWER_SAVING_MS's idea of "idle" (not its value
+// directly -- that constant lives in a different module -- but the same
+// shape: a short, fixed quiet period before backing off).
+constexpr uint32_t kConnIdleRelaxMs = 3000;
+
+uint32_t g_lastBleActivityMs = 0;
+// Tracks which profile was last requested, so tick() and the activity
+// helpers below don't spam updateConnParams() every call once already in the
+// right state. Starts false (idle) so onConnect()'s noteBleActivity() call
+// always fires an explicit busy request on a fresh connection -- the v6
+// handshake happens right after connect, and should get the tightest
+// round-trip available rather than whatever the central defaulted to.
+bool g_connParamsBusy = false;
+
+void requestConnParams(bool busy) {
+  if (!g_server || g_server->getConnectedCount() == 0) return;
+  if (g_connParamsBusy == busy) return;
+  const uint16_t interval = busy ? kConnIntervalBusyUnits : kConnIntervalIdleUnits;
+  const uint16_t latency = busy ? kConnLatencyBusy : kConnLatencyIdle;
+  const uint16_t timeout = busy ? kConnTimeoutBusyUnits : kConnTimeoutIdleUnits;
+  const auto peer = g_server->getPeerInfo(0);
+  g_server->updateConnParams(peer.getConnHandle(), interval, interval, latency, timeout);
+  g_connParamsBusy = busy;
+  LOG_DBG("CBLE", "requested %s conn params (interval=%u latency=%u timeout=%u)", busy ? "busy" : "idle",
+          static_cast<unsigned>(interval), static_cast<unsigned>(latency), static_cast<unsigned>(timeout));
+}
+
+// Called from every characteristic write and outgoing notify -- i.e. anything
+// that means a phone app is actively driving the link right now. Cheap: a
+// timestamp store and, only on the idle->busy edge, one GAP parameter-update
+// request.
+void noteBleActivity() {
+  g_lastBleActivityMs = millis();
+  requestConnParams(/*busy=*/true);
+}
 
 // ---------------------------------------------------------------------------
 // Session table
@@ -452,6 +546,7 @@ class SessionCharCallbacks : public NimBLECharacteristicCallbacks {
     const uint8_t* data = value.data();
     const size_t len = value.size();
     if (len == 0) return;
+    noteBleActivity();
 
     switch (data[0]) {
       case kSessHello:
@@ -534,6 +629,7 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
     const uint8_t* data = value.data();
     const size_t len = value.size();
     if (len == 0) return;
+    noteBleActivity();
 
     switch (data[0]) {
       case kOpStart: {
@@ -684,6 +780,7 @@ class StatusCharCallbacks : public NimBLECharacteristicCallbacks {
     if (value.size() < 3) return;
     const uint8_t* data = value.data();
     if (data[0] != g_foreground) return;  // not the app that owns the screen
+    noteBleActivity();
     // tagId is whatever the app declared; the firmware neither allocates nor
     // validates ids — an id the peer never declared is simply ignored upstream.
     if (g_statusCb) g_statusCb(data[1], data[2]);
@@ -693,9 +790,15 @@ class StatusCharCallbacks : public NimBLECharacteristicCallbacks {
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* /*server*/, NimBLEConnInfo& /*connInfo*/) override {
     LOG_DBG("CBLE", "central connected");
+    // Request the tight profile right away: the v6 HELLO handshake happens
+    // immediately after connect, before anything else marks the link busy.
+    noteBleActivity();
   }
   void onDisconnect(NimBLEServer* server, NimBLEConnInfo& /*connInfo*/, int /*reason*/) override {
     LOG_DBG("CBLE", "central disconnected");
+    // The next connect gets a fresh onConnect() -> noteBleActivity() edge;
+    // reset to idle so a stale "already busy" doesn't suppress that request.
+    g_connParamsBusy = false;
     resetReassembly();
     // Sessions do not survive the link. The token does — that is what makes the
     // next connect silent.
@@ -878,6 +981,12 @@ void stop() {
 
 bool isConnected() { return g_begun && g_server && g_server->getConnectedCount() > 0; }
 
+void tick() {
+  if (!isConnected() || !g_connParamsBusy) return;
+  if (millis() - g_lastBleActivityMs < kConnIdleRelaxMs) return;
+  requestConnParams(/*busy=*/false);
+}
+
 const uint8_t* capabilityValue(size_t& lengthOut) {
   lengthOut = sizeof(g_capabilityValue);
   return g_capabilityValue;
@@ -901,6 +1010,7 @@ const char* foregroundPeerKey() {
 bool notifyButtonEvent(ButtonId button, uint16_t durationTicks, bool isFinal) {
   const Session* session = sessionById(g_foreground);
   if (!isConnected() || !g_buttonChar || !session) return false;
+  noteBleActivity();
 
   // Header byte: bit7 isFinal, bits6-4 event type, bits3-0 button id.
   const uint8_t header = (isFinal ? 0x80 : 0x00) |
