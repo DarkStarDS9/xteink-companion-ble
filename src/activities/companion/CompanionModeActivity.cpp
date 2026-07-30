@@ -695,7 +695,12 @@ void CompanionModeActivity::loop() {
       g_pendingBatchStartMs = 0;
       portEXIT_CRITICAL(&g_mux);
     }
-    requestUpdate();
+    // A displayed image is already on the panel and unaffected by the link
+    // dropping — redrawing it here just re-decodes and re-flips the same
+    // pixels, flickering the panel for nothing. Everything else (text,
+    // waiting, pairing) still needs a redraw: the connection badge/prompt
+    // they show depends on `connected`.
+    if (!(screen == Screen::Image && !connected)) requestUpdate();
   }
 
   // Drain the host-task handoffs.
