@@ -119,9 +119,15 @@ uint16_t HalPowerManager::getBatteryPercentage() const {
 
 HalPowerManager::Lock::Lock() {
   xSemaphoreTake(powerManager.modeMutex, portMAX_DELAY);
-  // Current limitation: only one lock at a time
+  // Current limitation: only one lock at a time. This is not a bug: a
+  // shorter-lived Lock nested inside a longer-lived one (e.g. a render's
+  // Lock while companion mode's session-long BLE lock is already held,
+  // CompanionBle.cpp:735) is expected and safe -- the outer lock already
+  // holds NormalSpeed for the duration, and ~Lock() below only clears
+  // currentLockMode when `valid` is true, so this one is a no-op on both
+  // ends. DBG, not ERR: nothing is actually wrong here.
   if (powerManager.currentLockMode != None) {
-    LOG_ERR("PWR", "Lock already held, ignore");
+    LOG_DBG("PWR", "Lock already held, ignore");
     valid = false;
   } else {
     powerManager.currentLockMode = NormalSpeed;
