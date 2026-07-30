@@ -85,13 +85,15 @@ global `incoming_image.png`, so two apps staging at once cannot collide.
 once whole, `CompanionPeerStore::commitImage()` renames it into a bounded per-peer gallery
 (`images/`, `kMaxImagesPerPeer` slots reused oldest-first, indexed by `images.json`) instead of
 leaving one scratch file that the next push would silently overwrite. `CompanionModeActivity` browses
-that gallery with `Button::Up`/`Down` — the side buttons, not `Left`/`Right`: on real hardware those
-are the bottom front buttons, and every button map seen so far routes them to local text paging, so
-`Up`/`Down` are the pair actually free for this (see `MappedInputManager.h`) — while `Screen::Image`
-is showing, and only on whichever of those two buttons the foreground peer's own button map has left unclaimed
-(routing `None` or `LocalPagePrev`/`LocalPageNext`, which is already a no-op outside `Screen::Text`);
-a peer that declared its own use for Up/Down (e.g. `Remote`, for something like camera control) is
-never overridden. This is deliberately **firmware-local**: no protocol opcode, no capability bit, nothing
+that gallery while `Screen::Image` is showing, trying `Button::Left`/`Right` first and falling back to
+`Button::Up`/`Down`, using whichever pair the foreground peer's button map leaves fully unclaimed
+(routing `None` or `LocalPagePrev`/`LocalPageNext` on *both* sides, which is already a no-op outside
+`Screen::Text`). No single pair is safe to hardcode: confirmed on hardware that Snap2Ink's camera
+control claims `Up`/`Down` (`Remote`-routed "Redevelop"/"Timer") and leaves `Left`/`Right` free, while
+text-paging apps claim `Left`/`Right` and leave `Up`/`Down` free — hardcoding either pair works for one
+app and silently forwards the press to the other app's `Remote` handler instead of paging the gallery.
+A peer that has claimed *both* members of a pair (e.g. `Remote`, for something like camera control) is
+never overridden on that pair. This is deliberately **firmware-local**: no protocol opcode, no capability bit, nothing
 reported to the phone, exactly like the existing `currentPage`/`totalPages` text pagination that
 `LocalPagePrev`/`LocalPageNext` already drive with no BLE notification. Six images per peer costs
 ~612 KB of SD space at the measured panel's ~102 KB/image (trivial against a multi-GB card) and no

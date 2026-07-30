@@ -714,43 +714,63 @@ void CompanionModeActivity::showGalleryImage(size_t index) {
   requestUpdate();
 }
 
-// Button::Up/Down gallery prev/next, active only in Screen::Image and only
-// for a button the foreground peer's own map hasn't claimed for something
-// that actually applies on this screen. Remote and LocalSleep always defer to
-// the app — those are meaningful regardless of what's on screen.
+// Gallery prev/next, active only in Screen::Image, on whichever directional
+// button pair the foreground peer's own map leaves entirely free. There is no
+// single physical pair that's safe to hardcode: confirmed on hardware that
+// real apps disagree about which pair they claim for themselves. Snap2Ink's
+// camera control claims Up/Down (Remote-routed "Redevelop"/"Timer") and
+// leaves Left/Right unclaimed; scripts/push_companion_content.py (and text-
+// paging apps generally) claims Left/Right for LOCAL_PAGE_PREV/NEXT and
+// leaves Up/Down unclaimed. Hardcoding either pair works for one app and
+// silently forwards the press to the other app's Remote handler instead of
+// paging the gallery — which is exactly what happened when this was pinned to
+// Up/Down and a press reached Snap2Ink's "Redevelop" button instead.
 //
-// This deliberately does NOT use Left/Right: on real hardware those are the
-// bottom front buttons, and every app map seen so far (including scripts/
-// push_companion_content.py's default) routes them to LOCAL_PAGE_PREV/NEXT for
-// paging buffered text — i.e. what users call "the page-turn buttons".
-// Up/Down are the side buttons, physically the pair toward the top of the
-// device, and are otherwise unclaimed by a typical text/image app's button
-// map, which is exactly why they're free for this. (An app that legitimately
-// wants Up/Down for its own purpose, e.g. a camera-control app, still keeps
-// them — the None-only guard below never overrides a declared routing.)
-// LocalPagePrev/LocalPageNext are still accepted here too: handleMappedButton()
-// already scopes them to Screen::Text and no-ops elsewhere, so claiming them
-// on Image costs nothing if some future app reuses those routings on Up/Down.
+// So instead: try Left/Right first, then Up/Down, and use the first pair
+// where *both* sides are unclaimed (None) or claimed only for local text
+// paging (LocalPagePrev/LocalPageNext, which handleMappedButton() already
+// scopes to Screen::Text and no-ops on Image — safe to reuse here). Remote
+// and LocalSleep always defer to the app on both members of a pair, so a pair
+// is only used if the app has genuinely left it alone.
 namespace {
 bool isGalleryClaimable(companionble::ButtonRouting routing) {
   return routing == companionble::ButtonRouting::None ||
          routing == companionble::ButtonRouting::LocalPagePrev ||
          routing == companionble::ButtonRouting::LocalPageNext;
 }
+
+struct GalleryButtonPair {
+  MappedInputManager::Button prevRole;
+  companionble::ButtonId prevId;
+  MappedInputManager::Button nextRole;
+  companionble::ButtonId nextId;
+};
+
+constexpr GalleryButtonPair kGalleryCandidates[] = {
+    {MappedInputManager::Button::Left, companionble::ButtonId::Left, MappedInputManager::Button::Right,
+     companionble::ButtonId::Right},
+    {MappedInputManager::Button::Up, companionble::ButtonId::Up, MappedInputManager::Button::Down,
+     companionble::ButtonId::Down},
+};
 }  // namespace
 
 bool CompanionModeActivity::handleGalleryNav() {
   if (screen != Screen::Image || galleryImages.size() < 2) return false;
 
-  if (isGalleryClaimable(routingFor(companionble::ButtonId::Up)) &&
-      buttonWasPressed(MappedInputManager::Button::Up, companionble::ButtonId::Up)) {
-    showGalleryImage(galleryIndex == 0 ? galleryImages.size() - 1 : galleryIndex - 1);
-    return true;
-  }
-  if (isGalleryClaimable(routingFor(companionble::ButtonId::Down)) &&
-      buttonWasPressed(MappedInputManager::Button::Down, companionble::ButtonId::Down)) {
-    showGalleryImage(galleryIndex + 1 >= galleryImages.size() ? 0 : galleryIndex + 1);
-    return true;
+  for (const GalleryButtonPair& pair : kGalleryCandidates) {
+    if (!isGalleryClaimable(routingFor(pair.prevId)) || !isGalleryClaimable(routingFor(pair.nextId))) continue;
+
+    // This is the pair the foreground peer has left free — decide the press
+    // here and stop, rather than falling through to the next candidate.
+    if (buttonWasPressed(pair.prevRole, pair.prevId)) {
+      showGalleryImage(galleryIndex == 0 ? galleryImages.size() - 1 : galleryIndex - 1);
+      return true;
+    }
+    if (buttonWasPressed(pair.nextRole, pair.nextId)) {
+      showGalleryImage(galleryIndex + 1 >= galleryImages.size() ? 0 : galleryIndex + 1);
+      return true;
+    }
+    return false;
   }
   return false;
 }
