@@ -20,6 +20,14 @@ void HalPowerManager::begin() {
   normalFreq = getCpuFrequencyMhz();
   modeMutex = xSemaphoreCreateMutex();
   assert(modeMutex != nullptr);
+
+  // No esp_pm_configure() call here: CONFIG_PM_ENABLE + tickless idle (the
+  // esp-idf mechanism that would let the BLE session reach automatic light
+  // sleep on top of the BT modem sleep platformio.ini's custom_sdkconfig
+  // enables) does not link on this project's toolchain -- see
+  // platformio.ini's comment on the CONFIG_BT_CTRL_MODEM_SLEEP block for the
+  // confirmed esptool failure and why. Modem sleep alone (enabled there) does
+  // not need esp_pm_configure() and needs no HAL-side call at all.
 }
 
 void HalPowerManager::setPowerSaving(bool enabled) {

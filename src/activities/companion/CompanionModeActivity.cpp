@@ -654,6 +654,11 @@ void CompanionModeActivity::handlePendingImage() {
 void CompanionModeActivity::loop() {
   if (screen == Screen::StartFailed) return;  // nothing to poll: BLE never came up
 
+  // Relax the connection interval/slave latency once the link has been idle
+  // for a while; tightening back happens automatically on the next write or
+  // notify (see CompanionBle.h's tick() doc comment).
+  companionble::tick();
+
   const bool nowConnected = companionble::isConnected();
   if (nowConnected != connected) {
     // RenderLock: screen/pages gate which branch render() takes and renderPage()
