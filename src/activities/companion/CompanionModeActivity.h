@@ -183,4 +183,13 @@ class CompanionModeActivity final : public Activity {
   void onExit() override;
   void loop() override;
   void render(RenderLock&&) override;
+
+  // A live BLE session has no physical-input signal for main.cpp's general
+  // auto-sleep timer to see (see docs/companion-multi-app-design.md: the whole
+  // point of companion mode is phone-driven, button-free operation) — without
+  // this, a battery-powered device with an app connected but no button presses
+  // hits the inactivity timeout and deep-sleeps mid-session, dropping the BLE
+  // link. `connected` mirrors companionble::isConnected() once per loop() (see
+  // above), so this stays cheap to call every main-loop iteration.
+  bool preventAutoSleep() override { return connected; }
 };
