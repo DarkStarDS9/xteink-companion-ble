@@ -94,15 +94,17 @@ DEFAULT_BODY = (
 )
 
 # What this script declares about its own UI. LEFT/RIGHT page the buffered body
-# on-device; everything else is forwarded so --listen can print it. The tags are
-# this script's own invention — the device defines none.
+# on-device; BACK/CONFIRM are forwarded so --listen can print them. The tags
+# are this script's own invention — the device defines none. UP/DOWN are left
+# unrouted (None) rather than Remote: the firmware claims them for image
+# gallery prev/next while an image is on screen (see CompanionModeActivity::
+# handleGalleryNav()), and routing them here would block that for this
+# script's own pushes.
 BUTTON_MAP = [
     (2, ROUTING_PAGE_PREV, "<"),
     (3, ROUTING_PAGE_NEXT, ">"),
     (1, ROUTING_REMOTE, "Save"),
     (0, ROUTING_REMOTE, "Back"),
-    (4, ROUTING_REMOTE, ""),
-    (5, ROUTING_REMOTE, ""),
 ]
 
 

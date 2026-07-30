@@ -85,11 +85,13 @@ global `incoming_image.png`, so two apps staging at once cannot collide.
 once whole, `CompanionPeerStore::commitImage()` renames it into a bounded per-peer gallery
 (`images/`, `kMaxImagesPerPeer` slots reused oldest-first, indexed by `images.json`) instead of
 leaving one scratch file that the next push would silently overwrite. `CompanionModeActivity` browses
-that gallery with `Button::Left`/`Right` — front buttons, physically distinct from the reader's
-`PageBack`/`PageForward` side buttons (see `MappedInputManager.h`) — while `Screen::Image` is showing,
-and only on whichever of those two buttons the foreground peer's own button map has left unclaimed
-(routing `None`); a peer that declared its own use for Left/Right (e.g. `Remote`) is never
-overridden. This is deliberately **firmware-local**: no protocol opcode, no capability bit, nothing
+that gallery with `Button::Up`/`Down` — the side buttons, not `Left`/`Right`: on real hardware those
+are the bottom front buttons, and every button map seen so far routes them to local text paging, so
+`Up`/`Down` are the pair actually free for this (see `MappedInputManager.h`) — while `Screen::Image`
+is showing, and only on whichever of those two buttons the foreground peer's own button map has left unclaimed
+(routing `None` or `LocalPagePrev`/`LocalPageNext`, which is already a no-op outside `Screen::Text`);
+a peer that declared its own use for Up/Down (e.g. `Remote`, for something like camera control) is
+never overridden. This is deliberately **firmware-local**: no protocol opcode, no capability bit, nothing
 reported to the phone, exactly like the existing `currentPage`/`totalPages` text pagination that
 `LocalPagePrev`/`LocalPageNext` already drive with no BLE notification. Six images per peer costs
 ~612 KB of SD space at the measured panel's ~102 KB/image (trivial against a multi-GB card) and no

@@ -714,22 +714,23 @@ void CompanionModeActivity::showGalleryImage(size_t index) {
   requestUpdate();
 }
 
-// Button::Left/Right gallery prev/next, active only in Screen::Image and only
+// Button::Up/Down gallery prev/next, active only in Screen::Image and only
 // for a button the foreground peer's own map hasn't claimed for something
 // that actually applies on this screen. Remote and LocalSleep always defer to
-// the app — those are meaningful regardless of what's on screen. LocalPagePrev/
-// LocalPageNext are different: handleMappedButton() already scopes them to
-// Screen::Text only and no-ops (while still consuming the press) anywhere
-// else, including Image — most apps declare one button map covering both text
-// and image content, so on-screen paging routing is exactly the common case
-// here, not an edge case. Treating that as "claimed" left gallery nav dead on
-// every app that pages text with Left/Right (confirmed on hardware: the
-// original None-only guard never engaged with docs/../scripts/
-// push_companion_content.py's default map). Since those routings are already
-// no-ops outside Text, it's safe for gallery nav to claim them while an image
-// is on screen. See MappedInputManager.h: Left/Right are front buttons,
-// physically distinct from the PageBack/PageForward side buttons the reader
-// uses, so this cannot collide with page-turn handling anywhere else.
+// the app — those are meaningful regardless of what's on screen.
+//
+// This deliberately does NOT use Left/Right: on real hardware those are the
+// bottom front buttons, and every app map seen so far (including scripts/
+// push_companion_content.py's default) routes them to LOCAL_PAGE_PREV/NEXT for
+// paging buffered text — i.e. what users call "the page-turn buttons".
+// Up/Down are the side buttons, physically the pair toward the top of the
+// device, and are otherwise unclaimed by a typical text/image app's button
+// map, which is exactly why they're free for this. (An app that legitimately
+// wants Up/Down for its own purpose, e.g. a camera-control app, still keeps
+// them — the None-only guard below never overrides a declared routing.)
+// LocalPagePrev/LocalPageNext are still accepted here too: handleMappedButton()
+// already scopes them to Screen::Text and no-ops elsewhere, so claiming them
+// on Image costs nothing if some future app reuses those routings on Up/Down.
 namespace {
 bool isGalleryClaimable(companionble::ButtonRouting routing) {
   return routing == companionble::ButtonRouting::None ||
@@ -741,13 +742,13 @@ bool isGalleryClaimable(companionble::ButtonRouting routing) {
 bool CompanionModeActivity::handleGalleryNav() {
   if (screen != Screen::Image || galleryImages.size() < 2) return false;
 
-  if (isGalleryClaimable(routingFor(companionble::ButtonId::Left)) &&
-      buttonWasPressed(MappedInputManager::Button::Left, companionble::ButtonId::Left)) {
+  if (isGalleryClaimable(routingFor(companionble::ButtonId::Up)) &&
+      buttonWasPressed(MappedInputManager::Button::Up, companionble::ButtonId::Up)) {
     showGalleryImage(galleryIndex == 0 ? galleryImages.size() - 1 : galleryIndex - 1);
     return true;
   }
-  if (isGalleryClaimable(routingFor(companionble::ButtonId::Right)) &&
-      buttonWasPressed(MappedInputManager::Button::Right, companionble::ButtonId::Right)) {
+  if (isGalleryClaimable(routingFor(companionble::ButtonId::Down)) &&
+      buttonWasPressed(MappedInputManager::Button::Down, companionble::ButtonId::Down)) {
     showGalleryImage(galleryIndex + 1 >= galleryImages.size() ? 0 : galleryIndex + 1);
     return true;
   }
@@ -972,15 +973,24 @@ void CompanionModeActivity::loop() {
     return;
   }
 
+  // Gallery browsing is tried before the foreground check and works even with
+  // nobody connected: pushed images already survive disconnect (see the
+  // "nobody holds the screen" branch of applyForegroundChange(), which leaves
+  // Screen::Image and galleryImages alone) — requiring a live peer here would
+  // make a persisted gallery unbrowsable exactly when there's no app around to
+  // re-push anything, which defeats the point of persisting more than one
+  // image. routingFor() still reflects the last foreground peer's declared
+  // map after it disconnects (buttons[] is only reset by the *next* peer's
+  // loadUiDeclaration()), so the "don't steal a claimed button" gate keeps
+  // working the same whether or not that peer is still connected.
+  handleGalleryNav();
+
   if (foregroundPeerKey.empty()) return;  // no app owns the buttons
 
   // Route each button through the foreground app's declared map. Nothing here
   // decides what a button means — routingFor() is the app's own answer, read
-  // back off the SD card. Gallery nav is tried first but only ever engages on
-  // a button the app's own map left unclaimed (see handleGalleryNav()), so it
-  // cannot steal a press an app declared a use for.
-  const bool handled = handleGalleryNav() ||
-                       handleMappedButton(MappedInputManager::Button::Left, companionble::ButtonId::Left) ||
+  // back off the SD card.
+  const bool handled = handleMappedButton(MappedInputManager::Button::Left, companionble::ButtonId::Left) ||
                        handleMappedButton(MappedInputManager::Button::Right, companionble::ButtonId::Right) ||
                        handleMappedButton(MappedInputManager::Button::Up, companionble::ButtonId::Up) ||
                        handleMappedButton(MappedInputManager::Button::Down, companionble::ButtonId::Down) ||
