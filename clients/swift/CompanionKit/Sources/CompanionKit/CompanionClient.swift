@@ -745,6 +745,7 @@ extension CompanionClient: CBCentralManagerDelegate {
 
         writes.forEach { $0.resume(throwing: CompanionError.disconnected) }
         failPending(with: CompanionError.disconnected)
+        Task { await gate.reset() }
         transition(to: .disconnected)
         emit(.disconnected(reason: error?.localizedDescription))
     }
@@ -888,6 +889,19 @@ actor CommandGate {
         } else {
             waiting.removeFirst().resume()
         }
+    }
+
+    /// Called on disconnect, where whatever held the gate is never coming back to
+    /// release it. Without this, one push left in flight when the peripheral drops
+    /// wedges the gate forever — every push after a reconnect just queues behind a
+    /// holder that no longer exists, and `serialized` never returns or throws. Woken
+    /// waiters proceed straight into `requireSession()`, which throws immediately
+    /// against the now-cleared session, so this cannot let two pushes run for real.
+    func reset() {
+        let waiters = waiting
+        waiting.removeAll()
+        busy = false
+        waiters.forEach { $0.resume() }
     }
 }
 
