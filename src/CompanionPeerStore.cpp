@@ -1,5 +1,7 @@
 #include "CompanionPeerStore.h"
 
+#include "CompanionBle.h"
+
 #include <ArduinoJson.h>
 #include <HalStorage.h>
 #include <Logging.h>
@@ -130,6 +132,8 @@ bool writeWholeFile(const std::string& path, const uint8_t* data, size_t len) {
 //   N x { buttonId:1, routing:1, labelLen:1, label[labelLen] }
 //   byte        tag entry count M          (optional; absent means zero tags)
 //   M x { tagId:1, labelLen:1, label[labelLen] }
+//   byte        tag render style           (optional; absent means Bordered)
+//   byte        capabilities bitmask       (optional; absent means none)
 bool uiDeclarationParses(const uint8_t* data, size_t len) {
   if (len < 5) return false;  // digest + button count
   const uint8_t buttonCount = data[4];
@@ -142,14 +146,21 @@ bool uiDeclarationParses(const uint8_t* data, size_t len) {
 
   // The tag section is optional: an app with no tags may simply stop after its
   // buttons rather than append a zero byte.
-  if (offset == len) return true;
-  const uint8_t tagCount = data[offset++];
-  for (uint8_t i = 0; i < tagCount; ++i) {
-    if (offset + 2 > len) return false;
-    offset += 2 + data[offset + 1];
-    if (offset > len) return false;
+  if (offset != len) {
+    const uint8_t tagCount = data[offset++];
+    for (uint8_t i = 0; i < tagCount; ++i) {
+      if (offset + 2 > len) return false;
+      offset += 2 + data[offset + 1];
+      if (offset > len) return false;
+    }
   }
-  return offset == len;
+
+  // Up to two more trailing bytes may follow the tag section: tag render
+  // style, then capabilities. Both are optional and independently absent —
+  // "ran out of buffer" is how a decoder tells absent from present, so
+  // anything beyond two extra bytes here is not a declaration this version
+  // knows how to produce.
+  return len - offset <= 2;
 }
 
 // Deletes a peer's directory and everything under it. Used by LRU eviction.
@@ -202,7 +213,7 @@ void makePeerKey(const uint8_t appId[kIdLen], const uint8_t installId[kIdLen], c
 }
 
 bool ensurePeer(const uint8_t appId[kIdLen], const uint8_t installId[kIdLen], const char* displayName,
-                char keyOut[kPeerKeyLen]) {
+                const char* userName, char keyOut[kPeerKeyLen]) {
   makePeerKey(appId, installId, keyOut);
   if (!ensureRootDirs()) return false;
   if (!Storage.ensureDirectoryExists(peerDir(keyOut).c_str())) {
@@ -226,6 +237,7 @@ bool ensurePeer(const uint8_t appId[kIdLen], const uint8_t installId[kIdLen], co
     entry["install"] = hex;
   }
   if (displayName && displayName[0] != '\0') entry["name"] = displayName;
+  if (userName && userName[0] != '\0') entry["user"] = userName;
   entry["seq"] = seq;
 
   evictOverflow(doc);
@@ -401,6 +413,40 @@ std::string displayName(const char* peerKey) {
   JsonObject entry = findPeer(doc, peerKey);
   if (entry.isNull()) return std::string();
   return std::string(entry["name"] | "");
+}
+
+std::string userName(const char* peerKey) {
+  JsonDocument doc;
+  if (!loadIndex(doc)) return std::string();
+  JsonObject entry = findPeer(doc, peerKey);
+  if (entry.isNull()) return std::string();
+  return std::string(entry["user"] | "");
+}
+
+bool isImageCapable(const char* peerKey) {
+  uint8_t raw[kMaxUiDeclarationLen];
+  const size_t len = readAssetBody(peerKey, kAssetUiDeclaration, raw, sizeof(raw));
+  if (len < 1) return false;
+
+  const uint8_t buttonCount = raw[0];
+  size_t offset = 1;
+  for (uint8_t i = 0; i < buttonCount; ++i) {
+    if (offset + 3 > len) return false;
+    offset += 3 + raw[offset + 2];
+    if (offset > len) return false;
+  }
+  if (offset == len) return false;  // no tag section, so nothing trailing either
+
+  const uint8_t tagCount = raw[offset++];
+  for (uint8_t i = 0; i < tagCount; ++i) {
+    if (offset + 2 > len) return false;
+    offset += 2 + raw[offset + 1];
+    if (offset > len) return false;
+  }
+
+  if (offset < len) ++offset;   // skip the optional tag-render-style byte, present or not
+  if (offset >= len) return false;  // no capabilities byte present
+  return (raw[offset] & companionble::kUiCapabilityImageGallery) != 0;
 }
 
 void touch(const char* peerKey) {

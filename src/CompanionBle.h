@@ -178,6 +178,16 @@ enum class TagRenderStyle : uint8_t {
   Plain = 0x01,     // Outline draws nothing; Filled draws the label with no box (v5-style)
 };
 
+// Second (and, today, last) optional trailing byte of the UI declaration,
+// right after the tag render style byte — a bitmask of what this peer's app
+// can do beyond title/body. Absent means no bits set, same "ran out of
+// buffer" convention as the style byte. A peer only appears in the on-device
+// gallery picker (docs/companion-display-protocol.md, "On-screen behaviour")
+// if it has declared kUiCapabilityImageGallery — the grid is not a launcher,
+// it browses a peer's own already-pushed, locally-stored photos, but only for
+// apps that say they push photos at all.
+inline constexpr uint8_t kUiCapabilityImageGallery = 0x01;
+
 // Content characteristic field identifiers, matching docs/companion-display-protocol.md.
 inline constexpr uint8_t kFieldTitle = 0x01;
 inline constexpr uint8_t kFieldBody = 0x02;

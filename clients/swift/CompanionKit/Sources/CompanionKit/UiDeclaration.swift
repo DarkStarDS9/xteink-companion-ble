@@ -49,13 +49,19 @@ public struct UiDeclaration: Equatable, Sendable {
     public let tags: [TagDeclaration]
     /// Whole-row look for `tags`. A per-peer choice, not per-tag.
     public let tagRenderStyle: TagRenderStyle
+    /// What this app can do beyond title/body — e.g. ``PeerCapabilities/imageGallery``.
+    public let capabilities: PeerCapabilities
 
-    public init(buttons: [ButtonMapEntry], tags: [TagDeclaration] = [], tagRenderStyle: TagRenderStyle = .bordered) {
+    public init(buttons: [ButtonMapEntry],
+               tags: [TagDeclaration] = [],
+               tagRenderStyle: TagRenderStyle = .bordered,
+               capabilities: PeerCapabilities = []) {
         // POWER is firmware-owned; encoding it would be ignored on the device,
         // which would make our digest disagree with what is stored.
         self.buttons = buttons.filter { $0.button != .power }
         self.tags = Array(tags.prefix(CompanionTagLimits.maxTags))
         self.tagRenderStyle = tagRenderStyle
+        self.capabilities = capabilities
     }
 
     /// The asset body, without its 4-byte digest prefix.
@@ -85,6 +91,11 @@ public struct UiDeclaration: Equatable, Sendable {
         // the digest is a function of the declaration, not of how it was
         // serialized.
         out.append(tagRenderStyle.rawValue)
+        // Also trailing and optional on the wire (absent means no
+        // capabilities), also always emitted here for the same reason. The
+        // two trailing bytes are positional, not tagged, so this one can only
+        // be read once the style byte before it is present.
+        out.append(capabilities.rawValue)
         return out
     }
 

@@ -113,9 +113,12 @@ void makePeerKey(const uint8_t appId[kIdLen], const uint8_t installId[kIdLen], c
 
 // Looks the peer up in the index; creates its directory and index entry if it
 // is new. Bumps its sequence number either way (see touch()). Returns false
-// only if the SD card is unusable.
+// only if the SD card is unusable. `userName` (may be null/empty) is the
+// user-facing device/account label from HELLO — distinct from `displayName`,
+// the app's own name — used to tell apart this install from a user's other
+// ones on the gallery-picker grid.
 bool ensurePeer(const uint8_t appId[kIdLen], const uint8_t installId[kIdLen], const char* displayName,
-                char keyOut[kPeerKeyLen]);
+                const char* userName, char keyOut[kPeerKeyLen]);
 
 // True if this peer already has an index entry — i.e. the user has confirmed a
 // pairing for it at some point.
@@ -178,6 +181,15 @@ size_t listImages(const char* peerKey, ImageEntry* out, size_t maxImages);
 
 // Display name from the index, or an empty string.
 std::string displayName(const char* peerKey);
+
+// User-facing device/account label from the index, or an empty string. See
+// ensurePeer()'s comment on how this differs from displayName().
+std::string userName(const char* peerKey);
+
+// True if this peer's UI declaration sets the image-gallery capability bit
+// (companionble::kUiCapabilityImageGallery) — i.e. it wants a tile in the
+// on-device gallery picker. False for a peer with no declaration at all.
+bool isImageCapable(const char* peerKey);
 
 // Marks the peer as most recently seen and evicts beyond kMaxPeers.
 void touch(const char* peerKey);

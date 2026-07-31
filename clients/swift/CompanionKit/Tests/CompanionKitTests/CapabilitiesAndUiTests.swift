@@ -75,7 +75,8 @@ final class UiDeclarationTests: XCTestCase {
         XCTAssertEqual(String(data: body[8 ..< 15], encoding: .utf8), "Shutter")
         XCTAssertEqual(body[15], 0, "a declaration with no tags still emits a zero count")
         XCTAssertEqual(body[16], 0, "bordered is the default render style")
-        XCTAssertEqual(body.count, 17)
+        XCTAssertEqual(body[17], 0, "no capabilities by default")
+        XCTAssertEqual(body.count, 18)
     }
 
     func testTagSectionLayout() {
@@ -91,17 +92,32 @@ final class UiDeclarationTests: XCTestCase {
         XCTAssertEqual(Array(body[13 ..< 15]), [9, 3])
         XCTAssertEqual(String(data: body[15 ..< 18], encoding: .utf8), "New")
         XCTAssertEqual(body[18], 0, "bordered is the default render style")
-        XCTAssertEqual(body.count, 19)
+        XCTAssertEqual(body[19], 0, "no capabilities by default")
+        XCTAssertEqual(body.count, 20)
     }
 
     func testTagRenderStyleByteIsTrailingAndOptIn() {
         let bordered = UiDeclaration(buttons: [], tags: [TagDeclaration(id: 0, label: "Saved")])
-        XCTAssertEqual(bordered.encodedBody().last, TagRenderStyle.bordered.rawValue)
+        let borderedBody = bordered.encodedBody()
+        XCTAssertEqual(borderedBody[borderedBody.count - 2], TagRenderStyle.bordered.rawValue)
 
         let plain = UiDeclaration(buttons: [], tags: [TagDeclaration(id: 0, label: "Saved")], tagRenderStyle: .plain)
-        XCTAssertEqual(plain.encodedBody().last, TagRenderStyle.plain.rawValue)
-        XCTAssertEqual(plain.encodedBody().count, bordered.encodedBody().count,
+        let plainBody = plain.encodedBody()
+        XCTAssertEqual(plainBody[plainBody.count - 2], TagRenderStyle.plain.rawValue)
+        XCTAssertEqual(plainBody.count, borderedBody.count,
                        "the style byte replaces nothing else in the body -- same shape, different trailing value")
+    }
+
+    func testCapabilitiesByteIsTrailingAfterStyle() {
+        let plain = UiDeclaration(buttons: [], tags: [TagDeclaration(id: 0, label: "Saved")])
+        XCTAssertEqual(plain.encodedBody().last, 0, "no capabilities by default")
+
+        let gallery = UiDeclaration(buttons: [], tags: [TagDeclaration(id: 0, label: "Saved")],
+                                    capabilities: .imageGallery)
+        let body = gallery.encodedBody()
+        XCTAssertEqual(body.last, PeerCapabilities.imageGallery.rawValue)
+        XCTAssertEqual(body.count, plain.encodedBody().count,
+                       "the capabilities byte replaces nothing else in the body -- same shape, different trailing value")
     }
 
     func testTagLabelsAreTruncatedOnAUTF8Boundary() {
@@ -223,6 +239,24 @@ final class IdentityTests: XCTestCase {
         XCTAssertEqual(first.installId, second.installId, "a new installId means a new peer and a re-pair")
         XCTAssertEqual(first.peerKey, second.peerKey)
         XCTAssertEqual(first.peerKey.count, 8)
+    }
+
+    func testUserNameDefaultsAndCanBeOverridden() {
+        // The iCloud key-value tier itself isn't exercised here — there's no
+        // iCloud container in a test executable, so loadOrCreateInstallId()
+        // always takes its local UserDefaults fallback, same as before this
+        // feature. This only covers userName's plumbing, not the sync path.
+        let defaults = UserDefaults(suiteName: "CompanionKitTests.identity.userName")!
+        defaults.removePersistentDomain(forName: "CompanionKitTests.identity.userName")
+
+        let overridden = CompanionIdentity(appId: UUID(), displayName: "Test", userName: "Rainer's iPad",
+                                           defaults: defaults)
+        XCTAssertEqual(overridden.userName, "Rainer's iPad")
+
+        let explicit = CompanionIdentity(appId: Data(repeating: 1, count: 16),
+                                         installId: Data(repeating: 2, count: 16),
+                                         displayName: "Test")
+        XCTAssertEqual(explicit.userName, "", "userName defaults to empty on the byte-level initializer")
     }
 
     func testTokenStoreRoundTripsPerDevice() {

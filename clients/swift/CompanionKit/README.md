@@ -1,6 +1,6 @@
 # CompanionKit
 
-The Swift client for the Companion Display Protocol v6 — the BLE contract between an iOS app and an
+The Swift client for the Companion Display Protocol v8 — the BLE contract between an iOS app and an
 Xteink e-ink companion display running this firmware.
 
 It lives in the firmware repo on purpose. The protocol is the product; a client that ships alongside
@@ -15,7 +15,9 @@ If this package and that document disagree, the document is right.
 - Discovery and connection (`CBCentralManager` filtered on the service UUID).
 - The full `HELLO` handshake: pairing prompt, token enrollment, token persistence, and reconnecting
   silently afterwards.
-- `appId` / `installId` management, with the install id minted once into `UserDefaults`.
+- `appId` / `installId` management, with the install id minted once (see "iCloud" above for how it's
+  shared across a user's own devices) and a `userName` label for telling those devices apart on the
+  companion device's gallery picker.
 - Asset digests: compares the digests the device reports against your UI declaration and icon, and
   pushes only what changed.
 - `ACQUIRE` / `RELEASE` as explicit calls — see "Screen ownership is not app
@@ -46,6 +48,15 @@ just larger.
 
 iOS 15+ / macOS 12+. No third-party dependencies. Your app needs
 `NSBluetoothAlwaysUsageDescription` in its Info.plist.
+
+**Optional: iCloud, for treating a user's own devices as one.** By default, `CompanionIdentity` mints
+`installId` into `NSUbiquitousKeyValueStore` as well as `UserDefaults`, and `KeychainTokenStore`
+enables `kSecAttrSynchronizable` — together, an iPhone and an iPad signed into the same iCloud account
+converge on the same `installId` and pairing token, so the companion device treats them as one peer
+(one gallery, no repeat pairing prompt) instead of two. This needs the app's **iCloud → Key-value
+storage** capability enabled in Xcode; without it, `NSUbiquitousKeyValueStore` degrades silently (no
+crash, just no sync) and behavior is exactly the old per-device-only default. Nothing to do if you
+don't want this: it costs nothing to leave unconfigured.
 
 ## Integrating
 
@@ -152,8 +163,11 @@ settle. That slowness is wanted, not a defect to design around.
 ## Things that will bite you
 
 - **`installId` must persist.** Regenerating it makes a new peer: a new pairing prompt, a new
-  directory on the device, and the assets pushed again. The default `UserDefaults` storage handles
-  this; if you supply your own, do not lose it across launches.
+  directory on the device, and the assets pushed again. The default storage handles this; if you
+  supply your own, do not lose it across launches. Reinstalling the app *also* regenerates it, unless
+  the app has the iCloud capability described above enabled, in which case a reinstall on a device
+  still signed into the same account recovers the same `installId` — and with it, the same gallery on
+  the companion device.
 - **A UI declaration is mandatory.** The device rejects `ACQUIRE` from a peer that has not declared
   what its buttons do. There is no default. This package pushes yours automatically, but you must
   supply one.

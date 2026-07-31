@@ -49,6 +49,11 @@ constexpr int kMaxTitleLines = 2;
 constexpr int kIconGridColumns = 6;
 constexpr int kIconGridGap = 24;
 
+// Same grid, but for the interactive gallery picker (renderGalleryPicker()):
+// extra vertical room per row for the per-tile user/app-name label drawn
+// below each icon, which the plain decorative grid doesn't need.
+constexpr int kGalleryPickerRowGap = kIconGridGap + 20;
+
 // Sleeping-indicator geometry: bottom-left corner, same footprint text mode's
 // battery percentage occupies, sized as a small square rather than a bitmap
 // (no ready-made small "sleeping" glyph exists in the icon set — see the
@@ -378,8 +383,13 @@ void CompanionModeActivity::loadUiDeclaration() {
   // that ended after its tags — means Bordered, already set by
   // clearUiDeclaration() above. An out-of-range value is treated the same way
   // rather than trusted verbatim.
-  if (offset < len && raw[offset] <= static_cast<uint8_t>(companionble::TagRenderStyle::Plain)) {
-    tagRenderStyle = raw[offset];
+  if (offset < len) {
+    if (raw[offset] <= static_cast<uint8_t>(companionble::TagRenderStyle::Plain)) {
+      tagRenderStyle = raw[offset];
+    }
+    ++offset;  // advance past it regardless of validity, so a further trailing
+               // byte (e.g. the capabilities bitmask read separately by
+               // companionpeer::isImageCapable()) is never mistaken for this one.
   }
 
   // Restore state for every tag that still exists. A tag the new declaration
@@ -624,6 +634,13 @@ void CompanionModeActivity::checkIdleTimers() {
     return;
   }
 
+  if (screen == Screen::Message && millis() > transientMessageUntilMs) {
+    RenderLock lock;
+    screen = transientMessageReturnScreen;
+    requestUpdate();
+    return;
+  }
+
   if (idleSinceMs == 0) return;
   if (millis() - idleSinceMs < kWaitingIdleSleepMs) return;
 
@@ -683,7 +700,9 @@ void CompanionModeActivity::applyForegroundChange() {
     if (!haveContent && screen != Screen::Image) chooseIdleScreen();
   } else {
     // A different app took the screen: clear whatever the previous one left,
-    // since the device retains no content for a background session.
+    // since the device retains no content for a background session. That
+    // includes any gallery being browsed locally through the picker — a live
+    // app taking the screen always wins over firmware-local browsing.
     idleSinceMs = 0;
     title.clear();
     body.clear();
@@ -694,6 +713,9 @@ void CompanionModeActivity::applyForegroundChange() {
     displayedImagePath.clear();
     galleryImages.clear();
     galleryIndex = 0;
+    browsingPeerKey.clear();
+    galleryPickerBrowsing = false;
+    foregroundPushedImageThisSession = false;
     updateTitleLayout();
     screen = Screen::Text;
   }
@@ -734,34 +756,38 @@ void CompanionModeActivity::handlePendingImage(const std::string& stagedPath, co
 
   RenderLock lock;
   displayedImagePath = path;
+  foregroundPushedImageThisSession = true;
+  galleryPickerBrowsing = false;  // a live push always wins over picker browsing
+  browsingPeerKey.clear();
   refreshGalleryForForeground();
   screen = Screen::Image;
   requestUpdate();
 }
 
-// Rebuilds the in-memory gallery list from the foreground peer's stored
-// images and points galleryIndex at whichever one is currently displayed.
-// Called whenever a new image is committed; the list itself lives on SD
-// (CompanionPeerStore), so this is just re-reading a few dozen bytes of JSON,
-// not holding a second copy of anything image-sized.
-void CompanionModeActivity::refreshGalleryForForeground() {
+// Rebuilds the in-memory gallery list from a peer's stored images and points
+// galleryIndex/displayedImagePath at the most recent one. The list itself
+// lives on SD (CompanionPeerStore), so this is just re-reading a few dozen
+// bytes of JSON, not holding a second copy of anything image-sized. Used both
+// for the foreground peer (via refreshGalleryForForeground(), below) and for
+// an arbitrary peer selected through the gallery picker or the disconnect
+// fallback — browsing a peer's gallery is a local SD read, independent of
+// whether that peer has a live BLE session at all.
+void CompanionModeActivity::loadGalleryForPeer(const std::string& peerKey) {
   galleryImages.clear();
   galleryIndex = 0;
-  if (foregroundPeerKey.empty()) return;
+  if (peerKey.empty()) return;
 
   companionpeer::ImageEntry entries[companionpeer::kMaxImagesPerPeer];
-  const size_t count =
-      companionpeer::listImages(foregroundPeerKey.c_str(), entries, companionpeer::kMaxImagesPerPeer);
+  const size_t count = companionpeer::listImages(peerKey.c_str(), entries, companionpeer::kMaxImagesPerPeer);
   galleryImages.reserve(count);
   for (size_t i = 0; i < count; ++i) galleryImages.push_back(entries[i].path);
-
-  for (size_t i = 0; i < galleryImages.size(); ++i) {
-    if (galleryImages[i] == displayedImagePath) {
-      galleryIndex = i;
-      break;
-    }
+  if (!galleryImages.empty()) {
+    galleryIndex = galleryImages.size() - 1;
+    displayedImagePath = galleryImages[galleryIndex];
   }
 }
+
+void CompanionModeActivity::refreshGalleryForForeground() { loadGalleryForPeer(foregroundPeerKey); }
 
 // Redraws the image at `index` in the current gallery without touching BLE:
 // this is firmware-local browsing of already-pushed images, not new content.
@@ -815,6 +841,122 @@ bool CompanionModeActivity::handleGalleryNav() {
 }
 
 // ---------------------------------------------------------------------------
+// Gallery picker
+// ---------------------------------------------------------------------------
+
+// Puts a short line on screen for a few seconds, then reverts to `returnTo`.
+// checkIdleTimers() (polled every loop()) is what actually reverts it.
+void CompanionModeActivity::showTransientMessage(const std::string& text, Screen returnTo, unsigned long durationMs) {
+  RenderLock lock;
+  transientMessage = text;
+  transientMessageReturnScreen = returnTo;
+  transientMessageUntilMs = millis() + durationMs;
+  screen = Screen::Message;
+  requestUpdate();
+}
+
+// Confirm on the idle icon grid. Builds pickerPeerKeys from every enrolled
+// peer (companionpeer::listPeers() — ungrouped, unlike the decorative grid's
+// listIconTiles(), since two installs of the same app must stay two separate
+// tiles here) that declared the image-gallery capability, capped at
+// kMaxIconTiles the same as the decorative grid's tile budget. Falls back to
+// a transient message rather than entering an empty picker.
+void CompanionModeActivity::enterGalleryPicker() {
+  char keys[companionpeer::kMaxPeers][companionpeer::kPeerKeyLen];
+  const size_t total = companionpeer::listPeers(keys, companionpeer::kMaxPeers);
+
+  pickerPeerKeys.clear();
+  for (size_t i = 0; i < total && pickerPeerKeys.size() < companionpeer::kMaxIconTiles; ++i) {
+    if (companionpeer::isImageCapable(keys[i])) pickerPeerKeys.emplace_back(keys[i]);
+  }
+
+  if (pickerPeerKeys.empty()) {
+    showTransientMessage(tr(STR_COMPANION_NO_GALLERY_APPS), Screen::IconGrid);
+    return;
+  }
+
+  RenderLock lock;
+  pickerCursor = 0;
+  screen = Screen::GalleryPicker;
+  requestUpdate();
+}
+
+// Confirm on the picker grid: load the highlighted peer's stored gallery —
+// purely a local SD read, no BLE involved regardless of whether that peer is
+// currently connected — and show it, or say there's nothing to show yet.
+void CompanionModeActivity::selectGalleryPickerPeer() {
+  if (pickerCursor >= pickerPeerKeys.size()) return;
+  const std::string peerKey = pickerPeerKeys[pickerCursor];
+  loadGalleryForPeer(peerKey);
+
+  if (galleryImages.empty()) {
+    showTransientMessage(tr(STR_COMPANION_GALLERY_EMPTY), Screen::GalleryPicker);
+    return;
+  }
+
+  RenderLock lock;
+  browsingPeerKey = peerKey;
+  galleryPickerBrowsing = true;
+  screen = Screen::Image;
+  requestUpdate();
+}
+
+// Input for the picker itself and for leaving a gallery reached through it.
+// Tried before the foreground-button dispatch in loop(), same as
+// handleGalleryNav() — these are firmware-owned screens/modes with no
+// foreground peer's button map to defer to (most peers in the picker have no
+// live session at all).
+bool CompanionModeActivity::handlePickerInput() {
+  if (screen == Screen::IconGrid) {
+    if (buttonWasPressed(MappedInputManager::Button::Confirm, companionble::ButtonId::Confirm)) {
+      enterGalleryPicker();
+      return true;
+    }
+    return false;
+  }
+
+  if (screen == Screen::GalleryPicker) {
+    if (pickerPeerKeys.empty()) return false;  // defensive; enterGalleryPicker() never leaves this empty
+    if (buttonWasPressed(MappedInputManager::Button::Up, companionble::ButtonId::Up)) {
+      RenderLock lock;
+      pickerCursor = pickerCursor == 0 ? pickerPeerKeys.size() - 1 : pickerCursor - 1;
+      requestUpdate();
+      return true;
+    }
+    if (buttonWasPressed(MappedInputManager::Button::Down, companionble::ButtonId::Down)) {
+      RenderLock lock;
+      pickerCursor = pickerCursor + 1 >= pickerPeerKeys.size() ? 0 : pickerCursor + 1;
+      requestUpdate();
+      return true;
+    }
+    if (buttonWasPressed(MappedInputManager::Button::Confirm, companionble::ButtonId::Confirm)) {
+      selectGalleryPickerPeer();
+      return true;
+    }
+    if (buttonWasPressed(MappedInputManager::Button::Back, companionble::ButtonId::Back)) {
+      RenderLock lock;
+      screen = Screen::IconGrid;
+      requestUpdate();
+      return true;
+    }
+    return false;
+  }
+
+  if (screen == Screen::Image && galleryPickerBrowsing) {
+    if (buttonWasPressed(MappedInputManager::Button::Back, companionble::ButtonId::Back)) {
+      RenderLock lock;
+      screen = Screen::GalleryPicker;
+      galleryPickerBrowsing = false;
+      requestUpdate();
+      return true;
+    }
+    return false;
+  }
+
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
 
@@ -837,6 +979,30 @@ void CompanionModeActivity::loop() {
     RenderLock lock;
     connected = nowConnected;
     if (!connected) {
+      // If the peer that just lost the link is image-capable and never
+      // pushed anything this session, its own gallery is more useful than an
+      // empty "waiting" screen or holding nothing until the idle timeout —
+      // jump straight to it. A peer that did push content keeps that content
+      // up, same as always (the branch below still applies).
+      if (!foregroundPeerKey.empty() && !foregroundPushedImageThisSession &&
+          companionpeer::isImageCapable(foregroundPeerKey.c_str())) {
+        loadGalleryForPeer(foregroundPeerKey);
+        if (!galleryImages.empty()) {
+          browsingPeerKey = foregroundPeerKey;
+          galleryPickerBrowsing = true;
+          screen = Screen::Image;
+        } else {
+          // Inlined rather than calling showTransientMessage(): that helper
+          // takes its own RenderLock, and this block already holds one —
+          // nesting would deadlock (see RenderLock.h; the underlying
+          // semaphore is not recursive).
+          transientMessage = tr(STR_COMPANION_GALLERY_EMPTY);
+          transientMessageReturnScreen = Screen::IconGrid;
+          transientMessageUntilMs = millis() + 3000;
+          screen = Screen::Message;
+        }
+      }
+
       // Content is deliberately NOT cleared here. The last thing pushed stays on
       // screen until the idle timeout takes it to the sleep grid.
       idleSinceMs = millis();
@@ -977,9 +1143,12 @@ void CompanionModeActivity::loop() {
       haveContent = true;
     }
     // Text replaces an image, and vice versa. There is no compositing and no
-    // mode to enter: the last completed push owns the screen.
+    // mode to enter: the last completed push owns the screen. That includes
+    // replacing a gallery being browsed locally through the picker.
     screen = Screen::Text;
     displayedImagePath.clear();
+    galleryPickerBrowsing = false;
+    browsingPeerKey.clear();
     requestUpdate();
   }
 
@@ -1043,6 +1212,12 @@ void CompanionModeActivity::loop() {
   // loadUiDeclaration()), so the "don't steal a claimed button" gate keeps
   // working the same whether or not that peer is still connected.
   handleGalleryNav();
+
+  // Same reasoning as handleGalleryNav() above: the icon grid, the gallery
+  // picker, and a gallery reached through it are all firmware-owned screens
+  // with no foreground peer's button map to defer to, so this is tried
+  // regardless of whether foregroundPeerKey is empty.
+  if (handlePickerInput()) return;
 
   if (foregroundPeerKey.empty()) return;  // no app owns the buttons
 
@@ -1161,12 +1336,16 @@ const char* CompanionModeActivity::screenName() const {
       return "waiting";
     case Screen::IconGrid:
       return "icon_grid";
+    case Screen::GalleryPicker:
+      return "gallery_picker";
     case Screen::Pairing:
       return "pairing";
     case Screen::Text:
       return haveContent ? "text" : "waiting_app";
     case Screen::Image:
       return "image";
+    case Screen::Message:
+      return "message";
   }
   return "?";
 }
@@ -1250,6 +1429,9 @@ void CompanionModeActivity::render(RenderLock&&) {
     case Screen::IconGrid:
       renderIconGrid();
       break;
+    case Screen::GalleryPicker:
+      renderGalleryPicker();
+      break;
     case Screen::Image:
       renderImage();
       break;
@@ -1262,6 +1444,9 @@ void CompanionModeActivity::render(RenderLock&&) {
       break;
     case Screen::Waiting:
       renderWaiting();
+      break;
+    case Screen::Message:
+      renderTransientMessage();
       break;
   }
 }
@@ -1354,6 +1539,86 @@ void CompanionModeActivity::renderIconGrid(bool inverted, const char* label) {
   }
 
   if (inverted) renderer.invertScreen();
+  renderer.displayBuffer();
+}
+
+// The interactive counterpart to renderIconGrid(): one tile per peer that
+// declared the image-gallery capability (pickerPeerKeys, built once in
+// enterGalleryPicker() — not grouped by appId, unlike the decorative grid,
+// since two installs of the same app have two separate galleries and must
+// stay two separate tiles). A thick outline marks the cursor; the existing
+// thin "currently connected" marker still applies if that peer also happens
+// to hold a live session. A short label under each tile (userName falling
+// back to displayName) is what actually tells two installs of the same app
+// apart, since their icon and app name alone would be identical.
+void CompanionModeActivity::renderGalleryPicker() {
+  const size_t count = pickerPeerKeys.size();
+  if (count == 0) {
+    // Shouldn't happen — enterGalleryPicker() only switches to this screen
+    // when pickerPeerKeys is non-empty — but fail safe rather than draw an
+    // empty grid.
+    chooseIdleScreen();
+    renderIconGrid();
+    return;
+  }
+
+  const int tile = companionble::kIconWidthPx;
+  const int columns = std::min<int>(kIconGridColumns, static_cast<int>(count));
+  const int rows = static_cast<int>((count + columns - 1) / columns);
+  const int gridWidth = columns * tile + (columns - 1) * kIconGridGap;
+  const int gridHeight = rows * tile + (rows - 1) * kGalleryPickerRowGap;
+  const int originX = (renderer.getScreenWidth() - gridWidth) / 2;
+  const int originY = (renderer.getScreenHeight() - gridHeight) / 2;
+
+  // One 512-byte stack buffer, reused for every tile, same as renderIconGrid().
+  uint8_t bitmap[companionble::kIconBytes];
+  const int bytesPerRow = companionble::kIconWidthPx / 8;
+
+  for (size_t i = 0; i < count; ++i) {
+    const int column = static_cast<int>(i) % columns;
+    const int row = static_cast<int>(i) / columns;
+    const int x0 = originX + column * (tile + kIconGridGap);
+    const int y0 = originY + row * (tile + kGalleryPickerRowGap);
+    const char* key = pickerPeerKeys[i].c_str();
+
+    if (companionpeer::readAssetBody(key, companionpeer::kAssetIcon, bitmap, sizeof(bitmap)) == sizeof(bitmap)) {
+      for (int y = 0; y < companionble::kIconHeightPx; ++y) {
+        for (int x = 0; x < companionble::kIconWidthPx; ++x) {
+          const uint8_t byte = bitmap[y * bytesPerRow + (x / 8)];
+          if (byte & (0x80 >> (x % 8))) renderer.drawPixel(x0 + x, y0 + y, true);
+        }
+      }
+    }
+
+    if (!foregroundPeerKey.empty() && foregroundPeerKey == key) {
+      renderer.drawRect(x0 - 4, y0 - 4, tile + 8, tile + 8, true);
+    }
+    if (i == pickerCursor) {
+      renderer.drawRect(x0 - 7, y0 - 7, tile + 14, tile + 14, 3, true);
+    }
+
+    std::string label = companionpeer::userName(key);
+    if (label.empty()) label = companionpeer::displayName(key);
+    if (!label.empty()) {
+      // Not pixel-measured against the tile width — just a byte-length cap,
+      // truncated on a UTF-8 boundary like every other label in this file, so
+      // two adjacent tiles' labels don't run into each other.
+      constexpr size_t kMaxLabelBytes = 10;
+      if (label.size() > kMaxLabelBytes) {
+        size_t cut = kMaxLabelBytes;
+        while (cut > 0 && (static_cast<uint8_t>(label[cut]) & 0xC0) == 0x80) --cut;
+        label.resize(cut);
+      }
+      renderer.drawText(SMALL_FONT_ID, x0, y0 + tile + 10, label.c_str(), true);
+    }
+  }
+
+  renderer.displayBuffer();
+}
+
+void CompanionModeActivity::renderTransientMessage() {
+  renderer.drawCenteredText(kCompanionFontId, renderer.getScreenHeight() / 2, transientMessage.c_str(), true,
+                            EpdFontFamily::BOLD);
   renderer.displayBuffer();
 }
 

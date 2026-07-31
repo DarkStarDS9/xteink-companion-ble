@@ -20,7 +20,8 @@ final class SessionCodecTests: XCTestCase {
         XCTAssertEqual(Data(hello[19 ..< 35]), installId)
         XCTAssertEqual(hello[35], 0)                                  // tokenLen
         XCTAssertEqual(hello[36], 8)                                  // nameLen
-        XCTAssertEqual(String(data: hello[37...], encoding: .utf8), "Snap2Ink")
+        XCTAssertEqual(String(data: hello[37 ..< 45], encoding: .utf8), "Snap2Ink")
+        XCTAssertEqual(hello[45], 0)                                  // userNameLen (defaults empty)
     }
 
     func testHelloWithTokenLayout() {
@@ -34,7 +35,8 @@ final class SessionCodecTests: XCTestCase {
         XCTAssertEqual(hello[35], 16)
         XCTAssertEqual(Data(hello[36 ..< 52]), token)
         XCTAssertEqual(hello[52], 0)                                  // empty name
-        XCTAssertEqual(hello.count, 53)
+        XCTAssertEqual(hello[53], 0)                                  // empty userName
+        XCTAssertEqual(hello.count, 54)
     }
 
     func testWrongLengthTokenIsSentAsNoToken() {
@@ -58,6 +60,20 @@ final class SessionCodecTests: XCTestCase {
         let nameLen = Int(hello[36])
         XCTAssertLessThanOrEqual(nameLen, SessionCodec.maxNameBytes)
         XCTAssertNotNil(String(data: hello[37...], encoding: .utf8), "truncation must not split a codepoint")
+    }
+
+    func testUserNameIsAppendedAfterDisplayName() {
+        let hello = SessionCodec.encodeHello(helloTag: 1,
+                                             appId: appId,
+                                             installId: installId,
+                                             token: nil,
+                                             displayName: "Snap2Ink",
+                                             userName: "Rainer's iPad")
+
+        XCTAssertEqual(hello[36], 8)                                  // nameLen
+        XCTAssertEqual(String(data: hello[37 ..< 45], encoding: .utf8), "Snap2Ink")
+        XCTAssertEqual(hello[45], 13)                                 // userNameLen
+        XCTAssertEqual(String(data: hello[46...], encoding: .utf8), "Rainer's iPad")
     }
 
     // MARK: Simple opcodes

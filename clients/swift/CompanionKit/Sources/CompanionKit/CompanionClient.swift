@@ -400,7 +400,8 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
                                                        appId: self.identity.appId,
                                                        installId: self.identity.installId,
                                                        token: storedToken,
-                                                       displayName: self.identity.displayName))
+                                                       displayName: self.identity.displayName,
+                                                       userName: self.identity.userName))
         }
 
         guard case let .helloOK(_, session, token, assetTags) = reply else {

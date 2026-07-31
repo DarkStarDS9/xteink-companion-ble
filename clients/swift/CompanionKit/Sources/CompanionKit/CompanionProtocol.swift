@@ -140,6 +140,22 @@ public enum TagRenderStyle: UInt8, Sendable {
     case plain = 0x01
 }
 
+/// What this peer's app can do beyond title/body, declared as a trailing
+/// bitmask on the UI declaration (right after ``TagRenderStyle``). Every
+/// client in this repo emits this byte unconditionally, even when empty — see
+/// ``UiDeclaration/encodedBody()``.
+public struct PeerCapabilities: OptionSet, Sendable {
+    public let rawValue: UInt8
+    public init(rawValue: UInt8) { self.rawValue = rawValue }
+
+    /// This app pushes photos (content field `0x04`) and wants a tile in the
+    /// on-device gallery picker. Declared, not inferred from having pushed an
+    /// image before — an app that supports photos but hasn't pushed one yet
+    /// still belongs in the picker, showing "no images yet" rather than being
+    /// invisible.
+    public static let imageGallery = PeerCapabilities(rawValue: 1 << 0)
+}
+
 public enum CompanionTagLimits {
     /// Tags past this many are dropped by the device.
     public static let maxTags = 6

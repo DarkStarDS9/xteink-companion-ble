@@ -34,11 +34,11 @@ this document disagree, the firmware is wrong.
 > or tag has crossed the link. The device boots, advertises and answers serial
 > commands; that is the whole of what has been confirmed.
 >
-> The cause is environmental, not technical: macOS refuses Bluetooth
-> authorization to the automation process, so the test harness that would
-> exercise all of it has never run. See "Manual verification checklist" at the
-> end of this document — 36 items, all open — and
-> `docs/companion-test-console.md` for how to run them.
+> BLE itself works fine on this development machine — the gap is that the
+> automated test harness that would exercise the checklist below has not been
+> run yet. See "Manual verification checklist" at the end of this document —
+> 36 items, all open — and `docs/companion-test-console.md` for how to run
+> them.
 >
 > **`docs/companion-mode-implementation-notes.md` § "v6 bring-up log" is the
 > single authoritative answer** to what has and has not been proven, with the
@@ -269,17 +269,18 @@ again.
 notifications **before** writing `HELLO`. Every message is a single write or a
 single notification — this characteristic is never chunked.
 
-`HELLO` (up to 76 bytes) and `HELLO_OK` (up to 30 bytes) exceed BLE's minimum
-MTU, so a handshake needs an ATT MTU of at least 80. The device requests 185
+`HELLO` (up to 101 bytes) and `HELLO_OK` (up to 30 bytes) exceed BLE's minimum
+MTU, so a handshake needs an ATT MTU of at least 105. The device requests 185
 and both iOS and Android negotiate well above the floor in practice; a central
-that cannot get past 23 cannot use v6 at all.
+that cannot get past 23 cannot use v8 at all.
 
 ### Phone → device (write)
 
 ```
 0x01 HELLO      helloTag[2]  appId[16]  installId[16]
-                tokenLen:1  token[tokenLen]   (tokenLen 0 or 16)
-                nameLen:1   name[nameLen]     (UTF-8, <= 24 bytes, may be empty)
+                tokenLen:1  token[tokenLen]         (tokenLen 0 or 16)
+                nameLen:1   name[nameLen]           (UTF-8, <= 24 bytes, may be empty)
+                userNameLen:1  userName[userNameLen] (UTF-8, <= 24 bytes, may be empty)
 0x02 BYE        sessionId
 0x03 ACQUIRE    sessionId
 0x04 RELEASE    sessionId
@@ -288,6 +289,16 @@ that cannot get past 23 cannot use v6 at all.
 `name` is the display name shown on the pairing prompt and the "waiting for
 <app>" screen — the app's user-visible name ("Snap2Ink"), not the peer's.
 Longer names are truncated to 24 bytes on a UTF-8 boundary.
+
+`userName` is a separate, user-facing label for *this install* — e.g. which of
+the user's own devices/accounts this is — distinct from `name`, the app's own
+name. It exists so two installs of the same app (an iPhone and an iPad, say)
+don't look identical on the gallery picker (see "On-screen behaviour" below):
+same icon, same app name, but a different `userName` underneath. Resent on
+every `HELLO`, including reconnects, so it stays current with no digest or
+re-pairing needed — the same "just resend it" treatment as `name`. Same 24-byte
+UTF-8-boundary truncation. May be empty, in which case the picker falls back to
+the peer's `name`.
 
 `BYE` destroys the session (and drops the foreground if it held it) without
 disconnecting the link. Optional — disconnecting has the same effect. Useful
@@ -669,6 +680,7 @@ M x {  tagId    : 1
        label    : labelLen bytes, UTF-8  }
 
 byte         tag render style           <- optional; absent means BORDERED
+byte         capabilities bitmask       <- optional; absent means none set
 ```
 
 **Why one asset and not two.** Buttons and tags are the same kind of thing — near
@@ -777,6 +789,27 @@ it (end the declaration after the tag list, as before) and the device treats
 that peer as `BORDERED`. An out-of-range byte is treated the same as absent.
 This is a per-peer, whole-row choice — there is no way to mix styles within one
 app's tag row.
+
+**Capabilities.** One more optional trailing byte, after the tag render style
+byte, declaring what this peer's app can do beyond title/body:
+
+```
+bit0  IMAGE_GALLERY   this app pushes photos (field 0x04) and wants a tile in
+                       the on-device gallery picker — see "On-screen
+                       behaviour" below. Every other bit is reserved.
+```
+
+Same "ran out of buffer" absence convention as the style byte, and the two are
+positional, not tagged: a declaration that wants capabilities but not a custom
+style must still send the (default) style byte first. Every client in this
+repo emits both bytes unconditionally for exactly this reason — there's no
+reason to omit either once you're sending one.
+
+This is deliberately a capability, not something the device infers from
+whether a peer happens to have pushed an image before: an app that supports
+photos but hasn't pushed one yet (e.g. just after pairing) still belongs in
+the picker, so the user can see that it has no photos yet rather than the app
+being invisible until its first push.
 
 Max 512 bytes total for the whole declaration, which is far more than 7 buttons
 and 6 tags need.
@@ -934,12 +967,13 @@ string or a short opaque token. Treat 32 bytes as the contract.
 ## Capability characteristic — introspection
 
 A single read-only value clients query instead of hardcoding assumptions about
-the device. **23 bytes**, unchanged in layout since v6 — v7 only bumped the
-version number itself (byte 0) because field `0x04`'s payload format changed;
-see "v7 changes from v6":
+the device. **23 bytes**, unchanged in layout since v6 — v7 and v8 each only
+bumped the version number itself (byte 0), for field `0x04`'s payload format
+change and the `HELLO`/UI-declaration additions respectively; see "v7 changes
+from v6" and "v8 changes from v7":
 
 ```
-byte 0        protocol version = 7
+byte 0        protocol version = 8
 byte 1        screen width in characters, at the font Companion Mode uses
 byte 2        screen height in characters (lines per page)
 bytes 3..4    max text field length, uint16 LE — title/body only
@@ -1010,11 +1044,35 @@ Not wire format, but client-visible, and decided here so apps can rely on it:
 - **Foreground app disconnects** — the device **holds the last content on
   screen**, then falls through to the sleep/icon screen on the existing idle
   timeout (5 minutes). It does not blank on disconnect. A photo stays a photo;
-  an article stays readable after the phone walks away.
+  an article stays readable after the phone walks away. **Exception:** if the
+  disconnecting peer declared the `IMAGE_GALLERY` capability (see "UI
+  declaration field" above) and never pushed an image during that session, the
+  device shows that peer's own stored gallery immediately instead of waiting
+  out the idle timeout — an empty "waiting" screen or stale prior content is
+  less useful than photos the app already pushed in an earlier session. If it
+  has no stored images either, a brief "No images yet" message is shown before
+  falling through to the icon grid as usual.
 - **No peer has ever paired** — "Waiting for phone".
 - **Paired peers exist, none connected, idle timeout elapsed** — the icon grid.
 - **A session holds the foreground but has pushed nothing** — "Waiting for
   `<name>`", using that peer's display name.
+- **Gallery picker** — pressing CONFIRM on the icon grid enters an interactive
+  picker over every enrolled peer that declared `IMAGE_GALLERY`, most recently
+  seen first (not grouped by `appId`, unlike the icon grid: two installs of
+  the same app have two separate galleries and stay two separate tiles, each
+  labelled with `userName` — see "Phone → device (write)" above — falling
+  back to `name`). UP/DOWN move the cursor, CONFIRM loads the highlighted
+  peer's stored gallery (a local SD read — the peer need not be currently
+  connected), BACK returns to the icon grid. If no peer has declared the
+  capability, CONFIRM on the icon grid shows a brief "No photo apps paired
+  yet" message instead of entering an empty picker. If the selected peer has
+  no stored images, a brief "No images yet" message is shown and the picker
+  stays up. None of this involves the phone or any wire message — it is
+  firmware-local browsing of already-pushed photos, the same "dumb firmware"
+  local browsing as the existing UP/DOWN image-gallery navigation described
+  under "UI declaration field" above, just entered a different way. It is
+  *not* a launcher: the device cannot and does not start anything on the
+  phone.
 
 ### Deep sleep and boot
 
@@ -1045,7 +1103,7 @@ means:
 
 ```
 /.crosspoint/companion/
-  peers.json                 index: peerKey -> { appId, installId, displayName, lastSeenMs }
+  peers.json                 index: peerKey -> { appId, installId, displayName, userName, lastSeenMs }
   peers/<peerKey>/
     token.bin                16-byte pairing token
     icon.bin                 1-bpp sleep-screen icon
@@ -1062,6 +1120,27 @@ growth would make `peers.json` unbounded, and it is parsed into RAM.
 ---
 
 ## Version history
+
+### v8 changes from v7 — **breaking**
+
+1. **`HELLO` gains `userNameLen`/`userName`**, appended after `name`. See
+   "Phone → device (write)" above. A v7 `HELLO` is one field short of what v8
+   expects — this is why the bump is breaking rather than additive, even
+   though it is the last field on the message.
+2. **UI declaration gains an optional trailing capabilities byte**, after the
+   tag render style byte — see "UI declaration field" above. Additive on its
+   own (optional, absent-safe), bundled into this version bump because it
+   ships alongside the `HELLO` change.
+3. **Capability byte 0 bumped from 7 to 8.** No other capability bytes moved.
+4. New on-device feature, no wire surface of its own beyond the two additions
+   above: the gallery picker (see "On-screen behaviour").
+
+Why: the gallery picker (an interactive grid over paired photo apps' stored
+galleries — see "On-screen behaviour") needs a way to tell two installs of the
+same app apart on screen, which `name` alone can't do since it's the app's own
+name, identical across installs. `userName` is that per-install label.
+Bundling the capabilities byte into the same bump avoided a third protocol
+revision for two features that landed together.
 
 ### v7 changes from v6 — **breaking**
 
@@ -1275,3 +1354,39 @@ Power and recovery:
     (not stuck on a waiting screen).
 36. Confirm free heap after a full pair → push → image → disconnect cycle
     returns to its pre-session value (no leak across sessions).
+
+Gallery picker (new in v8):
+
+37. Pair an app that does not declare `IMAGE_GALLERY`: on the idle icon grid,
+    press CONFIRM and confirm a brief "No photo apps paired yet" message
+    appears instead of a picker grid.
+38. Pair an app that declares `IMAGE_GALLERY` but has not pushed a `HELLO`
+    with a `userName`: confirm its picker tile falls back to `name`.
+39. Pair the same `IMAGE_GALLERY` app twice with two different `installId`s
+    and two different `userName`s: confirm the icon grid still shows one tile
+    (grouped by `appId`, unchanged), but the gallery picker shows two separate
+    tiles, each labelled with its own `userName`.
+40. With at least one `IMAGE_GALLERY` peer paired but never having pushed an
+    image: enter the picker, select its tile, and confirm a brief "No images
+    yet" message appears and the picker stays up (not the icon grid).
+41. Push a few images to an `IMAGE_GALLERY` peer, disconnect, reconnect a
+    different (or no) app so it's no longer foreground, then open the picker
+    and select that peer: confirm its stored gallery loads and UP/DOWN page
+    through it, matching the existing image-gallery navigation.
+42. From a gallery reached through the picker, press BACK: confirm it returns
+    to the picker grid (not the icon grid or a blank screen), with the cursor
+    on the same tile as before.
+43. While an `IMAGE_GALLERY` peer holds the foreground and has pushed at least
+    one image this session, disconnect it: confirm the existing hold-last-
+    content behaviour applies (no jump to its gallery — the "never pushed an
+    image this session" exception does not apply here).
+44. While an `IMAGE_GALLERY` peer holds the foreground and has pushed nothing
+    this session, disconnect it: confirm the device jumps straight to that
+    peer's stored gallery (if it has one) instead of showing "Waiting for
+    phone" or holding stale content until the idle timeout.
+45. Repeat the above with a peer that has no stored images at all: confirm a
+    brief "No images yet" message, then the icon grid.
+46. While browsing a gallery reached through the picker (peer not currently
+    connected), have a *different*, currently-foreground app push new
+    content: confirm the new content takes the screen immediately, same as it
+    would over the plain icon grid.

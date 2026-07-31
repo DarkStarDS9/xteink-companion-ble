@@ -229,6 +229,7 @@ struct PendingPairing {
   uint8_t appId[companionpeer::kIdLen] = {0};
   uint8_t installId[companionpeer::kIdLen] = {0};
   char name[companionpeer::kMaxNameLen + 1] = {0};
+  char userName[companionpeer::kMaxNameLen + 1] = {0};
 };
 PendingPairing g_pendingPairing;
 
@@ -431,7 +432,7 @@ void computeCapabilityValue(const GfxRenderer& renderer, int fontId) {
   const uint64_t mac = ESP.getEfuseMac();
 
   size_t offset = 0;
-  g_capabilityValue[offset++] = 6;  // protocol version
+  g_capabilityValue[offset++] = 8;  // protocol version
   g_capabilityValue[offset++] = static_cast<uint8_t>(screenWidthChars > 255 ? 255 : screenWidthChars);
   g_capabilityValue[offset++] = static_cast<uint8_t>(screenHeightChars > 255 ? 255 : screenHeightChars);
   g_capabilityValue[offset++] = static_cast<uint8_t>(kMaxFieldLen & 0xFF);
@@ -482,7 +483,8 @@ void admitPeer(uint16_t helloTag, const char* peerKey, const uint8_t token[16]) 
 }
 
 void handleHello(const uint8_t* data, size_t len) {
-  // opcode(1) helloTag(2) appId(16) installId(16) tokenLen(1) token[..] nameLen(1) name[..]
+  // opcode(1) helloTag(2) appId(16) installId(16) tokenLen(1) token[..]
+  // nameLen(1) name[..] userNameLen(1) userName[..]
   if (len < 1 + 2 + 32 + 1) {
     notifyHelloDenied(0, kDeniedMalformed);
     return;
@@ -497,23 +499,34 @@ void handleHello(const uint8_t* data, size_t len) {
   }
   const uint8_t* token = data + 36;
   const uint8_t nameLen = data[36 + tokenLen];
-  if (len < 37u + tokenLen + nameLen) {
+  if (len < 37u + tokenLen + nameLen + 1u) {
     notifyHelloDenied(helloTag, kDeniedMalformed);
     return;
   }
   const uint8_t* name = data + 37 + tokenLen;
+  const uint8_t userNameLen = data[37 + tokenLen + nameLen];
+  if (len < 38u + tokenLen + nameLen + userNameLen) {
+    notifyHelloDenied(helloTag, kDeniedMalformed);
+    return;
+  }
+  const uint8_t* userNameBytes = data + 38 + tokenLen + nameLen;
 
   char displayName[companionpeer::kMaxNameLen + 1] = {0};
   const size_t nameCopy = nameLen > companionpeer::kMaxNameLen ? companionpeer::kMaxNameLen : nameLen;
   memcpy(displayName, name, nameCopy);
+
+  char userName[companionpeer::kMaxNameLen + 1] = {0};
+  const size_t userNameCopy = userNameLen > companionpeer::kMaxNameLen ? companionpeer::kMaxNameLen : userNameLen;
+  memcpy(userName, userNameBytes, userNameCopy);
 
   char peerKey[companionpeer::kPeerKeyLen];
   companionpeer::makePeerKey(appId, installId, peerKey);
 
   if (companionpeer::isEnrolled(appId, installId) && companionpeer::tokenMatches(peerKey, token, tokenLen)) {
     // The "connects automatically" relationship: known peer, valid token, no
-    // prompt. Refresh the stored display name in case the app was renamed.
-    if (!companionpeer::ensurePeer(appId, installId, displayName, peerKey)) {
+    // prompt. Refresh the stored display/user name in case the app was
+    // renamed or this connect is from a different one of the user's devices.
+    if (!companionpeer::ensurePeer(appId, installId, displayName, userName, peerKey)) {
       notifyHelloDenied(helloTag, kDeniedStorage);
       return;
     }
@@ -533,6 +546,7 @@ void handleHello(const uint8_t* data, size_t len) {
   memcpy(g_pendingPairing.appId, appId, companionpeer::kIdLen);
   memcpy(g_pendingPairing.installId, installId, companionpeer::kIdLen);
   snprintf(g_pendingPairing.name, sizeof(g_pendingPairing.name), "%s", displayName);
+  snprintf(g_pendingPairing.userName, sizeof(g_pendingPairing.userName), "%s", userName);
 
   const uint8_t pending[3] = {kSessHelloPending, static_cast<uint8_t>(helloTag & 0xFF),
                               static_cast<uint8_t>((helloTag >> 8) & 0xFF)};
@@ -1044,7 +1058,7 @@ void resolvePairing(bool accept, bool timedOut) {
   }
 
   char peerKey[companionpeer::kPeerKeyLen];
-  if (!companionpeer::ensurePeer(pending.appId, pending.installId, pending.name, peerKey)) {
+  if (!companionpeer::ensurePeer(pending.appId, pending.installId, pending.name, pending.userName, peerKey)) {
     notifyHelloDenied(pending.helloTag, kDeniedStorage);
     return;
   }

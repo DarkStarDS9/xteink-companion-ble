@@ -275,6 +275,15 @@ bool handleCommand(const String& command) {
       offset += labelLen;
       reply("tag id=%u label=%s", static_cast<unsigned>(id), label);
     }
+
+    // Up to two optional trailing bytes: tag render style, then capabilities.
+    // Both are absent-if-out-of-buffer, same convention as the loops above.
+    if (offset < length) {
+      reply("ui style=%u", static_cast<unsigned>(raw[offset++]));
+    }
+    if (offset < length) {
+      reply("ui capabilities=0x%02x", static_cast<unsigned>(raw[offset++]));
+    }
     return true;
   }
   return false;

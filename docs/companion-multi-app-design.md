@@ -59,11 +59,19 @@ requirement. Its directory name is `peerKey`, the first 8 hex chars of a hash ov
 The firmware never parses or validates these beyond byte equality. An app that regenerates its
 `installId` simply becomes a new peer and re-pairs.
 
+**`userName`** (v8) is a fourth, presentation-only string, not an id — it rides on `HELLO` (see
+`docs/companion-display-protocol.md`) rather than being part of the identity tuple above, and is
+resent on every connect the same way `name` is. Where `name` is the *app's* name (identical across
+every install), `userName` is a label for *this install* — which of the user's own devices/accounts
+this is. It exists to distinguish two peers that share an `appId` (see §8's gallery picker), and
+follows the same rule as every other display string in this design: it is never compared, matched, or
+used to derive a path — `peerKey` alone still does that, from `appId`/`installId` only.
+
 ## 4. Storage layout
 
 ```
 /.crosspoint/companion/
-  peers.json                     index: peerKey -> { appId, installId, displayName, lastSeenMs }
+  peers.json                     index: peerKey -> { appId, installId, displayName, userName, lastSeenMs }
   peers/<peerKey>/
     peer.json                    display name, auth token, protocol prefs
     icon.bin                     1-bpp sleep-screen icon
@@ -236,6 +244,17 @@ worth the UI. Revisit only if a real mechanism appears.
 
 Icons are read from SD one at a time into a 512-byte stack buffer at render, drawn, and discarded.
 None are resident.
+
+**A real mechanism did appear (v8): the gallery picker.** It is a *different* grid from this one —
+CONFIRM on this decorative icon grid enters an interactive picker over the subset of peers that
+declared the `IMAGE_GALLERY` capability (see `docs/companion-display-protocol.md`'s "UI declaration
+field"), and selecting a tile loads that peer's own already-pushed, locally-stored photo gallery. The
+objection above doesn't apply to it: the device starts nothing on the phone and asks nothing of it —
+it's a local SD browse of content the app already pushed in a past session, exactly the same kind of
+firmware-local action as the existing UP/DOWN image-gallery navigation (§4/§9's image sketch), just
+reached through a different entry point. Unlike this icon grid, the picker is **not** grouped by
+`appId`: two installs of the same photo app have two separate galleries, so they stay two separate
+tiles, distinguished by `userName` (see §3) since their icon and app name alone would be identical.
 
 ## 9. Wire format changes (v6)
 

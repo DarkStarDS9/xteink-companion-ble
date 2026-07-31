@@ -24,12 +24,14 @@ class CompanionModeActivity final : public Activity {
   // What is on screen. An explicit state rather than a pile of booleans: the
   // screens are mutually exclusive and render() must dispatch on exactly one.
   enum class Screen : uint8_t {
-    StartFailed,  // BLE never came up (heap floor or NimBLE init failure)
-    Waiting,      // no app holds the screen, and no enrolled app has an icon
-    IconGrid,     // idle with enrolled apps: the decorative sleep grid
-    Pairing,      // "Pair with <app>?" prompt, awaiting CONFIRM/BACK
-    Text,         // title/body from the foreground app
-    Image,        // a pushed photo, full screen
+    StartFailed,   // BLE never came up (heap floor or NimBLE init failure)
+    Waiting,       // no app holds the screen, and no enrolled app has an icon
+    IconGrid,      // idle with enrolled apps: the decorative sleep grid
+    GalleryPicker, // interactive: choose which image-capable peer's gallery to browse
+    Pairing,       // "Pair with <app>?" prompt, awaiting CONFIRM/BACK
+    Text,          // title/body from the foreground app
+    Image,         // a pushed photo, full screen
+    Message,       // a transient status line, auto-reverting after a few seconds
   };
 
   Screen screen = Screen::Waiting;
@@ -98,6 +100,31 @@ class CompanionModeActivity final : public Activity {
   // why that's the right call here too).
   std::vector<std::string> galleryImages;
   size_t galleryIndex = 0;
+
+  // On-device picker over enrolled peers that declared the image-gallery
+  // capability (companionble::kUiCapabilityImageGallery) — not every enrolled
+  // app, since most don't push photos at all. Selecting one loads its stored
+  // gallery locally; no BLE interaction is involved; see
+  // docs/companion-display-protocol.md's "On-screen behaviour".
+  std::vector<std::string> pickerPeerKeys;
+  size_t pickerCursor = 0;
+
+  // Which peer's gallery is on screen via the picker or the disconnect
+  // fallback below, distinct from foregroundPeerKey (a live BLE session —
+  // most peers in the picker have none). Only meaningful while
+  // galleryPickerBrowsing is true.
+  std::string browsingPeerKey;
+  bool galleryPickerBrowsing = false;
+
+  // Reset whenever foregroundPeerKey changes to a new peer; set once that
+  // peer's image push actually commits. Used only to decide whether a
+  // disconnect should fall through to that peer's gallery instead of the
+  // normal hold-last-content behaviour — see loop()'s disconnect handling.
+  bool foregroundPushedImageThisSession = false;
+
+  std::string transientMessage;
+  unsigned long transientMessageUntilMs = 0;
+  Screen transientMessageReturnScreen = Screen::IconGrid;
 
   std::string pairingAppName;
   unsigned long pairingDeadlineMs = 0;
@@ -171,8 +198,13 @@ class CompanionModeActivity final : public Activity {
   void handlePendingImage(const std::string& stagedPath, const std::string& peerKey, const uint8_t* contentId,
                           size_t contentIdLen);
   void refreshGalleryForForeground();
+  void loadGalleryForPeer(const std::string& peerKey);
   bool handleGalleryNav();
   void showGalleryImage(size_t index);
+  void showTransientMessage(const std::string& text, Screen returnTo, unsigned long durationMs = 3000);
+  void enterGalleryPicker();
+  void selectGalleryPickerPeer();
+  bool handlePickerInput();
   void computeViewport();
   void updateTitleLayout();
   std::vector<std::string> wrapTitleToLines(const std::string& text) const;
@@ -185,6 +217,8 @@ class CompanionModeActivity final : public Activity {
   // sleep/boot variants — see renderPreSleepScreen() and onEnter().
   void renderWaiting(bool inverted = false, const char* label = nullptr);
   void renderIconGrid(bool inverted = false, const char* label = nullptr);
+  void renderGalleryPicker();
+  void renderTransientMessage();
   void renderPairingPrompt();
   void renderStartFailed();
   void renderPage();

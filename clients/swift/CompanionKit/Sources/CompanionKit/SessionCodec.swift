@@ -24,11 +24,12 @@ public enum SessionCodec {
                                    appId: Data,
                                    installId: Data,
                                    token: Data?,
-                                   displayName: String) -> Data {
+                                   displayName: String,
+                                   userName: String = "") -> Data {
         precondition(appId.count == 16, "appId must be 16 bytes")
         precondition(installId.count == 16, "installId must be 16 bytes")
 
-        var out = Data(capacity: 76)
+        var out = Data(capacity: 101)
         out.append(SessionOpcode.hello.rawValue)
         out.appendUInt16LE(helloTag)
         out.append(appId)
@@ -41,6 +42,13 @@ public enum SessionCodec {
         let nameBytes = truncateUTF8(displayName, toByteCount: maxNameBytes)
         out.append(UInt8(nameBytes.count))
         out.append(nameBytes)
+
+        // userName is a separate, user-facing label for this install (which of
+        // the user's own devices/accounts this is), distinct from displayName
+        // (the app's own name). See CompanionIdentity.userName.
+        let userNameBytes = truncateUTF8(userName, toByteCount: maxNameBytes)
+        out.append(UInt8(userNameBytes.count))
+        out.append(userNameBytes)
         return out
     }
 
