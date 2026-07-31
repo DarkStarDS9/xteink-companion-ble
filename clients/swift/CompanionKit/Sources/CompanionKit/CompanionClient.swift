@@ -784,8 +784,11 @@ extension CompanionClient: CBPeripheralDelegate {
 
         guard let session, let capability else {
             // No Session characteristic means pre-v6 firmware. There is no
-            // fallback path by design — v6 was a clean break.
-            emit(.failure(.unsupportedProtocolVersion(5)))
+            // fallback path by design — v6 was a clean break. There's no real
+            // reported version to read at this point (the characteristic that
+            // would carry it doesn't exist), so 5 is a stand-in for "obviously
+            // pre-v6" rather than a value actually read off the device.
+            emit(.failure(.unsupportedProtocolVersion(reported: 5, expected: CompanionProtocol.version)))
             return
         }
         peripheral.setNotifyValue(true, for: session)
@@ -805,7 +808,7 @@ extension CompanionClient: CBPeripheralDelegate {
                 return
             }
             guard parsed.protocolVersion == CompanionProtocol.version else {
-                emit(.failure(.unsupportedProtocolVersion(parsed.protocolVersion)))
+                emit(.failure(.unsupportedProtocolVersion(reported: parsed.protocolVersion, expected: CompanionProtocol.version)))
                 return
             }
             lock.lock(); capabilities = parsed; lock.unlock()

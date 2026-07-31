@@ -8,8 +8,12 @@ import Foundation
 public enum CompanionProtocol {
     /// The protocol version this package speaks. The capability characteristic's
     /// first byte must equal this; a mismatch is not negotiable in either
-    /// direction, because v6 was a clean break from v5.
-    public static let version: UInt8 = 6
+    /// direction, because v6 was a clean break from v5. Keep this in lockstep
+    /// with `docs/companion-display-protocol.md`'s current version — a client
+    /// on an older number than a connected device's firmware is just as broken
+    /// as the reverse, and looks confusingly like the *device* needs an update
+    /// when it's actually this package that's behind.
+    public static let version: UInt8 = 8
 
     public static let serviceUUID = "7C9C0000-3E4A-4B1A-9C1E-6D8A1F2B0001"
     public static let contentCharacteristicUUID = "7C9C0001-3E4A-4B1A-9C1E-6D8A1F2B0001"
@@ -203,7 +207,15 @@ public enum CompanionError: Error, Sendable {
     /// instead of letting the app watch a blank reader.
     case noScreen
     /// The device advertised a protocol version this package does not speak.
-    case unsupportedProtocolVersion(UInt8)
+    /// `reported` is the device's, `expected` is `CompanionProtocol.version` at
+    /// the moment of the check — carry both rather than just `reported` so a
+    /// consumer app can phrase the right message without redoing the
+    /// comparison itself: `reported > expected` means the *device* is ahead
+    /// (the app needs updating, not the firmware) and `reported < expected`
+    /// means the reverse. Getting this backwards produces a confusing
+    /// "upgrade your firmware" prompt on a device that's already newer than
+    /// the app expects.
+    case unsupportedProtocolVersion(reported: UInt8, expected: UInt8)
     case malformedCapabilities
     case malformedMessage
     case pairingDenied(HelloDeniedReason)
