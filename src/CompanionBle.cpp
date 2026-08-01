@@ -5,6 +5,9 @@
 #include <HalStorage.h>
 #include <Logging.h>
 #include <NimBLEDevice.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
 
 #include <cstdio>
 #include <cstring>
@@ -148,6 +151,12 @@ ImageStagedCallback g_imageStagedCb = nullptr;
 // 15ms*1*3=45ms by a wide margin. Each image chunk write is a full
 // request/ack round trip bound by this interval, so this was previously 30ms
 // (measured ~2.9 KB/s); halving it roughly doubles chunk throughput.
+//
+// Safe only because image chunk storage no longer does blocking SD I/O on
+// this callback's task -- see the chunk queue in CompanionImageWriter
+// (image writes moved to a dedicated task so a slow SdFat/SPI write or the
+// end-of-image flush()/close() can never stall the BLE host task long enough
+// to miss a scheduled radio event at this tighter interval).
 constexpr uint16_t kConnIntervalBusyUnits = 12;  // 15 ms (12 * 1.25 ms)
 constexpr uint16_t kConnLatencyBusy = 0;
 constexpr uint16_t kConnTimeoutBusyUnits = 600;  // 6 s (10 ms units) -- iOS's floor
@@ -361,38 +370,217 @@ void dropSession(uint8_t sessionId, BackgroundReason reason) {
 // is the PNG decoder's own per-row scratch, which already runs today for EPUB
 // cover art under this same heap budget. Buffering an image in RAM would be a
 // third large allocation stacked on NimBLE's ~63 KB and the 48 KB framebuffer.
+//
+// The actual SD write/flush/close for the image field do NOT happen inline
+// here, though -- see "Image write-behind task" below. This block only holds
+// bookkeeping that's cheap enough to touch straight from the BLE host task.
 uint8_t g_activeField = 0;
 uint8_t g_activeSession = kNoSession;
 uint32_t g_activeTotalLen = 0;
 uint32_t g_activeWritten = 0;
 bool g_activeFinal = false;
 std::unique_ptr<uint8_t[]> g_activeBuf;
-HalFile g_activeImageFile;
-std::string g_activeImagePath;
 bool g_activeImageOverflow = false;
+// Set once handing image work to the writer task fails (queue full/missing,
+// see enqueueImageWork()) -- once true, further CHUNKs for this transfer are
+// dropped without retrying (a retry loop here would just re-introduce the
+// blocking-host-task problem this task exists to avoid), and END reports
+// StorageFailed immediately rather than waiting on a message the writer task
+// may process very late, if ever.
+bool g_activeImageFailed = false;
 // Wall-clock span of the image CHUNK sequence only -- set at START, read at
 // END -- so BLE transfer time can be told apart from decode/settle time
-// without needing a host-side script to measure it.
+// without needing a host-side script to measure it. Deliberately computed
+// here on the host task rather than in the writer task, so a slow flush/close
+// or a backlog of still-queued CHUNKs never inflates this number.
 uint32_t g_imageTransferStartMs = 0;
 
-void discardStagedImage() {
+// ---------------------------------------------------------------------------
+// Image write-behind task
+// ---------------------------------------------------------------------------
+//
+// ContentCharCallbacks::onWrite() runs on the NimBLE host task. ESP32-C3 is
+// single-core, so any blocking call made inline there -- SD/SPI I/O very much
+// included, since it is neither fast nor bounded -- can make the host task
+// miss its own scheduled BLE radio events. At the 30ms connection interval
+// this link used to run at there was enough slack for that to go unnoticed;
+// at the 15ms interval now in use (see kConnIntervalBusyUnits above) there
+// usually isn't, and an occasionally-slow write -- or the reliably-slower
+// end-of-image flush/close -- caused real disconnects on real hardware.
+//
+// So none of the image staging file's open/write/flush/close calls happen on
+// the host task any more. onWrite() only ever copies a small fixed-size
+// message onto a queue and returns immediately; this dedicated task drains
+// that queue and does the actual SD I/O.
+//
+// g_activeImageFile/g_activeImagePath/g_activeImagePeerKey are, from here on,
+// touched by the writer task ONLY -- never by the host task -- which is what
+// makes this safe without wrapping the HalFile itself in a mutex. (HalStorage
+// already serializes SD/SPI access against other SD users elsewhere in the
+// firmware, e.g. EPUB/cover reads; that says nothing about two tasks sharing
+// one open HalFile, which single ownership avoids entirely.)
+HalFile g_activeImageFile;
+std::string g_activeImagePath;
+char g_activeImagePeerKey[companionpeer::kPeerKeyLen] = {0};
+
+// Worst-case CHUNK payload: the negotiated MTU (185, see ensureStarted())
+// minus 3 bytes of ATT protocol overhead minus the 2-byte opcode+sessionId
+// header ContentCharCallbacks::onWrite's kOpChunk case strips before this
+// payload is measured.
+constexpr size_t kMaxImageChunkPayload = 185 - 3 - 2;
+
+enum class ImageWorkType : uint8_t { Open, Chunk, End, Abort };
+
+// Fixed-size and POD (no heap pointers) -- safe and cheap to copy by value
+// through a FreeRTOS queue. Only `type` plus the fields that type actually
+// uses are meaningful; the rest are simply unused for a given message.
+struct ImageWorkMsg {
+  ImageWorkType type = ImageWorkType::Abort;
+  uint16_t len = 0;                                // Chunk: valid bytes in data[]
+  uint8_t data[kMaxImageChunkPayload] = {0};        // Chunk: payload
+  char peerKey[companionpeer::kPeerKeyLen] = {0};   // Open: whose staging file to open
+  uint8_t contentId[kMaxContentIdLen] = {0};        // End: session's content-id, copied here
+  uint8_t contentIdLen = 0;                         // (host task) before enqueueing so a later
+                                                     // session-table reset can't race it
+};
+
+// Sized to comfortably absorb the writer task falling behind for a while (a
+// slow SD write, or a GC/wear-leveling pause on the card) without the host
+// task ever needing to wait for space. 24 * sizeof(ImageWorkMsg) is a few KB,
+// affordable against the ~34KB of free heap this feature typically runs with
+// (see ensureStarted()'s heap-cost comment), and at up to
+// kMaxImageChunkPayload bytes/CHUNK covers several hundred milliseconds of
+// incoming CHUNKs even at the fastest connection interval this firmware
+// requests -- far more slack than a single SD write or flush is ever expected
+// to need.
+constexpr UBaseType_t kImageWriteQueueLen = 24;
+
+QueueHandle_t g_imageWriteQueue = nullptr;
+TaskHandle_t g_imageWriteTaskHandle = nullptr;
+
+// Writer-task-only: same job the old discardStagedImage() did, just run from
+// the task that now exclusively owns g_activeImageFile/g_activeImagePath.
+void writerDiscardStagedImage() {
   if (g_activeImageFile.isOpen()) g_activeImageFile.close();
   if (!g_activeImagePath.empty()) {
-    // A partial PNG is not decodable and would sit on the card until the next
-    // push overwrote it. Drop it rather than leave a trap for the decoder.
+    // A partial image is not decodable and would sit on the card until the
+    // next push overwrote it. Drop it rather than leave a trap for the
+    // decoder.
     Storage.remove(g_activeImagePath.c_str());
     g_activeImagePath.clear();
   }
 }
 
+void imageWriteTaskLoop(void* /*param*/) {
+  for (;;) {
+    ImageWorkMsg msg;
+    if (xQueueReceive(g_imageWriteQueue, &msg, portMAX_DELAY) != pdTRUE) continue;
+
+    switch (msg.type) {
+      case ImageWorkType::Open: {
+        // Belt-and-suspenders: a prior transfer's Abort should always have
+        // closed this already, but if that Abort itself was ever dropped
+        // (e.g. it lost the race against a full queue), don't leak/overwrite
+        // a still-open handle out from under the SD layer.
+        if (g_activeImageFile.isOpen()) writerDiscardStagedImage();
+        memcpy(g_activeImagePeerKey, msg.peerKey, sizeof(g_activeImagePeerKey));
+        g_activeImagePath = companionpeer::dataFilePath(g_activeImagePeerKey, kStagedImageName);
+        if (!Storage.openFileForWrite("CBLE", g_activeImagePath, g_activeImageFile)) {
+          LOG_ERR("CBLE", "could not open %s for image staging", g_activeImagePath.c_str());
+          g_activeImagePath.clear();
+        }
+        break;
+      }
+
+      case ImageWorkType::Chunk: {
+        if (!g_activeImageFile.isOpen()) break;  // already failed/aborted -- drop silently
+        if (g_activeImageFile.write(msg.data, msg.len) != msg.len) {
+          LOG_ERR("CBLE", "SD write failed staging image");
+          writerDiscardStagedImage();
+        }
+        break;
+      }
+
+      case ImageWorkType::End: {
+        if (!g_activeImageFile.isOpen()) {
+          notifyImageStatus(ImageResult::StorageFailed);
+        } else {
+          g_activeImageFile.flush();
+          g_activeImageFile.close();
+          // Decoding touches the framebuffer, so it happens on the main loop
+          // task, not here. The activity answers with notifyImageStatus().
+          // onImageStaged() (CompanionModeActivity.cpp) only copies
+          // fixed-size buffers under its own critical section, so calling it
+          // from this task rather than the host task is safe.
+          if (g_imageStagedCb) {
+            g_imageStagedCb(g_activeImagePeerKey, g_activeImagePath.c_str(), msg.contentId, msg.contentIdLen);
+          }
+          g_activeImagePath.clear();  // ownership passes to the activity
+        }
+        break;
+      }
+
+      case ImageWorkType::Abort:
+        writerDiscardStagedImage();
+        break;
+    }
+  }
+}
+
+void ensureImageWriteTaskStarted() {
+  if (g_imageWriteTaskHandle) return;
+  g_imageWriteQueue = xQueueCreate(kImageWriteQueueLen, sizeof(ImageWorkMsg));
+  if (!g_imageWriteQueue) {
+    LOG_ERR("CBLE", "failed to create image write queue");
+    return;
+  }
+  // Priority 2, matching InputManager::beginAsync()'s default for a small
+  // dedicated I/O task: above the main render/loop task's default priority
+  // (ActivityManager's render task runs at 1) so queued SD work is drained
+  // promptly, but well below the NimBLE host/controller tasks so this task
+  // never competes with actual radio servicing.
+  const BaseType_t created = xTaskCreate(&imageWriteTaskLoop, "cble_imgw", 4096, nullptr, 2, &g_imageWriteTaskHandle);
+  if (created != pdPASS) {
+    LOG_ERR("CBLE", "failed to create image write task");
+    vQueueDelete(g_imageWriteQueue);
+    g_imageWriteQueue = nullptr;
+    g_imageWriteTaskHandle = nullptr;
+  }
+}
+
+// Bounded, non-blocking handoff from the host task -- onWrite() must never
+// wait here, so a full (or not-yet-created) queue is simply a failure rather
+// than something worth spending host-task time retrying.
+bool enqueueImageWork(const ImageWorkMsg& msg, const char* context) {
+  if (!g_imageWriteQueue || xQueueSend(g_imageWriteQueue, &msg, 0) != pdTRUE) {
+    LOG_ERR("CBLE", "image write queue full/unavailable (%s)", context);
+    return false;
+  }
+  return true;
+}
+
+// Tears down whatever the writer task has in flight for the current transfer.
+// Always safe to call (a no-op if nothing is open/pending) -- used both for a
+// real mid-transfer abort (disconnect, a new session taking the screen, a
+// START overriding an unfinished transfer) and, harmlessly, once more after
+// every clean END, mirroring the old discardStagedImage()-is-a-no-op-after-a-
+// clean-finish idiom this replaces.
+void enqueueImageAbort() {
+  if (!g_imageWriteQueue) return;
+  ImageWorkMsg msg;
+  msg.type = ImageWorkType::Abort;
+  enqueueImageWork(msg, "abort");
+}
+
 void resetReassembly() {
-  if (g_activeField == kFieldImage) discardStagedImage();
+  if (g_activeField == kFieldImage) enqueueImageAbort();
   g_activeField = 0;
   g_activeSession = kNoSession;
   g_activeTotalLen = 0;
   g_activeWritten = 0;
   g_activeFinal = false;
   g_activeImageOverflow = false;
+  g_activeImageFailed = false;
   g_activeBuf.reset();
 }
 
@@ -619,12 +807,16 @@ class SessionCharCallbacks : public NimBLECharacteristicCallbacks {
 // Content characteristic
 // ---------------------------------------------------------------------------
 
+// Only enqueues the open request -- the actual SD open happens on the writer
+// task (see "Image write-behind task" above). Runs once per transfer, so it's
+// the least critical of the three SD calls to move off the host task, but the
+// open can still stall on a busy card exactly like write()/flush()/close()
+// can, so it moves too for the same reason.
 void beginImageStaging(const Session& session) {
-  g_activeImagePath = companionpeer::dataFilePath(session.peerKey, kStagedImageName);
-  if (!Storage.openFileForWrite("CBLE", g_activeImagePath, g_activeImageFile)) {
-    LOG_ERR("CBLE", "could not open %s for image staging", g_activeImagePath.c_str());
-    g_activeImagePath.clear();
-  }
+  ImageWorkMsg msg;
+  msg.type = ImageWorkType::Open;
+  memcpy(msg.peerKey, session.peerKey, sizeof(msg.peerKey));
+  if (!enqueueImageWork(msg, "open")) g_activeImageFailed = true;
 }
 
 void finishAsset(uint8_t field, const Session& session, uint8_t sessionId) {
@@ -719,12 +911,36 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
         const size_t payloadLen = len - 2;
 
         if (g_activeField == kFieldImage) {
-          if (g_activeImageOverflow || !g_activeImageFile.isOpen()) return;
-          if (g_activeImageFile.write(payload, payloadLen) != payloadLen) {
-            LOG_ERR("CBLE", "SD write failed staging image");
-            discardStagedImage();
+          if (g_activeImageOverflow || g_activeImageFailed) return;
+          if (payloadLen > kMaxImageChunkPayload) {
+            // Cannot happen at the negotiated MTU (185, see ensureStarted()) --
+            // guard anyway so a future MTU change fails loudly instead of
+            // overflowing ImageWorkMsg::data.
+            LOG_ERR("CBLE", "image CHUNK payload %u exceeds max %u", static_cast<unsigned>(payloadLen),
+                    static_cast<unsigned>(kMaxImageChunkPayload));
+            g_activeImageFailed = true;
+            enqueueImageAbort();
             return;
           }
+          ImageWorkMsg msg;
+          msg.type = ImageWorkType::Chunk;
+          msg.len = static_cast<uint16_t>(payloadLen);
+          memcpy(msg.data, payload, payloadLen);
+          if (!enqueueImageWork(msg, "chunk")) {
+            // Writer task is falling behind (or never started) -- fail this
+            // transfer the same way a real SD write failure would: stop
+            // accepting further CHUNKs and let END report StorageFailed.
+            // Retrying the enqueue here would just turn into the blocking
+            // callback this task exists to avoid.
+            g_activeImageFailed = true;
+            enqueueImageAbort();
+            return;
+          }
+          // Optimistic: counts bytes handed to the writer task, not bytes
+          // actually persisted to SD yet. Only the throughput log at END
+          // reads this for the image field (see g_imageTransferStartMs's
+          // comment) -- nothing else does, so a few bytes of skew in the rare
+          // failure case is harmless.
           g_activeWritten += payloadLen;
           return;
         }
@@ -759,18 +975,25 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
             }
             if (g_activeImageOverflow) {
               notifyImageStatus(ImageResult::RejectedSize);
-            } else if (!g_activeImageFile.isOpen()) {
+            } else if (g_activeImageFailed) {
+              // The writer task already knows (or will shortly, via the
+              // Abort enqueued when the failure happened) that this transfer
+              // is dead -- report it here rather than waiting on an End
+              // message it may process very late, if ever.
               notifyImageStatus(ImageResult::StorageFailed);
             } else {
-              g_activeImageFile.flush();
-              g_activeImageFile.close();
-              // Decoding touches the framebuffer, so it happens on the main loop
-              // task, not here. The activity answers with notifyImageStatus().
-              if (g_imageStagedCb) {
-                g_imageStagedCb(session->peerKey, g_activeImagePath.c_str(), session->contentId,
-                                session->contentIdLen);
+              // flush()/close() (and, on an open/write failure the writer
+              // task hit earlier, StorageFailed) now happen on the writer
+              // task once it drains any CHUNKs still ahead of this message in
+              // the queue -- see "Image write-behind task" above.
+              ImageWorkMsg msg;
+              msg.type = ImageWorkType::End;
+              memcpy(msg.contentId, session->contentId, sizeof(msg.contentId));
+              msg.contentIdLen = session->contentIdLen;
+              if (!enqueueImageWork(msg, "end")) {
+                notifyImageStatus(ImageResult::StorageFailed);
+                enqueueImageAbort();
               }
-              g_activeImagePath.clear();  // ownership passes to the activity
             }
             break;
           }
@@ -881,6 +1104,11 @@ bool ensureStarted(const GfxRenderer& renderer, int fontId) {
   if (g_begun) return true;
 
   g_startInProgress = true;
+
+  // Created once and kept alive across stop()/ensureStarted() cycles, same as
+  // e.g. the session table -- cheap to leave idle, and avoids having to
+  // synchronize a clean task/queue teardown against an in-flight transfer.
+  ensureImageWriteTaskStarted();
 
   if (ESP.getFreeHeap() < kStartMinFreeHeap) {
     LOG_ERR("CBLE", "ensureStarted: free heap %u < floor %u, not starting", static_cast<unsigned>(ESP.getFreeHeap()),
