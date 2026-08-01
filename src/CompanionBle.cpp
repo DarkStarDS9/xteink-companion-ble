@@ -425,11 +425,20 @@ HalFile g_activeImageFile;
 std::string g_activeImagePath;
 char g_activeImagePeerKey[companionpeer::kPeerKeyLen] = {0};
 
-// Worst-case CHUNK payload: the negotiated MTU (185, see ensureStarted())
-// minus 3 bytes of ATT protocol overhead minus the 2-byte opcode+sessionId
-// header ContentCharCallbacks::onWrite's kOpChunk case strips before this
-// payload is measured.
-constexpr size_t kMaxImageChunkPayload = 185 - 3 - 2;
+// Worst-case CHUNK payload: NimBLE's own compiled ATT MTU ceiling
+// (BLE_ATT_MTU_MAX == 527, nimble/nimble/host/include/host/ble_att.h) --
+// deliberately NOT the 185 NimBLEDevice::setMTU() requests in ensureStarted().
+// That call only sets NimBLE's own *initiating* preference; a central that
+// initiates the MTU exchange itself (which CoreBluetooth does) negotiates
+// min(both sides' actual capability), not capped at what we asked for.
+// Confirmed on real hardware: an iPhone negotiated an ATT MTU around 515,
+// nearly 3x the 185 this buffer used to assume, and every CHUNK was
+// rejected outright ("payload N exceeds max 180") the instant a real
+// high-MTU central pushed an image -- hard-failing every transfer with
+// storageFailed after streaming the whole thing for nothing.
+// 3 bytes of ATT protocol overhead, 2-byte opcode+sessionId header stripped
+// in onWrite's kOpChunk case, subtracted from NimBLE's true ceiling.
+constexpr size_t kMaxImageChunkPayload = 527 - 3 - 2;
 
 enum class ImageWorkType : uint8_t { Open, Chunk, End, Abort };
 
@@ -448,9 +457,12 @@ struct ImageWorkMsg {
 
 // Sized to smooth over the writer task falling behind briefly (a slow SD
 // write, or a GC/wear-leveling pause on the card) without the host task
-// needing to wait at all. 24 * sizeof(ImageWorkMsg) is a few KB, affordable
-// against the ~34KB of free heap this feature typically runs with (see
-// ensureStarted()'s heap-cost comment).
+// needing to wait at all. Kept at 10 (rather than the 24 this started at)
+// now that kMaxImageChunkPayload reflects NimBLE's real ~522-byte ceiling
+// instead of an assumed 180 -- 10 * sizeof(ImageWorkMsg) lands close to the
+// original queue's total footprint (a few KB), affordable against the
+// ~34KB of free heap this feature typically runs with (see ensureStarted()'s
+// heap-cost comment).
 //
 // It does NOT cover a sustained gap between incoming and drain rate -- a
 // fast sender can outpace the SD card for an entire transfer, not just a
@@ -460,7 +472,7 @@ struct ImageWorkMsg {
 // enqueueImageWork() blocking the host task briefly when the queue is full
 // (safe -- see its comment), which throttles the incoming rate down to
 // whatever the writer can actually sustain instead of failing the transfer.
-constexpr UBaseType_t kImageWriteQueueLen = 24;
+constexpr UBaseType_t kImageWriteQueueLen = 10;
 
 QueueHandle_t g_imageWriteQueue = nullptr;
 TaskHandle_t g_imageWriteTaskHandle = nullptr;
@@ -477,6 +489,14 @@ void writerDiscardStagedImage() {
     g_activeImagePath.clear();
   }
 }
+
+// Temporary instrumentation: attributes wall-clock time in the writer loop to
+// either the SD write() call itself or everything else (queue wait,
+// scheduling latency), to find out where a slow transfer is actually
+// spending its time. TODO remove once the real bottleneck is identified.
+uint32_t g_writerChunkCount = 0;
+uint32_t g_writerWriteBusyMs = 0;
+uint32_t g_writerFirstChunkMs = 0;
 
 void imageWriteTaskLoop(void* /*param*/) {
   for (;;) {
@@ -496,12 +516,20 @@ void imageWriteTaskLoop(void* /*param*/) {
           LOG_ERR("CBLE", "could not open %s for image staging", g_activeImagePath.c_str());
           g_activeImagePath.clear();
         }
+        g_writerChunkCount = 0;
+        g_writerWriteBusyMs = 0;
+        g_writerFirstChunkMs = 0;
         break;
       }
 
       case ImageWorkType::Chunk: {
         if (!g_activeImageFile.isOpen()) break;  // already failed/aborted -- drop silently
-        if (g_activeImageFile.write(msg.data, msg.len) != msg.len) {
+        if (g_writerFirstChunkMs == 0) g_writerFirstChunkMs = millis();
+        const uint32_t writeStartMs = millis();
+        const bool ok = g_activeImageFile.write(msg.data, msg.len) == msg.len;
+        g_writerWriteBusyMs += millis() - writeStartMs;
+        ++g_writerChunkCount;
+        if (!ok) {
           LOG_ERR("CBLE", "SD write failed staging image");
           writerDiscardStagedImage();
         }
@@ -509,11 +537,20 @@ void imageWriteTaskLoop(void* /*param*/) {
       }
 
       case ImageWorkType::End: {
+        if (g_writerChunkCount > 0) {
+          const uint32_t spanMs = millis() - g_writerFirstChunkMs;
+          LOG_DBG("CBLE", "writer: %u chunks, %u ms write()-busy, %u ms span (%u%% busy)",
+                  static_cast<unsigned>(g_writerChunkCount), static_cast<unsigned>(g_writerWriteBusyMs),
+                  static_cast<unsigned>(spanMs),
+                  static_cast<unsigned>(spanMs > 0 ? (g_writerWriteBusyMs * 100UL / spanMs) : 0));
+        }
         if (!g_activeImageFile.isOpen()) {
           notifyImageStatus(ImageResult::StorageFailed);
         } else {
+          const uint32_t flushStartMs = millis();
           g_activeImageFile.flush();
           g_activeImageFile.close();
+          LOG_DBG("CBLE", "writer: flush()+close() took %u ms", static_cast<unsigned>(millis() - flushStartMs));
           // Decoding touches the framebuffer, so it happens on the main loop
           // task, not here. The activity answers with notifyImageStatus().
           // onImageStaged() (CompanionModeActivity.cpp) only copies
@@ -1071,6 +1108,23 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // below is the only way to know what actually landed.
     if (server) {
       server->updatePhy(connInfo.getConnHandle(), BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK, 0);
+      // Without this, the link layer stays on the legacy default data
+      // length (27-byte payload), regardless of the ~522-byte ATT MTU this
+      // firmware now accepts (see kMaxImageChunkPayload). A large ATT write
+      // still has to go out, but gets fragmented into far more over-the-air
+      // LL Data PDUs than necessary -- observed on hardware turning a
+      // single ~510-byte image CHUNK write into a ~250ms round trip despite
+      // an 8x tighter (30ms) connection interval, because most of that time
+      // is spent re-fragmenting one write across many connection events
+      // instead of sending it in one or two. 251 is BLE 4.2+'s max useful
+      // payload (BLE_GAP_MAX_TXOCTETS below) -- matches the write chunk size
+      // far better than the legacy default. Purely a request like the PHY
+      // and conn-param ones above; there is no NimBLE server-role callback
+      // to confirm what a given central actually grants. 251 is the
+      // Bluetooth Core Spec's own max TX octets for Data Length Extension
+      // (not a NimBLE-specific constant, since this build doesn't expose
+      // one).
+      server->setDataLen(connInfo.getConnHandle(), 251);
     }
   }
   void onConnParamsUpdate(NimBLEConnInfo& connInfo) override {
