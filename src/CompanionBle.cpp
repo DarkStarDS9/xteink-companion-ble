@@ -143,10 +143,12 @@ ImageStagedCallback g_imageStagedCb = nullptr;
 //
 // "Busy": tight interval, no latency skipping -- lowest round-trip time while
 // a button press or a content/image chunk sequence is actively in flight.
-// 30 ms satisfies interval>=15ms/15ms-multiple; latency 0 means
-// maxInterval*(latency+1)=30ms and the timeout floor (6s) clears
-// 30ms*1*3=90ms by a wide margin.
-constexpr uint16_t kConnIntervalBusyUnits = 24;  // 30 ms (24 * 1.25 ms)
+// 15 ms is iOS's own floor (interval>=15ms/15ms-multiple); latency 0 means
+// maxInterval*(latency+1)=15ms and the timeout floor (6s) clears
+// 15ms*1*3=45ms by a wide margin. Each image chunk write is a full
+// request/ack round trip bound by this interval, so this was previously 30ms
+// (measured ~2.9 KB/s); halving it roughly doubles chunk throughput.
+constexpr uint16_t kConnIntervalBusyUnits = 12;  // 15 ms (12 * 1.25 ms)
 constexpr uint16_t kConnLatencyBusy = 0;
 constexpr uint16_t kConnTimeoutBusyUnits = 600;  // 6 s (10 ms units) -- iOS's floor
 
@@ -368,6 +370,10 @@ std::unique_ptr<uint8_t[]> g_activeBuf;
 HalFile g_activeImageFile;
 std::string g_activeImagePath;
 bool g_activeImageOverflow = false;
+// Wall-clock span of the image CHUNK sequence only -- set at START, read at
+// END -- so BLE transfer time can be told apart from decode/settle time
+// without needing a host-side script to measure it.
+uint32_t g_imageTransferStartMs = 0;
 
 void discardStagedImage() {
   if (g_activeImageFile.isOpen()) g_activeImageFile.close();
@@ -693,6 +699,7 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           // one clear IMAGE_STATUS either way; the bytes are simply not stored.
           g_activeImageOverflow = totalLen > cap;
           g_activeTotalLen = totalLen;
+          g_imageTransferStartMs = millis();
           if (!g_activeImageOverflow) beginImageStaging(*session);
           return;
         }
@@ -744,6 +751,12 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
 
         switch (field) {
           case kFieldImage: {
+            const uint32_t transferMs = millis() - g_imageTransferStartMs;
+            if (transferMs > 0) {
+              LOG_DBG("CBLE", "image transfer: %u bytes in %u ms (%u B/s)",
+                      static_cast<unsigned>(g_activeWritten), static_cast<unsigned>(transferMs),
+                      static_cast<unsigned>(g_activeWritten * 1000UL / transferMs));
+            }
             if (g_activeImageOverflow) {
               notifyImageStatus(ImageResult::RejectedSize);
             } else if (!g_activeImageFile.isOpen()) {
@@ -802,11 +815,37 @@ class StatusCharCallbacks : public NimBLECharacteristicCallbacks {
 };
 
 class ServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* /*server*/, NimBLEConnInfo& /*connInfo*/) override {
+  void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
     LOG_DBG("CBLE", "central connected");
     // Request the tight profile right away: the v6 HELLO handshake happens
     // immediately after connect, before anything else marks the link busy.
     noteBleActivity();
+    // 2M PHY halves on-air time per packet versus the 1M PHY default. Purely
+    // a request -- the central (iOS) grants or ignores it, same as
+    // updateConnParams above -- and iOS decides silently, so onPhyUpdate()
+    // below is the only way to know what actually landed.
+    if (server) {
+      server->updatePhy(connInfo.getConnHandle(), BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK, 0);
+    }
+  }
+  void onConnParamsUpdate(NimBLEConnInfo& connInfo) override {
+    // Confirms what the central actually granted -- requestConnParams() above
+    // only logs what was asked for; a peripheral request can be silently
+    // ignored, leaving the previous interval in place.
+    LOG_DBG("CBLE", "conn params granted: interval=%.2fms latency=%u timeout=%ums",
+            connInfo.getConnInterval() * 1.25f, static_cast<unsigned>(connInfo.getConnLatency()),
+            static_cast<unsigned>(connInfo.getConnTimeout() * 10));
+  }
+  void onPhyUpdate(NimBLEConnInfo& /*connInfo*/, uint8_t txPhy, uint8_t rxPhy) override {
+    auto phyName = [](uint8_t phy) {
+      switch (phy) {
+        case BLE_GAP_LE_PHY_1M: return "1M";
+        case BLE_GAP_LE_PHY_2M: return "2M";
+        case BLE_GAP_LE_PHY_CODED: return "CODED";
+        default: return "?";
+      }
+    };
+    LOG_DBG("CBLE", "PHY update: tx=%s rx=%s", phyName(txPhy), phyName(rxPhy));
   }
   void onDisconnect(NimBLEServer* server, NimBLEConnInfo& /*connInfo*/, int /*reason*/) override {
     LOG_DBG("CBLE", "central disconnected");

@@ -32,6 +32,7 @@ import json
 import os
 import struct
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -203,8 +204,11 @@ def parse_capabilities(raw: bytes) -> dict:
         "max_content_id": raw[21],
         "gray_levels": raw[22],
     }
-    if caps["version"] != 6:
-        raise SystemExit(f"Device speaks protocol v{caps['version']}, this script speaks v6.")
+    # Capability/content/session wire layout has been stable since v6 (v7/v8
+    # only added new fields elsewhere, e.g. the gallery picker); this script
+    # only exercises the v6 subset, so accept anything >= 6.
+    if caps["version"] < 6:
+        raise SystemExit(f"Device speaks protocol v{caps['version']}, this script needs v6+.")
     return caps
 
 
@@ -289,6 +293,9 @@ class Session:
         payload += bytes([len(token) if token else 0]) + (token or b"")
         name = DISPLAY_NAME.encode("utf-8")[:24]
         payload += bytes([len(name)]) + name
+        # v8 HELLO appends userNameLen/userName after name; this script has no
+        # per-install label, so send it empty (still needs the length byte).
+        payload += bytes([0])
         await self.client.write_gatt_char(SESSION_CHAR_UUID, payload, response=True)
         return await asyncio.wait_for(self.hello_future, timeout=40)
 
@@ -341,7 +348,10 @@ class Session:
         if len(raw_bitmap) > self.caps["max_image"]:
             raise SystemExit(f"Image is {len(raw_bitmap)} bytes, device cap is {self.caps['max_image']}.")
         self.image_future = self.loop.create_future()
+        transfer_start = time.perf_counter()
         await self.push_field(FIELD_IMAGE, raw_bitmap, final=True, progress=True)
+        transfer_s = time.perf_counter() - transfer_start
+        print(f"  BLE transfer: {transfer_s:.2f}s ({len(raw_bitmap) / transfer_s:.0f} B/s)")
         print("  Waiting for the device to develop it (decode + grayscale settle)...")
         result = await asyncio.wait_for(self.image_future, timeout=180)
         print(f"  image: {IMAGE_RESULTS.get(result, result)}")
