@@ -410,8 +410,10 @@ uint32_t g_imageTransferStartMs = 0;
 //
 // So none of the image staging file's open/write/flush/close calls happen on
 // the host task any more. onWrite() only ever copies a small fixed-size
-// message onto a queue and returns immediately; this dedicated task drains
-// that queue and does the actual SD I/O.
+// message onto a queue (occasionally waiting briefly for room -- see
+// enqueueImageWork()'s kImageEnqueueTimeoutTicks -- but never doing SD/SPI
+// I/O itself) and this dedicated task drains that queue and does the actual
+// SD I/O.
 //
 // g_activeImageFile/g_activeImagePath/g_activeImagePeerKey are, from here on,
 // touched by the writer task ONLY -- never by the host task -- which is what
@@ -444,15 +446,20 @@ struct ImageWorkMsg {
                                                      // session-table reset can't race it
 };
 
-// Sized to comfortably absorb the writer task falling behind for a while (a
-// slow SD write, or a GC/wear-leveling pause on the card) without the host
-// task ever needing to wait for space. 24 * sizeof(ImageWorkMsg) is a few KB,
-// affordable against the ~34KB of free heap this feature typically runs with
-// (see ensureStarted()'s heap-cost comment), and at up to
-// kMaxImageChunkPayload bytes/CHUNK covers several hundred milliseconds of
-// incoming CHUNKs even at the fastest connection interval this firmware
-// requests -- far more slack than a single SD write or flush is ever expected
-// to need.
+// Sized to smooth over the writer task falling behind briefly (a slow SD
+// write, or a GC/wear-leveling pause on the card) without the host task
+// needing to wait at all. 24 * sizeof(ImageWorkMsg) is a few KB, affordable
+// against the ~34KB of free heap this feature typically runs with (see
+// ensureStarted()'s heap-cost comment).
+//
+// It does NOT cover a sustained gap between incoming and drain rate -- a
+// fast sender can outpace the SD card for an entire transfer, not just a
+// brief stall, and no queue depth fixes that (the image is ~100KB; buffering
+// the whole thing in RAM instead of streaming to SD is exactly what the
+// heap-cost comment above rules out). That case is handled by
+// enqueueImageWork() blocking the host task briefly when the queue is full
+// (safe -- see its comment), which throttles the incoming rate down to
+// whatever the writer can actually sustain instead of failing the transfer.
 constexpr UBaseType_t kImageWriteQueueLen = 24;
 
 QueueHandle_t g_imageWriteQueue = nullptr;
@@ -548,11 +555,26 @@ void ensureImageWriteTaskStarted() {
   }
 }
 
-// Bounded, non-blocking handoff from the host task -- onWrite() must never
-// wait here, so a full (or not-yet-created) queue is simply a failure rather
-// than something worth spending host-task time retrying.
+// A real sender (e.g. iOS, which paces writes far tighter than the queue
+// depth assumed) can sustain a higher incoming rate than the SD card can
+// absorb -- not just the occasional slow write/GC pause this queue was sized
+// for, but a persistent gap between incoming and drain rate for the whole
+// transfer. Without backpressure that gap fills the queue in well under a
+// second and fails the transfer outright.
+//
+// So this blocks, briefly, when full -- which is safe here in a way the old
+// inline SD call was not: xQueueSend() blocking suspends the calling task on
+// a semaphore wait (zero CPU, fully preemptible), letting the NimBLE
+// host/controller tasks run and service the radio on schedule regardless of
+// how long the wait takes. That is categorically different from blocking
+// inside an uninterruptible SPI transaction, which is what actually caused
+// missed radio events before. The bound below only guards against a
+// genuinely stuck writer task (e.g. a wedged SD card) rather than normal
+// backlog draining.
+constexpr TickType_t kImageEnqueueTimeoutTicks = pdMS_TO_TICKS(4000);
+
 bool enqueueImageWork(const ImageWorkMsg& msg, const char* context) {
-  if (!g_imageWriteQueue || xQueueSend(g_imageWriteQueue, &msg, 0) != pdTRUE) {
+  if (!g_imageWriteQueue || xQueueSend(g_imageWriteQueue, &msg, kImageEnqueueTimeoutTicks) != pdTRUE) {
     LOG_ERR("CBLE", "image write queue full/unavailable (%s)", context);
     return false;
   }
