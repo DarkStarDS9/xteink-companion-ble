@@ -119,6 +119,8 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     private let tokenStore: CompanionTokenStore
     private let assets: CompanionAssetProvider
     private let log: @Sendable (String) -> Void
+    /// Backing store for ``isVerboseLoggingEnabled``; guarded by ``lock``.
+    private var verboseLogging: Bool
     /// Whether the handshake should end by asking for the screen. This is an
     /// app-intent flag, never a lifecycle mirror — see ``acquireScreen()``.
     private var wantsScreen: Bool
@@ -168,17 +170,22 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     ///     display something. Pass `false` if the app connects for other reasons
     ///     and will call ``acquireScreen()`` later; you can also change it at any
     ///     time with ``acquireScreen()`` / ``releaseScreen()`` before connecting.
+    ///   - verboseLogging: whether per-packet BLE transport chatter reaches
+    ///     `log`. Off by default, and it should stay off in shipping builds —
+    ///     see ``isVerboseLoggingEnabled``.
     ///   - log: diagnostics sink. Defaults to dropping them — apps with their own
     ///     event log should pass a closure rather than hunting in os_log.
     public init(identity: CompanionIdentity,
                 tokenStore: CompanionTokenStore = KeychainTokenStore(),
                 assets: CompanionAssetProvider,
                 acquireScreenOnConnect: Bool = true,
+                verboseLogging: Bool = false,
                 log: @escaping @Sendable (String) -> Void = { _ in }) {
         self.identity = identity
         self.tokenStore = tokenStore
         self.assets = assets
         self.wantsScreen = acquireScreenOnConnect
+        self.verboseLogging = verboseLogging
         self.log = log
 
         var continuation: AsyncStream<CompanionEvent>.Continuation!
@@ -186,6 +193,38 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         super.init()
         self.eventContinuation = continuation
         self.central = CBCentralManager(delegate: self, queue: queue)
+    }
+
+    /// Whether per-packet BLE transport chatter is written to the `log` sink.
+    /// Default `false`, and deliberately so.
+    ///
+    /// `log` is not a developer-only os_log in practice: consumer apps wire it
+    /// into user-visible diagnostic tapes (SpokenFeeds' "Copy Tape" JSONL
+    /// export, for one), which people are asked to paste into bug reports. A
+    /// line that fires per packet or per push drowns that tape — the WWR
+    /// ready-with-no-waiters line alone fired twice per push, so a session of
+    /// twenty-five articles buried everything else under fifty lines of it.
+    ///
+    /// So the rule for this flag: anything that fires on the happy path goes
+    /// behind it; anything rare and actionable (the WWR wedge warning,
+    /// sequence-gap drops, state transitions, pairing denials) stays
+    /// unconditional. Toggle it at runtime from a debug menu when chasing a
+    /// transport bug.
+    public var isVerboseLoggingEnabled: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return verboseLogging }
+        set { lock.lock(); verboseLogging = newValue; lock.unlock() }
+    }
+
+    /// Logs only when ``isVerboseLoggingEnabled``. The message is an
+    /// autoclosure so an unwanted line costs no string interpolation at all —
+    /// this is called from inside the WWR chunk loop, which runs hundreds of
+    /// times per image push.
+    private func logVerbose(_ message: @autoclosure () -> String) {
+        lock.lock()
+        let enabled = verboseLogging
+        lock.unlock()
+        guard enabled else { return }
+        log(message())
     }
 
     /// The device's self-description, once connected.
@@ -1033,8 +1072,12 @@ extension CompanionClient: CBPeripheralDelegate {
         // a sender arriving late simply observes the freed buffer space and
         // never suspends) and it is not on its own evidence of anything: it
         // also happens benignly whenever no send is in flight at all.
+        //
+        // Verbose-only: it fires twice per push on real hardware, which is far
+        // too much for a shipping app's diagnostic tape. See
+        // ``isVerboseLoggingEnabled``.
         if waiters.isEmpty {
-            log("WWR ready fired with no waiters queued")
+            logVerbose("WWR ready fired with no waiters queued")
         }
         waiters.forEach { $0.resume() }
     }
