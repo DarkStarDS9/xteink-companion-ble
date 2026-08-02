@@ -48,6 +48,19 @@ constexpr uint8_t kSessBackground = 0x85;
 constexpr uint8_t kSessAcquireDenied = 0x86;
 constexpr uint8_t kSessAssetAck = 0x87;
 constexpr uint8_t kSessImageStatus = 0x88;
+// v9: progress marker for an in-flight image push sent over Write Without
+// Response, so the phone can detect a stalled/diverged transfer well before
+// the final IMAGE_STATUS -- see kOpChunk's image branch below.
+constexpr uint8_t kSessImageChunkAck = 0x89;
+
+// How often (in chunks) to send kSessImageChunkAck during an image push. Not
+// flow control -- iOS's own canSendWriteWithoutResponse/
+// peripheralIsReadyToSendWriteWithoutResponse already throttles the sender at
+// the OS level -- this is purely so the phone learns the device is still
+// alive and in sync well before the ~25s transfer's final IMAGE_STATUS,
+// letting it abort early instead of always waiting for the whole push to
+// finish before finding out it was corrupt.
+constexpr uint16_t kImageChunkAckInterval = 32;
 
 constexpr uint8_t kDeniedUserRejected = 0x00;
 constexpr uint8_t kDeniedTimeout = 0x01;
@@ -389,6 +402,14 @@ bool g_activeImageOverflow = false;
 // StorageFailed immediately rather than waiting on a message the writer task
 // may process very late, if ever.
 bool g_activeImageFailed = false;
+// v9+: image CHUNKs carry a 2-byte sequence number (see kOpChunk below) so a
+// dropped/reordered chunk under Write Without Response is detected instead of
+// silently corrupting the reassembled 2bpp payload. g_activeImageSeq is the
+// next expected value, reset to 0 at START; g_activeImageSeqGap latches once
+// a mismatch is seen, reported distinctly from StorageFailed at END so the
+// app can tell "the link dropped a packet" from "the SD card failed".
+uint16_t g_activeImageSeq = 0;
+bool g_activeImageSeqGap = false;
 // Wall-clock span of the image CHUNK sequence only -- set at START, read at
 // END -- so BLE transfer time can be told apart from decode/settle time
 // without needing a host-side script to measure it. Deliberately computed
@@ -721,6 +742,8 @@ void resetReassembly() {
   g_activeFinal = false;
   g_activeImageOverflow = false;
   g_activeImageFailed = false;
+  g_activeImageSeq = 0;
+  g_activeImageSeqGap = false;
   g_activeBuf.reset();
 }
 
@@ -766,7 +789,7 @@ void computeCapabilityValue(const GfxRenderer& renderer, int fontId) {
   const uint64_t mac = ESP.getEfuseMac();
 
   size_t offset = 0;
-  g_capabilityValue[offset++] = 8;  // protocol version
+  g_capabilityValue[offset++] = 9;  // protocol version
   g_capabilityValue[offset++] = static_cast<uint8_t>(screenWidthChars > 255 ? 255 : screenWidthChars);
   g_capabilityValue[offset++] = static_cast<uint8_t>(screenHeightChars > 255 ? 255 : screenHeightChars);
   g_capabilityValue[offset++] = static_cast<uint8_t>(kMaxFieldLen & 0xFF);
@@ -1085,12 +1108,38 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           // of when the write arrived, not what this task did with it.
           const uint32_t chunkEntryMs = millis();
           recordChunkGap(chunkEntryMs);
-          if (g_activeImageOverflow || g_activeImageFailed) return;
-          if (payloadLen > kMaxImageChunkPayload) {
+          if (g_activeImageOverflow || g_activeImageFailed || g_activeImageSeqGap) return;
+          // v9: image CHUNKs carry a 2-byte little-endian sequence number
+          // right after sessionId -- byte 0 opcode, byte 1 sessionId, bytes
+          // 2-3 seq, bytes 4..N payload. Every other field's CHUNK is
+          // unchanged (payload starts at byte 2). This exists because the
+          // image field is the one pushed over Write Without Response (see
+          // docs/companion-display-protocol.md "Image field"), which drops
+          // the link-layer's own delivery guarantee -- without a sequence
+          // number a lost chunk would shift every byte after it and
+          // silently corrupt the raw 2bpp payload instead of failing loudly.
+          if (len < 4) {
+            LOG_ERR("CBLE", "image CHUNK too short for seq header (%u bytes)", static_cast<unsigned>(len));
+            g_activeImageSeqGap = true;
+            enqueueImageAbort();
+            return;
+          }
+          uint16_t seq;
+          memcpy(&seq, data + 2, sizeof(seq));  // data may be unaligned
+          if (seq != g_activeImageSeq) {
+            LOG_ERR("CBLE", "image CHUNK sequence gap: expected %u got %u", static_cast<unsigned>(g_activeImageSeq),
+                    static_cast<unsigned>(seq));
+            g_activeImageSeqGap = true;
+            enqueueImageAbort();
+            return;
+          }
+          const uint8_t* imgPayload = data + 4;
+          const size_t imgPayloadLen = len - 4;
+          if (imgPayloadLen > kMaxImageChunkPayload) {
             // Cannot happen at the negotiated MTU (185, see ensureStarted()) --
             // guard anyway so a future MTU change fails loudly instead of
             // overflowing ImageWorkMsg::data.
-            LOG_ERR("CBLE", "image CHUNK payload %u exceeds max %u", static_cast<unsigned>(payloadLen),
+            LOG_ERR("CBLE", "image CHUNK payload %u exceeds max %u", static_cast<unsigned>(imgPayloadLen),
                     static_cast<unsigned>(kMaxImageChunkPayload));
             g_activeImageFailed = true;
             enqueueImageAbort();
@@ -1098,8 +1147,8 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           }
           ImageWorkMsg msg;
           msg.type = ImageWorkType::Chunk;
-          msg.len = static_cast<uint16_t>(payloadLen);
-          memcpy(msg.data, payload, payloadLen);
+          msg.len = static_cast<uint16_t>(imgPayloadLen);
+          memcpy(msg.data, imgPayload, imgPayloadLen);
           if (!enqueueImageWork(msg, "chunk")) {
             // Writer task is falling behind (or never started) -- fail this
             // transfer the same way a real SD write failure would: stop
@@ -1115,7 +1164,14 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           // reads this for the image field (see g_imageTransferStartMs's
           // comment) -- nothing else does, so a few bytes of skew in the rare
           // failure case is harmless.
-          g_activeWritten += payloadLen;
+          g_activeWritten += imgPayloadLen;
+          ++g_activeImageSeq;
+          if (g_activeImageSeq % kImageChunkAckInterval == 0) {
+            const uint16_t ackedSeq = g_activeImageSeq - 1;
+            const uint8_t ack[4] = {kSessImageChunkAck, g_activeSession, static_cast<uint8_t>(ackedSeq & 0xFF),
+                                     static_cast<uint8_t>((ackedSeq >> 8) & 0xFF)};
+            notifySession(ack, sizeof(ack));
+          }
           recordChunkBusy(chunkEntryMs);
           return;
         }
@@ -1152,6 +1208,12 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
             logLastConnParams();
             if (g_activeImageOverflow) {
               notifyImageStatus(ImageResult::RejectedSize);
+            } else if (g_activeImageSeqGap) {
+              // Distinct from StorageFailed: the SD path never ran into
+              // trouble here, a CHUNK's sequence number skipped ahead of
+              // what was expected -- the signature of a dropped Write
+              // Without Response packet, not a card write failure.
+              notifyImageStatus(ImageResult::SequenceGap);
             } else if (g_activeImageFailed) {
               // The writer task already knows (or will shortly, via the
               // Abort enqueued when the failure happened) that this transfer

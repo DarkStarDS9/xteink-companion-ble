@@ -9,9 +9,16 @@ import Foundation
 ///
 /// ```
 /// START:  0x01 | field|final | sessionId | length uint32 LE      (7 bytes)
-/// CHUNK:  0x02 | sessionId   | payload...
+/// CHUNK:  0x02 | sessionId   | payload...                          (other fields)
+/// CHUNK:  0x02 | sessionId   | seq uint16 LE | payload...           (field 0x04, image, v9+)
 /// END:    0x03 | sessionId
 /// ```
+///
+/// The image field's CHUNK carries an extra 2-byte sequence number because it
+/// is the one field pushed over Write Without Response (see
+/// `docs/companion-display-protocol.md` "Image field") — without a sequence
+/// number a dropped chunk would shift every byte after it and silently
+/// corrupt the reassembled raw 2bpp payload instead of failing loudly.
 public struct ContentFramer: Sequence {
     public let field: CompanionField
     public let sessionId: UInt8
@@ -20,9 +27,13 @@ public struct ContentFramer: Sequence {
     /// everything it has buffered when this field's END arrives. Use it on the
     /// last field of a title+body+content-id batch so they land together.
     public let isFinal: Bool
-    /// Payload bytes per CHUNK. This is the negotiated ATT payload minus the 2
-    /// bytes of CHUNK framing — see ``ContentFramer/chunkPayloadSize(forATTPayload:)``.
+    /// Payload bytes per CHUNK, already netted against this field's CHUNK
+    /// framing overhead — see ``ContentFramer/chunkPayloadSize(forATTPayload:field:)``.
     public let maxChunkPayload: Int
+
+    /// `true` for ``CompanionField/image`` — every other field's CHUNK is
+    /// unchanged from pre-v9.
+    var includesSequenceNumber: Bool { field == .image }
 
     public init(field: CompanionField,
                 sessionId: UInt8,
@@ -38,9 +49,16 @@ public struct ContentFramer: Sequence {
     }
 
     /// Usable CHUNK payload for a given ATT payload size (`maximumWriteValueLength`
-    /// on iOS, which already excludes the 3-byte ATT header).
+    /// on iOS, which already excludes the 3-byte ATT header) and field — the
+    /// image field's CHUNK carries 2 extra bytes of sequence number.
+    public static func chunkPayloadSize(forATTPayload attPayload: Int, field: CompanionField) -> Int {
+        Swift.max(1, attPayload - (field == .image ? 4 : 2))
+    }
+
+    /// Deprecated: assumes non-image framing overhead (2 bytes). Prefer
+    /// ``chunkPayloadSize(forATTPayload:field:)``.
     public static func chunkPayloadSize(forATTPayload attPayload: Int) -> Int {
-        Swift.max(1, attPayload - 2)
+        chunkPayloadSize(forATTPayload: attPayload, field: .title)
     }
 
     /// Number of packets this framer will emit, START and END included.
@@ -54,6 +72,7 @@ public struct ContentFramer: Sequence {
     public struct Iterator: IteratorProtocol {
         private let framer: ContentFramer
         private var offset = 0
+        private var seq: UInt16 = 0
         private var stage = Stage.start
 
         private enum Stage { case start, chunks, end, done }
@@ -73,9 +92,14 @@ public struct ContentFramer: Sequence {
 
             case .chunks:
                 let end = Swift.min(offset + framer.maxChunkPayload, framer.payload.count)
-                var packet = Data(capacity: 2 + (end - offset))
+                let headerLen = 2 + (framer.includesSequenceNumber ? 2 : 0)
+                var packet = Data(capacity: headerLen + (end - offset))
                 packet.append(CompanionProtocol.opChunk)
                 packet.append(framer.sessionId)
+                if framer.includesSequenceNumber {
+                    packet.appendUInt16LE(seq)
+                    seq += 1
+                }
                 packet.append(framer.payload[framer.payload.startIndex + offset ..< framer.payload.startIndex + end])
                 offset = end
                 if offset >= framer.payload.count { stage = .end }

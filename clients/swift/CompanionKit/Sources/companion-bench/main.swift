@@ -129,6 +129,8 @@ let listener = Task {
         case .disconnected(let reason):
             print("Disconnected: \(reason ?? "unknown")")
             if !pushStarted { exit(1) }
+        case .imageChunkAck(let seq):
+            print("\n  chunk ack: seq=\(seq)")
         default:
             break
         }

@@ -57,6 +57,10 @@ public enum CompanionEvent: Sendable {
     case acquireDenied(AcquireDeniedReason)
     case buttonEvent(CompanionButtonEvent)
     case imageStatus(ImageResult)
+    /// v9: progress marker during an in-flight image push, roughly every 32
+    /// chunks — see ``SessionNotification/imageChunkAck``. Diagnostic only;
+    /// `pushImage` still resolves from the final `imageStatus`.
+    case imageChunkAck(seq: UInt16)
     case disconnected(reason: String?)
     case failure(CompanionError)
 }
@@ -508,21 +512,52 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         lock.unlock()
         guard let characteristic, let target else { throw CompanionError.notConnected }
 
-        let attPayload = target.maximumWriteValueLength(for: .withResponse)
+        // The image field's bulk CHUNKs go out over Write Without Response —
+        // see docs/companion-display-protocol.md "Image field" (v9). A
+        // write-with-response round trip costs ~120ms regardless of the
+        // negotiated connection interval (measured on real hardware, see
+        // companion-bench), which floors a ~200-chunk image transfer at
+        // several times the link's real throughput. WWR has no such round
+        // trip, but drops CoreBluetooth's own delivery guarantee, which is
+        // why the image CHUNK format carries a sequence number (device-side
+        // gap detection) and the device sends a periodic ack (early failure
+        // detection) — see ``SessionMessage/imageChunkAck``. START and END
+        // stay Write, so the phone still gets a reliable begin/end ack; every
+        // other field is untouched (Write throughout, same as pre-v9).
+        let chunkWriteType: CBCharacteristicWriteType = field == .image ? .withoutResponse : .withResponse
+        let attPayload = target.maximumWriteValueLength(for: chunkWriteType)
         let framer = ContentFramer(field: field,
                                    sessionId: sessionId,
                                    payload: payload,
                                    isFinal: isFinal,
-                                   maxChunkPayload: ContentFramer.chunkPayloadSize(forATTPayload: attPayload))
+                                   maxChunkPayload: ContentFramer.chunkPayloadSize(forATTPayload: attPayload, field: field))
         let total = framer.packetCount
         var sent = 0
-        // Write-with-response throughout: a dropped chunk silently corrupts the
-        // reassembled field, and for an image that means a multi-second transfer
-        // wasted on a PNG that will not decode.
         for packet in framer {
-            try await write(packet, to: characteristic, on: target)
+            if chunkWriteType == .withoutResponse, packet.first == CompanionProtocol.opChunk {
+                await waitUntilReadyForWriteWithoutResponse(on: target)
+                target.writeValue(packet, for: characteristic, type: .withoutResponse)
+            } else {
+                try await write(packet, to: characteristic, on: target)
+            }
             sent += 1
             progress?(Double(sent) / Double(total))
+        }
+    }
+
+    /// CoreBluetooth's own backpressure for Write Without Response: the OS
+    /// buffers a bounded number of un-acked WWR writes and calls
+    /// `peripheralIsReady(toSendWriteWithoutResponse:)` once space frees up.
+    /// Writing past that without waiting drops the excess silently at the OS
+    /// layer — this is what keeps the image CHUNK loop from outrunning it.
+    private var writeWithoutResponseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    private func waitUntilReadyForWriteWithoutResponse(on target: CBPeripheral) async {
+        if target.canSendWriteWithoutResponse { return }
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            writeWithoutResponseWaiters.append(continuation)
+            lock.unlock()
         }
     }
 
@@ -697,6 +732,10 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
             lock.lock(); let pending = pendingImageStatus; pendingImageStatus = nil; lock.unlock()
             pending?.resume(result)
             emit(.imageStatus(result))
+
+        case let .imageChunkAck(session, seq):
+            guard session == currentSession else { return }
+            emit(.imageChunkAck(seq: seq))
         }
     }
 }
@@ -741,9 +780,16 @@ extension CompanionClient: CBCentralManagerDelegate {
         contentChar = nil; buttonChar = nil; capabilityChar = nil; statusChar = nil; sessionChar = nil
         let writes = writeContinuations
         writeContinuations = []
+        let wwrWaiters = writeWithoutResponseWaiters
+        writeWithoutResponseWaiters = []
         lock.unlock()
 
         writes.forEach { $0.resume(throwing: CompanionError.disconnected) }
+        // Can't throw (CheckedContinuation<Void, Never>) -- waking it just lets
+        // an in-flight image push's loop proceed to its next packet, which then
+        // fails immediately via requireSession()/target-is-nil the same way any
+        // other post-disconnect send would.
+        wwrWaiters.forEach { $0.resume() }
         failPending(with: CompanionError.disconnected)
         Task { await gate.reset() }
         transition(to: .disconnected)
@@ -851,6 +897,14 @@ extension CompanionClient: CBPeripheralDelegate {
         default:
             break
         }
+    }
+
+    public func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        lock.lock()
+        let waiters = writeWithoutResponseWaiters
+        writeWithoutResponseWaiters = []
+        lock.unlock()
+        waiters.forEach { $0.resume() }
     }
 
     public func peripheral(_ peripheral: CBPeripheral,

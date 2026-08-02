@@ -226,6 +226,12 @@ enum class ImageResult : uint8_t {
   DecodeFailed = 0x01,
   RejectedSize = 0x02,
   StorageFailed = 0x03,
+  // v9: the image CHUNK sequence number (see CompanionBle.cpp's kOpChunk)
+  // skipped ahead of what was expected -- a packet was lost or reordered
+  // under Write Without Response. Distinct from StorageFailed so the app can
+  // tell "the link dropped a packet" (retry the whole push) from "the SD
+  // card failed" (a device-local problem retrying won't fix).
+  SequenceGap = 0x04,
 };
 
 // Why a session lost the screen, reported as BACKGROUND.

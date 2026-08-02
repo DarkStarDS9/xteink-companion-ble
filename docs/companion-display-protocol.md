@@ -14,14 +14,12 @@ Home/reader entry path in normal operation.
 
 ## Status
 
-**v7 — the current contract.** v6 was a **clean break**: the session handshake
+**v9 — the current contract.** v6 was a **clean break**: the session handshake
 is mandatory, and a client that pushes content without a valid session is
-ignored. A v5 client will connect, push, and see nothing happen. v7 keeps that
-shape unchanged and makes one further breaking change on top of it: field
-`0x04` (image) is no longer PNG, see "v7 changes from v6" below. Since nothing
-built against v6 has ever executed on the wire (see the warning box below),
-this is a wire-format redesign, not a migration with real clients to
-accommodate.
+ignored. A v5 client will connect, push, and see nothing happen. v9 keeps that
+shape unchanged and makes one further breaking change on top of it: the image
+field's `CHUNK` gains a sequence number and is now pushed over Write Without
+Response — see "v9 changes from v8" below.
 
 This document is **authoritative** and is written first on purpose: consumer
 apps are built against it while the firmware side lands. Where the firmware and
@@ -316,6 +314,7 @@ when one app on a shared link is done but the other is still using the device.
 0x86 ACQUIRE_DENIED sessionId  reason:1
 0x87 ASSET_ACK      sessionId  assetId:1  result:1  tag[4]
 0x88 IMAGE_STATUS   sessionId  result:1
+0x89 IMAGE_CHUNK_ACK sessionId seq:2                          -- new in v9
 ```
 
 ```
@@ -342,7 +341,15 @@ IMAGE_STATUS result      0x00 DISPLAYED
                          0x01 DECODE_FAILED     wrong byte count for a raw 2bpp full-screen image
                          0x02 REJECTED_SIZE     exceeded max image length
                          0x03 STORAGE_FAILED    could not stage to SD
+                         0x04 SEQUENCE_GAP      a CHUNK's sequence number skipped ahead of what
+                                                was expected -- new in v9, see "Image field"
 ```
+
+`IMAGE_CHUNK_ACK` is a progress marker only, sent roughly every 32 CHUNKs
+during an image push (see "Image field" below) — it is not required for
+correctness and a client that ignores it loses nothing but early failure
+detection. `seq` is the highest contiguous CHUNK sequence number the device
+has processed.
 
 `ASSET_ACK` and `IMAGE_STATUS` are the two things a client genuinely cannot
 work out for itself: whether the device stored the asset, and whether the
@@ -447,7 +454,7 @@ BLE clients can't assume a large MTU (iOS negotiates anywhere from ~185 to
 ~500 bytes; other platforms may negotiate less), so content is sent as a
 sequence of framed packets rather than one write.
 
-### Framing (v6)
+### Framing (v6, `CHUNK` amended in v9 for the image field)
 
 ```
 START:  byte 0      opcode = 0x01
@@ -457,7 +464,12 @@ START:  byte 0      opcode = 0x01
 
 CHUNK:  byte 0      opcode = 0x02
         byte 1      sessionId
-        bytes 2..N  payload bytes
+        bytes 2..N  payload bytes                    (every field except image)
+
+CHUNK:  byte 0      opcode = 0x02
+        byte 1      sessionId
+        bytes 2..3  sequence number, uint16 little-endian, starting at 0
+        bytes 4..N  payload bytes                    (image field only, v9+ — see "Image field")
 
 END:    byte 0      opcode = 0x03
         byte 1      sessionId
@@ -465,10 +477,11 @@ END:    byte 0      opcode = 0x03
 
 A push of one field is: one `START` declaring the field and its total byte
 length, one or more `CHUNK`s carrying the bytes in order (each sized to the
-negotiated MTU minus the 2 bytes of framing overhead), then one `END`. Fields
-are independent pushes over the same characteristic — send one field's full
-START/CHUNK…/END before starting the next. The device does not assume an order
-beyond "each field is internally ordered".
+negotiated MTU minus the CHUNK framing overhead — 2 bytes, or 4 for the image
+field), then one `END`. Fields are independent pushes over the same
+characteristic — send one field's full START/CHUNK…/END before starting the
+next. The device does not assume an order beyond "each field is internally
+ordered".
 
 **`sessionId` is on every frame, including `CHUNK`.** It costs one byte per
 packet and buys the guarantee that a stray write from a background app can
@@ -535,9 +548,30 @@ timeout (3 s) rather than sitting on stale content indefinitely.
 
 On the client side this is a small, fully synchronous send loop — there is no
 per-chunk ack. If reliable delivery matters, use "Write" (not "Write Without
-Response") for the CHUNK packets so BLE's own link-layer ack applies. For the
-image field, **always** use Write-with-response: a dropped chunk shifts every
-byte after it, corrupting the raw 2bpp payload, and wastes the transfer.
+Response") for the CHUNK packets so BLE's own link-layer ack applies.
+
+**Except the image field, where the recommendation is the opposite as of v9:
+push its CHUNKs with Write Without Response.** Measured on real hardware
+(ESP32-C3, 15ms connection interval, 2M PHY): a write-with-response round trip
+costs ~120ms regardless of connection interval — the peripheral's own handling
+is 0-1ms, so the cost is the ATT round trip itself, not anything the firmware
+does. That floors a ~200-chunk image transfer at several times the link's real
+throughput. Write Without Response has no such round trip, but drops
+CoreBluetooth/BlueZ's own delivery guarantee, which is why the image field's
+CHUNK carries the sequence number described above: a dropped or reordered
+chunk is now something the device *detects* (`IMAGE_STATUS(SEQUENCE_GAP)`)
+instead of something that silently corrupts the reassembled 2bpp payload. Keep
+`START` and `END` on Write, so the phone still gets a reliable begin/end ack.
+Every other field is unaffected — small enough that the per-chunk round trip
+this exists to avoid barely matters, and (having no sequence number) still
+depends on Write's link-layer ack for correctness.
+
+A client pushing over Write Without Response should throttle to what the OS
+buffers for un-acked WWR writes (iOS: `CBPeripheral.canSendWriteWithoutResponse`
+/ `peripheralIsReady(toSendWriteWithoutResponse:)`) rather than writing in a
+tight loop — `IMAGE_CHUNK_ACK` (above) is a diagnostic on top of that, not a
+substitute for it, since it arrives only every ~32 chunks and says nothing
+about how many writes the OS will currently accept.
 
 ### Content-id field (`0x03`) — opaque correlation token
 
@@ -598,7 +632,17 @@ the e-ink refresh, not decoding.
 
 **Wire format.**
 
-- No header. The payload is exactly `bytesPerRow * screenHeightPx` bytes —
+- **The field's `CHUNK` carries a 2-byte sequence number (v9+).** See "Atomic
+  multi-field pushes" above for why (bulk image CHUNKs go out over Write
+  Without Response) and "Framing" for the exact byte layout. The device
+  tracks the next expected value and fails the transfer with
+  `IMAGE_STATUS(SEQUENCE_GAP)` the instant a CHUNK arrives out of order — a
+  lost or reordered packet is detected rather than silently corrupting the
+  reassembled payload the way it would with no sequence number. There is no
+  partial-resume protocol: recovering from `SEQUENCE_GAP` means re-pushing
+  the field from a fresh `START`.
+- No header (beyond the CHUNK sequence number above). The payload is exactly
+  `bytesPerRow * screenHeightPx` bytes —
   nothing else. Both sides already know the dimensions from the capability
   characteristic (bytes 17..20), so a length/width/height header would be
   redundant weight on every single push.
@@ -974,13 +1018,14 @@ string or a short opaque token. Treat 32 bytes as the contract.
 ## Capability characteristic — introspection
 
 A single read-only value clients query instead of hardcoding assumptions about
-the device. **23 bytes**, unchanged in layout since v6 — v7 and v8 each only
-bumped the version number itself (byte 0), for field `0x04`'s payload format
-change and the `HELLO`/UI-declaration additions respectively; see "v7 changes
-from v6" and "v8 changes from v7":
+the device. **23 bytes**, unchanged in layout since v6 — v7, v8 and v9 each
+only bumped the version number itself (byte 0), for field `0x04`'s payload
+format change, the `HELLO`/UI-declaration additions, and the image `CHUNK`
+sequence number respectively; see "v7 changes from v6", "v8 changes from v7"
+and "v9 changes from v8":
 
 ```
-byte 0        protocol version = 8
+byte 0        protocol version = 9
 byte 1        screen width in characters, at the font Companion Mode uses
 byte 2        screen height in characters (lines per page)
 bytes 3..4    max text field length, uint16 LE — title/body only
@@ -1004,10 +1049,10 @@ future revision. It is the one thing a client can rely on before it knows
 whether it can talk to the device at all.
 
 That makes it the graceful-degradation path across the v5 break, which is the
-whole reason to guarantee it. A v7 client should:
+whole reason to guarantee it. A v9 client should:
 
 1. Read the characteristic immediately after connecting.
-2. Check byte 0. If it is not 7, tell the user *"this reader's firmware is too
+2. Check byte 0. If it is not 9, tell the user *"this reader's firmware is too
    old for this version of <app>"* (or too new) and stop. Do not attempt the
    handshake, and do not guess at the layout — the 23-byte value shares nothing
    past byte 4 with v5's 5-byte one.
@@ -1127,6 +1172,35 @@ growth would make `peers.json` unbounded, and it is parsed into RAM.
 ---
 
 ## Version history
+
+### v9 changes from v8 — **breaking**
+
+1. **The image field's (`0x04`) `CHUNK` gains a 2-byte little-endian sequence
+   number**, right after `sessionId` — see "Framing" and "Image field" above.
+   Every other field's `CHUNK` is unchanged.
+2. **The image field's `CHUNK`s are now pushed over Write Without Response**
+   (recommended, not enforced at the GATT level — the Content characteristic
+   already advertised both write types since v6). `START` and `END` stay
+   Write. See "Atomic multi-field pushes" above for the measurement behind
+   this and why the sequence number exists.
+3. **New device → phone notification `IMAGE_CHUNK_ACK` (`0x89`)**, sent every
+   ~32 CHUNKs during an image push — see "Session characteristic". Diagnostic
+   only; ignoring it costs a client nothing but early failure detection.
+4. **New `IMAGE_STATUS` result `SEQUENCE_GAP` (`0x04`)** — the device
+   detected a CHUNK sequence number that skipped ahead of what it expected.
+5. **Capability byte 0 bumped from 8 to 9.** No other capability bytes moved.
+
+Why: measured on real hardware (ESP32-C3, 15ms connection interval, 2M PHY),
+a write-with-response round trip on the image CHUNK path costs ~120ms
+regardless of connection interval, floored by the ATT round trip itself
+rather than anything the firmware does with the write (the peripheral's own
+`onWrite` handling measured 0-1ms). For a ~200-chunk image push that is
+several times slower than the link's real throughput. Write Without Response
+removes that round trip, at the cost of BLE's own delivery guarantee — the
+sequence number and the periodic ack together turn a silently corrupted
+transfer into one the device (and, with `IMAGE_CHUNK_ACK`, the phone) detects
+instead. There is no partial-resume protocol yet: recovering from a
+`SEQUENCE_GAP` means re-pushing the field from a fresh `START`.
 
 ### v8 changes from v7 — **breaking**
 
@@ -1344,6 +1418,12 @@ Images:
 28. Push a body after an image and confirm the screen returns to text.
 28b. With a tag visible, push an image and confirm the chip is drawn over the
     print; hide every tag, re-push, and confirm the print is untouched.
+28c. **(v9)** Push an image over Write Without Response with correctly
+    incrementing CHUNK sequence numbers: confirm `IMAGE_CHUNK_ACK` notifies
+    roughly every 32 chunks and the transfer still ends in
+    `IMAGE_STATUS(DISPLAYED)`. Then push one with a deliberately skipped
+    sequence number: confirm `IMAGE_STATUS(SEQUENCE_GAP)` and that the
+    previous screen is retained, the same as a decode failure.
 
 Icons and sleep screen:
 

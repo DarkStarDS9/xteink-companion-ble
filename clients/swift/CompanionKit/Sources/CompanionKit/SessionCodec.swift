@@ -10,6 +10,10 @@ public enum SessionMessage: Equatable, Sendable {
     case acquireDenied(sessionId: UInt8, reason: AcquireDeniedReason)
     case assetAck(sessionId: UInt8, assetId: UInt8, result: AssetResult, tag: AssetTag)
     case imageStatus(sessionId: UInt8, result: ImageResult)
+    /// v9: progress marker during an in-flight image push — see
+    /// ``SessionNotification/imageChunkAck``. `seq` is the highest
+    /// contiguous CHUNK sequence number the device has processed.
+    case imageChunkAck(sessionId: UInt8, seq: UInt16)
 }
 
 /// Encoders and decoders for the Session characteristic. Pure functions over
@@ -119,6 +123,10 @@ public enum SessionCodec {
         case .imageStatus:
             guard let sessionId = data.byte(1), let result = data.byte(2) else { return nil }
             return .imageStatus(sessionId: sessionId, result: ImageResult(wire: result))
+
+        case .imageChunkAck:
+            guard let sessionId = data.byte(1), let seq = data.uint16LE(at: 2) else { return nil }
+            return .imageChunkAck(sessionId: sessionId, seq: seq)
         }
     }
 

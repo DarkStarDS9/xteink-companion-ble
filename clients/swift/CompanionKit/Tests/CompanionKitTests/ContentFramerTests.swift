@@ -72,6 +72,31 @@ final class ContentFramerTests: XCTestCase {
     func testChunkPayloadSizeLeavesRoomForFraming() {
         XCTAssertEqual(ContentFramer.chunkPayloadSize(forATTPayload: 182), 180)
         XCTAssertEqual(ContentFramer.chunkPayloadSize(forATTPayload: 1), 1)
+        // The image field's CHUNK carries 2 extra bytes (sequence number) —
+        // see "Image field" (v9) in docs/companion-display-protocol.md.
+        XCTAssertEqual(ContentFramer.chunkPayloadSize(forATTPayload: 182, field: .image), 178)
+        XCTAssertEqual(ContentFramer.chunkPayloadSize(forATTPayload: 182, field: .body), 180)
+    }
+
+    func testImageChunksCarryALittleEndianSequenceNumber() {
+        // v9: only the image field's CHUNK gains the 2-byte seq — every other
+        // field's framing (tested above) is untouched.
+        let payload = Data((0 ..< 250).map { UInt8($0 % 256) })
+        let framer = ContentFramer(field: .image, sessionId: 5, payload: payload, maxChunkPayload: 100)
+        let packets = Array(framer)
+
+        XCTAssertEqual(packets.count, 5)  // START + 3 chunks + END
+        let chunks = packets[1 ..< 4]
+        XCTAssertEqual(chunks.map(\.count), [104, 104, 54])  // +2 seq bytes per chunk vs. the non-image test
+        for (index, chunk) in chunks.enumerated() {
+            XCTAssertEqual(chunk[chunk.startIndex], 0x02)
+            XCTAssertEqual(chunk[chunk.startIndex + 1], 5)
+            let seq = UInt16(chunk[chunk.startIndex + 2]) | (UInt16(chunk[chunk.startIndex + 3]) << 8)
+            XCTAssertEqual(seq, UInt16(index))
+        }
+
+        let reassembled = chunks.reduce(into: Data()) { $0.append($1.dropFirst(4)) }
+        XCTAssertEqual(reassembled, payload)
     }
 
     func testFramerIsLazyAndRepeatable() {

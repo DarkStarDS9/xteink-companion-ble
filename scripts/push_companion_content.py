@@ -60,7 +60,8 @@ SESS_HELLO, SESS_BYE, SESS_ACQUIRE, SESS_RELEASE = 0x01, 0x02, 0x03, 0x04
     SESS_ACQUIRE_DENIED,
     SESS_ASSET_ACK,
     SESS_IMAGE_STATUS,
-) = (0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88)
+    SESS_IMAGE_CHUNK_ACK,
+) = (0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89)
 
 DENIED_REASONS = {
     0x00: "user rejected",
@@ -72,7 +73,13 @@ DENIED_REASONS = {
 }
 ACQUIRE_DENIED_REASONS = {0x00: "no UI declaration stored", 0x01: "unknown session"}
 ASSET_RESULTS = {0x00: "stored", 0x01: "rejected: size", 0x02: "rejected: format", 0x03: "rejected: storage"}
-IMAGE_RESULTS = {0x00: "displayed", 0x01: "decode failed", 0x02: "rejected: size", 0x03: "storage failed"}
+IMAGE_RESULTS = {
+    0x00: "displayed",
+    0x01: "decode failed",
+    0x02: "rejected: size",
+    0x03: "storage failed",
+    0x04: "sequence gap (dropped/reordered chunk)",
+}
 BUTTON_NAMES = {0: "BACK", 1: "CONFIRM", 2: "LEFT", 3: "RIGHT", 4: "UP", 5: "DOWN", 6: "POWER"}
 
 ROUTING_NONE, ROUTING_REMOTE, ROUTING_PAGE_PREV, ROUTING_PAGE_NEXT, ROUTING_SLEEP = range(5)
@@ -270,6 +277,12 @@ class Session:
                 self.loop.call_soon_threadsafe(future.set_result, (data[3], bytes(data[4:8])))
         elif opcode == SESS_IMAGE_STATUS:
             self._resolve("image_future", data[2])
+        elif opcode == SESS_IMAGE_CHUNK_ACK:
+            # Diagnostic only -- progress marker during an in-flight image
+            # push, well before the final SESS_IMAGE_STATUS. Nothing here
+            # awaits it.
+            seq = struct.unpack_from("<H", data, 2)[0]
+            print(f"  chunk ack: seq={seq}")
 
     def _resolve(self, attr: str, value) -> None:
         future = getattr(self, attr, None)
@@ -320,12 +333,24 @@ class Session:
         start = bytes([OP_START, field_byte, self.session_id]) + struct.pack("<I", len(data))
         await self.client.write_gatt_char(CONTENT_CHAR_UUID, start, response=True)
 
-        total = max(1, (len(data) + self.chunk_payload - 1) // self.chunk_payload)
-        for index, offset in enumerate(range(0, len(data), self.chunk_payload)):
-            chunk = data[offset : offset + self.chunk_payload]
-            await self.client.write_gatt_char(
-                CONTENT_CHAR_UUID, bytes([OP_CHUNK, self.session_id]) + chunk, response=True
-            )
+        # v9: the image field's CHUNK carries a 2-byte little-endian sequence
+        # number right after sessionId (see "Image field" in
+        # docs/companion-display-protocol.md) -- every other field's CHUNK is
+        # unchanged. This script still writes with response (bleak has no
+        # cross-platform equivalent of CoreBluetooth's
+        # canSendWriteWithoutResponse flow control), so the seq number is
+        # belt-and-suspenders here rather than load-bearing -- but the device
+        # requires it unconditionally for field 0x04, regardless of which ATT
+        # write type carried it.
+        is_image = field == FIELD_IMAGE
+        chunk_payload = max(1, self.chunk_payload - 2) if is_image else self.chunk_payload
+        total = max(1, (len(data) + chunk_payload - 1) // chunk_payload)
+        for index, offset in enumerate(range(0, len(data), chunk_payload)):
+            chunk = data[offset : offset + chunk_payload]
+            header = bytes([OP_CHUNK, self.session_id])
+            if is_image:
+                header += struct.pack("<H", index)
+            await self.client.write_gatt_char(CONTENT_CHAR_UUID, header + chunk, response=True)
             if progress and (index % 25 == 0 or index == total - 1):
                 print(f"\r  sending {index + 1}/{total} chunks", end="", flush=True)
         if progress:
@@ -342,6 +367,12 @@ class Session:
         return result
 
     async def push_image(self, raw_bitmap: bytes) -> int:
+        # Unlike the rest of this script (which only exercises the stable-
+        # since-v6 subset), image CHUNKs now carry a v9 sequence number this
+        # script always sends -- a pre-v9 device has no idea to expect those 2
+        # extra bytes and would mis-parse every chunk.
+        if self.caps["version"] < 9:
+            raise SystemExit(f"Device speaks protocol v{self.caps['version']}, image push needs v9+.")
         expected = ((self.caps["px_wide"] + 3) // 4) * self.caps["px_high"]
         if len(raw_bitmap) != expected:
             raise SystemExit(

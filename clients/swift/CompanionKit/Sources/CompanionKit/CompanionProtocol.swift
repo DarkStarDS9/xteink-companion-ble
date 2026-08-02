@@ -13,7 +13,7 @@ public enum CompanionProtocol {
     /// on an older number than a connected device's firmware is just as broken
     /// as the reverse, and looks confusingly like the *device* needs an update
     /// when it's actually this package that's behind.
-    public static let version: UInt8 = 8
+    public static let version: UInt8 = 9
 
     public static let serviceUUID = "7C9C0000-3E4A-4B1A-9C1E-6D8A1F2B0001"
     public static let contentCharacteristicUUID = "7C9C0001-3E4A-4B1A-9C1E-6D8A1F2B0001"
@@ -70,6 +70,12 @@ enum SessionNotification: UInt8 {
     case acquireDenied = 0x86
     case assetAck = 0x87
     case imageStatus = 0x88
+    /// v9: progress marker sent every ``ContentFramer/imageChunkAckInterval``
+    /// chunks during an image push over Write Without Response, well before
+    /// the final `imageStatus` — lets a client detect a stalled/diverged
+    /// transfer early. Not flow control (CoreBluetooth's own
+    /// `canSendWriteWithoutResponse` already handles that).
+    case imageChunkAck = 0x89
 }
 
 public enum HelloDeniedReason: UInt8, Sendable {
@@ -118,6 +124,12 @@ public enum ImageResult: UInt8, Sendable {
     case decodeFailed = 0x01
     case rejectedSize = 0x02
     case storageFailed = 0x03
+    /// v9: the device saw an image CHUNK's sequence number skip ahead of what
+    /// it expected — a packet was lost or reordered under Write Without
+    /// Response. Retrying the whole push (not just the missing chunk — there
+    /// is no partial-resume protocol yet) is the right response, unlike
+    /// ``storageFailed`` which points at the SD card instead.
+    case sequenceGap = 0x04
     case unknown = 0xFF
 
     init(wire: UInt8) { self = ImageResult(rawValue: wire) ?? .unknown }
