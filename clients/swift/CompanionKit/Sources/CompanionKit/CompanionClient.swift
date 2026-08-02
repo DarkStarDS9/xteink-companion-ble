@@ -377,19 +377,86 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     ///
     /// Takes several seconds: BLE transfer plus a two-pass grayscale settle.
     /// `progress` is called on an arbitrary queue with 0...1.
+    ///
+    /// A transient failure is retried once, automatically — see
+    /// ``isTransientImageFailure(_:)`` for which results qualify and why. The
+    /// retry re-sends the whole image (there is no partial-resume anywhere in
+    /// the protocol), so `progress` restarts from 0 and climbs to 1 a second
+    /// time. That is the honest report: a bar that jumps back to the start is
+    /// exactly what is happening on the wire. A caller that wants to say so in
+    /// its UI can watch for the progress value decreasing.
     @discardableResult
     public func pushImage(_ png: Data, progress: (@Sendable (Double) -> Void)? = nil) async throws -> ImageResult {
         try await serialized { [self] in
-            let session = try requireSession()
-            if let limit = deviceCapabilities?.maxImageFieldLength, png.count > limit {
-                throw CompanionError.payloadTooLarge(field: .image, bytes: png.count, limit: limit)
-            }
+            // Note the retry lives *inside* `serialized`: the gate is acquired
+            // once for both attempts. Retrying by re-calling `pushImage` would
+            // try to re-acquire a gate this task already holds, which is a
+            // straight deadlock — CommandGate is a plain non-reentrant mutex.
+            // Holding it across the retry is also what we want semantically:
+            // another push interleaving between the two attempts would make the
+            // device discard whichever field arrived first.
+            let first = try await attemptImagePush(png, progress: progress)
+            if first == .displayed { return first }
+            guard Self.isTransientImageFailure(first) else { throw CompanionError.imageRejected(first) }
 
-            let result = try await withPendingImageStatus {
-                try await self.sendField(.image, payload: png, sessionId: session, isFinal: true, progress: progress)
-            }
-            guard result == .displayed else { throw CompanionError.imageRejected(result) }
-            return result
+            log("image push failed with \(first); retrying once")
+            // Re-checked rather than reused from the first attempt: the screen
+            // can have been preempted, or the link dropped, while the failed
+            // transfer was in flight. `attemptImagePush` calls `requireSession`
+            // again, which throws in either case instead of spending another
+            // ~104 KB of airtime on frames the device will discard.
+            let second = try await attemptImagePush(png, progress: progress)
+            guard second == .displayed else { throw CompanionError.imageRejected(second) }
+            return second
+        }
+    }
+
+    /// One transfer attempt. Assumes the command gate is already held.
+    private func attemptImagePush(_ png: Data,
+                                  progress: (@Sendable (Double) -> Void)?) async throws -> ImageResult {
+        let session = try requireSession()
+        if let limit = deviceCapabilities?.maxImageFieldLength, png.count > limit {
+            throw CompanionError.payloadTooLarge(field: .image, bytes: png.count, limit: limit)
+        }
+        return try await withPendingImageStatus {
+            try await self.sendField(.image, payload: png, sessionId: session, isFinal: true, progress: progress)
+        }
+    }
+
+    /// Whether a non-`displayed` image result is worth one more try.
+    ///
+    /// Retrying is not free — a full-screen image is ~104 KB and takes seconds —
+    /// so this retries only where the same bytes plausibly succeed next time,
+    /// and never where a second attempt would just buy the same failure at
+    /// double the wait. Case by case:
+    ///
+    /// - ``ImageResult/sequenceGap``: **retry.** A CHUNK went missing under
+    ///   Write Without Response, which has no delivery guarantee and no
+    ///   retransmission anywhere in this protocol — one dropped packet
+    ///   currently kills the entire transfer. That is precisely the failure a
+    ///   retry exists for, and it is per-packet luck rather than anything about
+    ///   the image.
+    /// - ``ImageResult/storageFailed``: **retry.** The device stages the image
+    ///   to an SD scratch file; a failed write is a card/filesystem hiccup, not
+    ///   a property of the payload. If the card is genuinely gone the retry
+    ///   fails the same way and the caller sees the error one attempt later.
+    /// - ``ImageResult/rejectedSize``: **no.** Deterministic, and computable
+    ///   from the capability characteristic — the same bytes are the same size
+    ///   next time.
+    /// - ``ImageResult/decodeFailed``: **no.** Also deterministic in the payload:
+    ///   a complete transfer that the device could not make sense of will not
+    ///   make more sense on a second reading. (A *truncated* transfer is not
+    ///   this case — the device reports that as a sequence gap.)
+    /// - ``ImageResult/unknown``: **no.** A result byte this package does not
+    ///   recognise carries no claim that it is transient, and blind retrying on
+    ///   "don't know" is how a future permanent rejection turns into a doubled
+    ///   wait for every caller.
+    private static func isTransientImageFailure(_ result: ImageResult) -> Bool {
+        switch result {
+        case .sequenceGap, .storageFailed:
+            return true
+        case .displayed, .decodeFailed, .rejectedSize, .unknown:
+            return false
         }
     }
 
