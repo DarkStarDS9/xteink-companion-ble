@@ -565,48 +565,110 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     /// `peripheralIsReady(toSendWriteWithoutResponse:)` once space frees up.
     /// Writing past that without waiting drops the excess silently at the OS
     /// layer — this is what keeps the image CHUNK loop from outrunning it.
-    private var writeWithoutResponseWaiters: [(id: Int, continuation: CheckedContinuation<Void, Never>)] = []
-    /// DIAGNOSTIC (2026-08-03 link-robustness investigation): monotonic id per
-    /// wait, so the log can pair an enter with its resume and name the one that
-    /// never came back.
+    private var writeWithoutResponseWaiters: [WriteWithoutResponseWaiter] = []
+    /// Monotonic id per wait, so the log can pair an enter with its resume and
+    /// name the one that never came back. Introduced by the 2026-08-03
+    /// link-robustness investigation and kept: the fallback message below is
+    /// useless without a way to identify which wait tripped it.
     private var writeWithoutResponseWaitCounter = 0
-    /// DIAGNOSTIC: how long a wait may sit unresumed before it is reported as a
-    /// wedge. CoreBluetooth normally drains within a connection interval or two;
-    /// seconds means the wakeup was lost.
-    private static let writeWithoutResponseWedgeWarningSeconds: UInt64 = 5
+    /// How long a wait may sit unresumed before the fallback resumes it anyway.
+    ///
+    /// Bound justification: the negotiated connection interval on this device is
+    /// 15-60 ms, and CoreBluetooth frees WWR buffer space within a connection
+    /// event or two — a normal wait resolves in well under 150 ms. Two seconds is
+    /// therefore more than an order of magnitude past any legitimate wait, so the
+    /// fallback cannot fire during healthy operation and add spurious dropped
+    /// chunks; and it is short enough that even the pathological case (every
+    /// chunk waiting the full timeout) fails the transfer inside the image
+    /// status timeout rather than parking the caller. It is also comfortably
+    /// under BLE's supervision timeout, so a genuinely dead link produces a
+    /// disconnect (which resumes all waiters) rather than a long series of
+    /// fallbacks.
+    private static let writeWithoutResponseFallbackSeconds: UInt64 = 2
 
+    /// Waits until CoreBluetooth will accept another Write Without Response.
+    ///
+    /// The whole point of this function is a lost-wakeup race that was live from
+    /// v9 (image CHUNKs over WWR) until 2026-08-03. The old shape read
+    /// `canSendWriteWithoutResponse` *outside* the lock and only then took the
+    /// lock to enqueue its continuation, while
+    /// ``peripheralIsReady(toSendWriteWithoutResponse:)`` drains the queue under
+    /// that same lock. Interleave them and the wakeup is lost outright: the
+    /// sender sees `canSend == false`, CoreBluetooth fires `peripheralIsReady`
+    /// and drains an empty queue, and only then does the sender enqueue. Nothing
+    /// will ever resume that continuation — CoreBluetooth re-fires
+    /// `peripheralIsReady` only after a further write attempt, and the only loop
+    /// that would make one is suspended awaiting this very continuation.
+    ///
+    /// The cost of losing it is out of all proportion to the width of the
+    /// window. This runs inside ``sendField``, inside ``push``/``pushImage``,
+    /// which hold the ``CommandGate`` — so a single lost wakeup wedges the gate
+    /// for the life of the connection, every later push queues behind a holder
+    /// that never returns, and the device sits frozen on its last frame until
+    /// the link drops and `CommandGate.reset()` bails everyone out.
+    ///
+    /// Two independent mitigations, because the failure mode is so expensive:
+    ///
+    /// 1. The `canSend` re-check happens *inside* the lock, atomically with the
+    ///    decision to enqueue. That closes the race as such: either we observe
+    ///    room and never enqueue, or we enqueue before any drain can miss us.
+    /// 2. A bounded fallback resumes the waiter anyway if the wakeup somehow
+    ///    still never arrives, so no future CoreBluetooth behaviour can turn a
+    ///    lost edge back into a permanently wedged gate. Worst case we write a
+    ///    chunk the OS drops, the device reports a sequence gap, and the push
+    ///    fails or (for images) retries — recoverable, unlike a hang.
     private func waitUntilReadyForWriteWithoutResponse(on target: CBPeripheral) async {
-        if target.canSendWriteWithoutResponse { return }
-        lock.lock()
-        writeWithoutResponseWaitCounter += 1
-        let id = writeWithoutResponseWaitCounter
-        lock.unlock()
+        var waiter: WriteWithoutResponseWaiter?
 
-        // DIAGNOSTIC: does NOT resume the continuation -- this only observes.
-        // Resuming here would be a fix, and would hide the very stall we are
-        // trying to confirm on hardware.
-        let watchdog = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: Self.writeWithoutResponseWedgeWarningSeconds * 1_000_000_000)
-            guard let self else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            // The re-check and the append are one critical section; this is the
+            // actual fix. `peripheralIsReady` cannot slip between them, because
+            // it takes the same lock to drain.
+            if target.canSendWriteWithoutResponse {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            writeWithoutResponseWaitCounter += 1
+            let created = WriteWithoutResponseWaiter(id: writeWithoutResponseWaitCounter,
+                                                     continuation: continuation)
+            writeWithoutResponseWaiters.append(created)
+            lock.unlock()
+            waiter = created
+            armWriteWithoutResponseFallback(for: created, on: target)
+        }
+
+        // Cancelling only stops the sleep; the resume-once guard inside
+        // ``WriteWithoutResponseWaiter`` is what makes the cancel/fire race safe,
+        // not this call.
+        waiter?.cancelFallback()
+    }
+
+    /// Arms the bounded fallback for one waiter. Split out so the enqueue
+    /// critical section above stays short and obviously non-suspending.
+    private func armWriteWithoutResponseFallback(for waiter: WriteWithoutResponseWaiter,
+                                                 on target: CBPeripheral) {
+        let task = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.writeWithoutResponseFallbackSeconds * 1_000_000_000)
+            guard !Task.isCancelled, let self else { return }
             self.lock.lock()
-            let stillPending = self.writeWithoutResponseWaiters.contains { $0.id == id }
+            self.writeWithoutResponseWaiters.removeAll { $0 === waiter }
             let pendingCount = self.writeWithoutResponseWaiters.count
             let canSend = target.canSendWriteWithoutResponse
             self.lock.unlock()
-            if stillPending {
-                self.log("WWR WEDGE: waiter #\(id) unresumed after "
-                    + "\(Self.writeWithoutResponseWedgeWarningSeconds)s "
-                    + "(pending=\(pendingCount), canSendWriteWithoutResponse=\(canSend)) "
-                    + "— peripheralIsReady never fired for it; the command gate is now stuck")
-            }
+            // `resume()` returns false if `peripheralIsReady` or the disconnect
+            // teardown got there first, in which case there was no wedge and
+            // there is nothing to report.
+            guard waiter.resume() else { return }
+            self.log("WWR WEDGE: waiter #\(waiter.id) unresumed after "
+                + "\(Self.writeWithoutResponseFallbackSeconds)s "
+                + "(pending=\(pendingCount), canSendWriteWithoutResponse=\(canSend)) "
+                + "— peripheralIsReady never fired for it; resuming it anyway so the "
+                + "command gate cannot wedge. The chunk about to be written may be "
+                + "dropped by the OS and show up as a sequence gap.")
         }
-
-        await withCheckedContinuation { continuation in
-            lock.lock()
-            writeWithoutResponseWaiters.append((id: id, continuation: continuation))
-            lock.unlock()
-        }
-        watchdog.cancel()
+        waiter.attachFallback(task)
     }
 
     /// Assets are pushed *before* `ACQUIRE` is legal, so they deliberately skip
@@ -847,8 +909,9 @@ extension CompanionClient: CBCentralManagerDelegate {
         // Can't throw (CheckedContinuation<Void, Never>) -- waking it just lets
         // an in-flight image push's loop proceed to its next packet, which then
         // fails immediately via requireSession()/target-is-nil the same way any
-        // other post-disconnect send would.
-        wwrWaiters.forEach { $0.continuation.resume() }
+        // other post-disconnect send would. `resume()` is a no-op for any waiter
+        // the fallback timer already claimed.
+        wwrWaiters.forEach { $0.resume() }
         failPending(with: CompanionError.disconnected)
         Task { await gate.reset() }
         transition(to: .disconnected)
@@ -963,14 +1026,17 @@ extension CompanionClient: CBPeripheralDelegate {
         let waiters = writeWithoutResponseWaiters
         writeWithoutResponseWaiters = []
         lock.unlock()
-        // DIAGNOSTIC: an empty drain is the smoking gun for the lost-wakeup
-        // race — it means this callback landed between the sender's
-        // `canSendWriteWithoutResponse` check and its append, so the waiter that
-        // is about to be enqueued will never be resumed.
+        // DIAGNOSTIC: an empty drain used to be the precondition for the
+        // lost-wakeup race — this callback landing between a sender's
+        // `canSendWriteWithoutResponse` check and its append. It is no longer
+        // dangerous (the check and the append are now one critical section, so
+        // a sender arriving late simply observes the freed buffer space and
+        // never suspends) and it is not on its own evidence of anything: it
+        // also happens benignly whenever no send is in flight at all.
         if waiters.isEmpty {
-            log("WWR ready fired with no waiters queued (possible lost wakeup)")
+            log("WWR ready fired with no waiters queued")
         }
-        waiters.forEach { $0.continuation.resume() }
+        waiters.forEach { $0.resume() }
     }
 
     public func peripheral(_ peripheral: CBPeripheral,
@@ -1048,6 +1114,67 @@ final class StateLock: @unchecked Sendable {
 
     func lock() { pthread_mutex_lock(&mutex) }
     func unlock() { pthread_mutex_unlock(&mutex) }
+}
+
+/// One suspended sender waiting for CoreBluetooth to accept another Write
+/// Without Response.
+///
+/// Exists purely to make the resume exactly-once. Three parties hold a reference
+/// and each has a legitimate reason to wake this waiter:
+///
+/// - `peripheralIsReady(toSendWriteWithoutResponse:)`, the normal path;
+/// - the bounded fallback timer, if that callback never arrives;
+/// - the disconnect teardown, which resumes everything outstanding.
+///
+/// They race freely — the drain copies the array before resuming, so removal
+/// from the array is *not* a claim on the continuation — and double-resuming a
+/// `CheckedContinuation` is a hard crash, not a warning. So the continuation
+/// itself is the claim token: ``resume()`` takes it out under this object's own
+/// lock and nils it in the same critical section, and only the caller that
+/// actually took a non-nil continuation resumes it. Everyone else gets `false`
+/// and does nothing. Same trick as ``Pending``, minus the error channel
+/// (`CheckedContinuation<Void, Never>` cannot fail).
+final class WriteWithoutResponseWaiter: @unchecked Sendable {
+    let id: Int
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var fallback: Task<Void, Never>?
+    private let lock = NSLock()
+
+    init(id: Int, continuation: CheckedContinuation<Void, Never>) {
+        self.id = id
+        self.continuation = continuation
+    }
+
+    /// Attaches the fallback timer. If the waiter was already resumed in the
+    /// window between enqueue and arming — `peripheralIsReady` can fire that
+    /// fast — the timer is cancelled immediately instead of being retained.
+    func attachFallback(_ task: Task<Void, Never>) {
+        lock.lock()
+        let alreadyResumed = continuation == nil
+        if !alreadyResumed { fallback = task }
+        lock.unlock()
+        if alreadyResumed { task.cancel() }
+    }
+
+    /// - Returns: `true` if this call is the one that resumed the continuation,
+    ///   `false` if somebody else got there first.
+    @discardableResult
+    func resume() -> Bool {
+        lock.lock()
+        let taken = continuation
+        continuation = nil
+        lock.unlock()
+        taken?.resume()
+        return taken != nil
+    }
+
+    func cancelFallback() {
+        lock.lock()
+        let task = fallback
+        fallback = nil
+        lock.unlock()
+        task?.cancel()
+    }
 }
 
 /// One outstanding request/reply. Resuming twice traps in Swift, and both a
