@@ -16,7 +16,6 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <builtinFonts/all.h>
-#include <driver/usb_serial_jtag.h>
 
 #include <cstring>
 
@@ -331,6 +330,7 @@ void setup() {
       LOG_DBG("MAIN", "Verifying power button press duration");
       if (!gpio.verifyPowerButtonWakeup(SETTINGS.getPowerButtonDuration(),
                                         SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP)) {
+        LOG_DBG("SLP", "Power button wakeup verification failed, returning to sleep");
         powerManager.startDeepSleep(gpio);
       }
       break;
@@ -347,18 +347,10 @@ void setup() {
       // usb_serial_jtag_is_connected() needs the host to have resumed sending
       // SOF traffic, which can still be settling this soon after a hard reset
       // -- the same enumeration race the 250 ms pre-Serial.begin() delay above
-      // exists for. A single instantaneous check here can read false (no
-      // debug cable detected) even with one plugged in, undoing this whole
-      // guard. Poll briefly instead of trusting one sample.
-      {
-        bool connected = false;
-        for (int i = 0; i < 10 && !connected; i++) {
-          connected = usb_serial_jtag_is_connected();
-          if (!connected) delay(50);
-        }
-        if (!connected) {
-          powerManager.startDeepSleep(gpio);
-        }
+      // exists for. isUsbOrDebugConnected() polls instead of trusting one sample.
+      if (!gpio.isUsbOrDebugConnected()) {
+        LOG_DBG("SLP", "No USB/debug connection after USB-power boot, returning to sleep");
+        powerManager.startDeepSleep(gpio);
       }
       break;
     case HalGPIO::WakeupReason::AfterFlash:
@@ -590,23 +582,9 @@ void loop() {
   // Only auto-sleep on inactivity while running on battery — a device sitting on USB
   // power (charging, or plugged in for serial debugging) has no battery-life reason
   // to sleep, and deep-sleeping drops the USB CDC connection entirely.
-  //
-  // gpio.isUsbConnected() only detects net-positive charge current (X3: BQ27220
-  // fuel-gauge Current() > 0) — confirmed against the BQ25616 datasheet that the
-  // charge IC's STAT pin (what a GPIO-based alternative would read) is HIGH for
-  // BOTH "charging complete" and "no input at all," so it can't distinguish "USB
-  // plugged in, battery just full" from "nothing plugged in" either.
-  //
-  // usb_serial_jtag_is_connected() catches the case both of those miss: a debug/
-  // data cable to a dev machine, with no net charging current, and no serial
-  // terminal app actively holding the port open (unlike `Serial`'s bool operator,
-  // which needs a host application to assert DTR — merely being plugged into a
-  // computer already means the USB Serial/JTAG peripheral is receiving SOF
-  // packets, independent of any application-level connection). It reads false for
-  // a plain power source with no USB host controller (e.g. a power bank), which is
-  // fine — isUsbConnected() already covers genuine charging.
-  if (sleepTimeoutMs > 0 && millis() - lastActivityTime >= sleepTimeoutMs && !gpio.isUsbConnected() &&
-      !usb_serial_jtag_is_connected()) {
+  // See HalGPIO::isUsbOrDebugConnected()'s doc comment for why this needs both a
+  // charge-current check and a polled USB Serial/JTAG check, not just one sample.
+  if (sleepTimeoutMs > 0 && millis() - lastActivityTime >= sleepTimeoutMs && !gpio.isUsbOrDebugConnected()) {
     LOG_DBG("SLP", "Auto-sleep triggered after %lu ms of inactivity", sleepTimeoutMs);
     enterDeepSleep(true);
     // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
@@ -619,6 +597,7 @@ void loop() {
     if (gpio.isPressed(HalGPIO::BTN_DOWN)) {
       return;
     }
+    LOG_DBG("SLP", "Power button long-press, entering deep sleep");
     enterDeepSleep();
     // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
     return;

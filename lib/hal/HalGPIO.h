@@ -90,6 +90,16 @@ class HalGPIO {
   // Check if USB is connected
   bool isUsbConnected() const;
 
+  // isUsbConnected() (charge current) OR'd with usb_serial_jtag_is_connected() (a
+  // debug/data cable with no net charging current -- see isUsbConnected()'s own
+  // doc comment). usb_serial_jtag_is_connected() reflects USB SOF traffic, which
+  // needs the host to have resumed sending it; a single instantaneous read can
+  // come back false immediately after enumeration (or after a brief host-side
+  // link hiccup) even with a cable plugged in. Polls for up to
+  // attempts * delayMs before giving up, so callers deciding whether it's safe to
+  // deep-sleep (which drops the port) don't act on one flaky sample.
+  bool isUsbOrDebugConnected(uint8_t attempts = 10, uint16_t delayMs = 50) const;
+
   // Returns true once per edge (plug or unplug) since the last update()
   bool wasUsbStateChanged() const;
 

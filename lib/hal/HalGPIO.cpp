@@ -5,6 +5,7 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <XteinkDetect.h>
+#include <driver/usb_serial_jtag.h>
 #include <esp_sleep.h>
 
 // Global HalGPIO instance
@@ -344,6 +345,15 @@ bool HalGPIO::verifyPowerButtonWakeup(uint16_t requiredDurationMs, bool shortPre
     return false;
   }
   return true;
+}
+
+bool HalGPIO::isUsbOrDebugConnected(uint8_t attempts, uint16_t delayMs) const {
+  if (isUsbConnected()) return true;
+  for (uint8_t attempt = 0; attempt < attempts; ++attempt) {
+    if (usb_serial_jtag_is_connected()) return true;
+    if (attempt + 1 < attempts) delay(delayMs);
+  }
+  return false;
 }
 
 bool HalGPIO::isUsbConnected() const {

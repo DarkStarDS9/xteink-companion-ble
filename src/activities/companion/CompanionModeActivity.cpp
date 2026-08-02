@@ -5,7 +5,6 @@
 #include <HalPowerManager.h>
 #include <I18n.h>
 #include <Logging.h>
-#include <driver/usb_serial_jtag.h>
 
 #include <algorithm>
 #include <cmath>
@@ -657,10 +656,19 @@ void CompanionModeActivity::checkIdleTimers() {
     return;
   }
 
-  // See main.cpp's general auto-sleep check for why USB power skips this too —
-  // deep-sleeping drops the USB CDC connection, which is actively unhelpful
-  // while plugged in (charging, or connected for serial debugging).
-  if (gpio.isUsbConnected() || usb_serial_jtag_is_connected()) return;
+  // See HalGPIO::isUsbOrDebugConnected()'s doc comment for why USB power skips
+  // this too — deep-sleeping drops the USB CDC connection, which is actively
+  // unhelpful while plugged in (charging, or connected for serial debugging).
+  // Slide the idle clock forward while USB holds sleep off, rather than
+  // leaving it stale: otherwise the elapsed idle time keeps accruing
+  // unbounded for as long as USB stays connected, and unplugging after (say)
+  // 30 idle minutes blows straight through the kWaitingIdleSleepMs guard
+  // above and sleeps on the very next loop tick, instead of giving a genuine
+  // fresh countdown from the moment USB actually goes away.
+  if (gpio.isUsbOrDebugConnected()) {
+    idleSinceMs = millis();
+    return;
+  }
 
   LOG_INF("CMA", "No app driving the screen for %lu ms, deep-sleeping", kWaitingIdleSleepMs);
   {
