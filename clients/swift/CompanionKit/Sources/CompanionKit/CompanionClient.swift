@@ -211,8 +211,14 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     // MARK: Discovery
 
     public func startScanning() {
+        // allowDuplicates: true — the advertised name lives only in the scan-response
+        // packet (the primary advertisement is service-UUID-only to fit the legacy
+        // 31-byte PDU; see the firmware's CompanionBle.cpp). With duplicates
+        // suppressed, CoreBluetooth may deliver only the first-seen packet and never
+        // redeliver once the scan response arrives, leaving didDiscover stuck without
+        // a name for that peripheral for the rest of the scan.
         central.scanForPeripherals(withServices: [CBUUID(string: CompanionProtocol.serviceUUID)],
-                                   options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+                                   options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
     }
 
     public func stopScanning() {
@@ -751,7 +757,12 @@ extension CompanionClient: CBCentralManagerDelegate {
                                didDiscover peripheral: CBPeripheral,
                                advertisementData: [String: Any],
                                rssi RSSI: NSNumber) {
-        let name = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? peripheral.name ?? "Companion"
+        // peripheral.name deliberately excluded: it's CoreBluetooth's own cached
+        // GAP name for this peripheral's Bluetooth address, which can go stale
+        // (persists across reflashes and even device reboots) and silently
+        // disagree with what's actually being broadcast right now. Trust only
+        // the live advertisement/scan-response payload.
+        let name = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? "Companion"
         emit(.discovered(CompanionDevice(id: peripheral.identifier,
                                          name: name,
                                          rssi: RSSI.intValue,
