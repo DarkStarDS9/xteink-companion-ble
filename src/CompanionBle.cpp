@@ -209,6 +209,23 @@ uint32_t g_lastBleActivityMs = 0;
 // round-trip available rather than whatever the central defaulted to.
 bool g_connParamsBusy = false;
 
+// DIAGNOSTIC (2026-08-03 link-robustness investigation): millis() at the last
+// onConnect, so every link-layer log line can carry "t=+Nms into this
+// connection". This is what turns "it disconnects every ~43 seconds" from a
+// stopwatch observation into a measured number correlated with the profile
+// churn and the granted parameters. Remove with the rest of this
+// investigation's instrumentation.
+uint32_t g_connectMs = 0;
+uint32_t connUptimeMs() { return g_connectMs == 0 ? 0 : millis() - g_connectMs; }
+
+// DIAGNOSTIC: what requestConnParams() last asked for, so onConnParamsUpdate()
+// can say whether the central actually granted it. requestConnParams() latches
+// g_connParamsBusy on the *request*; if iOS silently ignores or alters it, the
+// firmware otherwise carries on believing the link is tight.
+uint16_t g_reqIntervalUnits = 0;
+uint16_t g_reqLatency = 0;
+uint16_t g_reqTimeoutUnits = 0;
+
 void requestConnParams(bool busy) {
   if (!g_server || g_server->getConnectedCount() == 0) return;
   if (g_connParamsBusy == busy) return;
@@ -218,8 +235,12 @@ void requestConnParams(bool busy) {
   const auto peer = g_server->getPeerInfo(0);
   g_server->updateConnParams(peer.getConnHandle(), interval, interval, latency, timeout);
   g_connParamsBusy = busy;
-  LOG_DBG("CBLE", "requested %s conn params (interval=%u latency=%u timeout=%u)", busy ? "busy" : "idle",
-          static_cast<unsigned>(interval), static_cast<unsigned>(latency), static_cast<unsigned>(timeout));
+  g_reqIntervalUnits = interval;
+  g_reqLatency = latency;
+  g_reqTimeoutUnits = timeout;
+  LOG_DBG("CBLE", "t=+%lums requested %s conn params (interval=%u latency=%u timeout=%u)",
+          static_cast<unsigned long>(connUptimeMs()), busy ? "busy" : "idle", static_cast<unsigned>(interval),
+          static_cast<unsigned>(latency), static_cast<unsigned>(timeout));
 }
 
 // Called from every characteristic write and outgoing notify -- i.e. anything
@@ -1350,8 +1371,38 @@ class StatusCharCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
+// DIAGNOSTIC (2026-08-03): names the HCI reason behind a disconnect. NimBLE
+// hands onDisconnect() a host-stack error, not a raw HCI code -- controller
+// reasons arrive offset by BLE_HS_ERR_HCI_BASE (0x200, ble_hs.h:171), so the
+// low byte is the actual HCI value only for codes in that range.
+//
+// The distinction is the whole point of this instrumentation: 0x08 blames the
+// idle connection profile's 6 s supervision timeout against a 750 ms effective
+// wake cadence; 0x13/0x16 mean iOS or the app deliberately dropped the link
+// (an app-lifecycle timer, not the radio); 0x22/0x28 point at the busy<->idle
+// parameter-update churn colliding with itself.
+const char* disconnectReasonName(int reason) {
+  if (reason >= BLE_HS_ERR_HCI_BASE && reason < BLE_HS_ERR_HCI_BASE + 0x100) {
+    switch (reason - BLE_HS_ERR_HCI_BASE) {
+      case 0x08: return "HCI 0x08 supervision timeout";
+      case 0x13: return "HCI 0x13 remote user terminated";
+      case 0x14: return "HCI 0x14 remote terminated, low resources";
+      case 0x15: return "HCI 0x15 remote terminated, powering off";
+      case 0x16: return "HCI 0x16 local host terminated";
+      case 0x1F: return "HCI 0x1f unspecified error";
+      case 0x22: return "HCI 0x22 LMP/LL response timeout";
+      case 0x28: return "HCI 0x28 instant passed";
+      case 0x3B: return "HCI 0x3b unacceptable conn interval";
+      case 0x3E: return "HCI 0x3e connection failed to establish";
+      default: return "HCI (other)";
+    }
+  }
+  return "host-stack error (not an HCI reason)";
+}
+
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
+    g_connectMs = millis();
     LOG_DBG("CBLE", "central connected");
     // Request the tight profile right away: the v6 HELLO handshake happens
     // immediately after connect, before anything else marks the link busy.
@@ -1388,16 +1439,39 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     g_lastConnIntervalMs = connInfo.getConnInterval() * 1.25f;
     g_lastConnLatency = connInfo.getConnLatency();
     g_lastConnTimeoutMs = connInfo.getConnTimeout() * 10;
-    LOG_DBG("CBLE", "conn params granted: interval=%.2fms latency=%u timeout=%ums", g_lastConnIntervalMs,
+    LOG_DBG("CBLE", "t=+%lums conn params granted: interval=%.2fms latency=%u timeout=%ums",
+            static_cast<unsigned long>(connUptimeMs()), g_lastConnIntervalMs,
             static_cast<unsigned>(g_lastConnLatency), static_cast<unsigned>(g_lastConnTimeoutMs));
+    // DIAGNOSTIC: a request the central did not honour leaves the firmware
+    // streaming Write-Without-Response chunks into a link it wrongly believes
+    // is on the 15 ms busy profile. Nothing currently notices; say so loudly.
+    if (g_reqIntervalUnits != 0 &&
+        (connInfo.getConnInterval() != g_reqIntervalUnits || connInfo.getConnLatency() != g_reqLatency ||
+         connInfo.getConnTimeout() != g_reqTimeoutUnits)) {
+      LOG_ERR("CBLE",
+              "conn params DIVERGED from request: asked interval=%u latency=%u timeout=%u, got interval=%u "
+              "latency=%u timeout=%u (units: 1.25ms / events / 10ms)",
+              static_cast<unsigned>(g_reqIntervalUnits), static_cast<unsigned>(g_reqLatency),
+              static_cast<unsigned>(g_reqTimeoutUnits), static_cast<unsigned>(connInfo.getConnInterval()),
+              static_cast<unsigned>(connInfo.getConnLatency()), static_cast<unsigned>(connInfo.getConnTimeout()));
+    }
   }
   void onPhyUpdate(NimBLEConnInfo& /*connInfo*/, uint8_t txPhy, uint8_t rxPhy) override {
     g_lastPhyTx = phyName(txPhy);
     g_lastPhyRx = phyName(rxPhy);
     LOG_DBG("CBLE", "PHY update: tx=%s rx=%s", g_lastPhyTx, g_lastPhyRx);
   }
-  void onDisconnect(NimBLEServer* server, NimBLEConnInfo& /*connInfo*/, int /*reason*/) override {
-    LOG_DBG("CBLE", "central disconnected");
+  void onDisconnect(NimBLEServer* server, NimBLEConnInfo& /*connInfo*/, int reason) override {
+    // DIAGNOSTIC: the reason code was previously discarded, which left every
+    // disconnect indistinguishable -- radio, iOS policy, and our own parameter
+    // churn all looked the same. The uptime alongside it is what a periodic
+    // drop shows up in. Also reports whether a transfer was in flight, since a
+    // drop mid-field is a different story from a drop on an idle link.
+    LOG_ERR("CBLE", "central disconnected after %lums: reason=0x%04x (%s), field-in-flight=0x%02x",
+            static_cast<unsigned long>(connUptimeMs()), static_cast<unsigned>(reason),
+            disconnectReasonName(reason), g_activeField);
+    g_connectMs = 0;
+    g_reqIntervalUnits = 0;
     // The next connect gets a fresh onConnect() -> noteBleActivity() edge;
     // reset to idle so a stale "already busy" doesn't suppress that request.
     g_connParamsBusy = false;

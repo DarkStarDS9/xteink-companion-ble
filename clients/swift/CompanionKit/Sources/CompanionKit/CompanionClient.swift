@@ -565,15 +565,48 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     /// `peripheralIsReady(toSendWriteWithoutResponse:)` once space frees up.
     /// Writing past that without waiting drops the excess silently at the OS
     /// layer — this is what keeps the image CHUNK loop from outrunning it.
-    private var writeWithoutResponseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var writeWithoutResponseWaiters: [(id: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    /// DIAGNOSTIC (2026-08-03 link-robustness investigation): monotonic id per
+    /// wait, so the log can pair an enter with its resume and name the one that
+    /// never came back.
+    private var writeWithoutResponseWaitCounter = 0
+    /// DIAGNOSTIC: how long a wait may sit unresumed before it is reported as a
+    /// wedge. CoreBluetooth normally drains within a connection interval or two;
+    /// seconds means the wakeup was lost.
+    private static let writeWithoutResponseWedgeWarningSeconds: UInt64 = 5
 
     private func waitUntilReadyForWriteWithoutResponse(on target: CBPeripheral) async {
         if target.canSendWriteWithoutResponse { return }
+        lock.lock()
+        writeWithoutResponseWaitCounter += 1
+        let id = writeWithoutResponseWaitCounter
+        lock.unlock()
+
+        // DIAGNOSTIC: does NOT resume the continuation -- this only observes.
+        // Resuming here would be a fix, and would hide the very stall we are
+        // trying to confirm on hardware.
+        let watchdog = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.writeWithoutResponseWedgeWarningSeconds * 1_000_000_000)
+            guard let self else { return }
+            self.lock.lock()
+            let stillPending = self.writeWithoutResponseWaiters.contains { $0.id == id }
+            let pendingCount = self.writeWithoutResponseWaiters.count
+            let canSend = target.canSendWriteWithoutResponse
+            self.lock.unlock()
+            if stillPending {
+                self.log("WWR WEDGE: waiter #\(id) unresumed after "
+                    + "\(Self.writeWithoutResponseWedgeWarningSeconds)s "
+                    + "(pending=\(pendingCount), canSendWriteWithoutResponse=\(canSend)) "
+                    + "— peripheralIsReady never fired for it; the command gate is now stuck")
+            }
+        }
+
         await withCheckedContinuation { continuation in
             lock.lock()
-            writeWithoutResponseWaiters.append(continuation)
+            writeWithoutResponseWaiters.append((id: id, continuation: continuation))
             lock.unlock()
         }
+        watchdog.cancel()
     }
 
     /// Assets are pushed *before* `ACQUIRE` is legal, so they deliberately skip
@@ -815,7 +848,7 @@ extension CompanionClient: CBCentralManagerDelegate {
         // an in-flight image push's loop proceed to its next packet, which then
         // fails immediately via requireSession()/target-is-nil the same way any
         // other post-disconnect send would.
-        wwrWaiters.forEach { $0.resume() }
+        wwrWaiters.forEach { $0.continuation.resume() }
         failPending(with: CompanionError.disconnected)
         Task { await gate.reset() }
         transition(to: .disconnected)
@@ -930,7 +963,14 @@ extension CompanionClient: CBPeripheralDelegate {
         let waiters = writeWithoutResponseWaiters
         writeWithoutResponseWaiters = []
         lock.unlock()
-        waiters.forEach { $0.resume() }
+        // DIAGNOSTIC: an empty drain is the smoking gun for the lost-wakeup
+        // race — it means this callback landed between the sender's
+        // `canSendWriteWithoutResponse` check and its append, so the waiter that
+        // is about to be enqueued will never be resumed.
+        if waiters.isEmpty {
+            log("WWR ready fired with no waiters queued (possible lost wakeup)")
+        }
+        waiters.forEach { $0.continuation.resume() }
     }
 
     public func peripheral(_ peripheral: CBPeripheral,
