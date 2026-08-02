@@ -1387,6 +1387,7 @@ bool ensureStarted(const GfxRenderer& renderer, int fontId) {
   const uint32_t heapBeforeInit = ESP.getFreeHeap();
 
   buildDeviceName();
+  LOG_INF("CBLE", "advertising as \"%s\"", g_deviceName);
 
   if (!NimBLEDevice::init(g_deviceName)) {
     LOG_ERR("CBLE", "ensureStarted: NimBLEDevice::init() failed");
