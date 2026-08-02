@@ -15,8 +15,8 @@
 #include <vector>
 
 #include "CompanionPeerStore.h"
-#include "Memory.h"
 #include "Epub/converters/RawBitmapToFramebufferConverter.h"
+#include "Memory.h"
 
 namespace companionble {
 
@@ -1404,7 +1404,8 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           case kFieldContentId:
             session->contentIdLen = static_cast<uint8_t>(g_activeWritten);
             memcpy(session->contentId, g_activeBuf.get(), session->contentIdLen);
-            if (g_contentCb) g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal);
+            if (g_contentCb)
+              g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal, FieldOutcome::Complete);
             break;
 
           case kFieldTitle:
@@ -1416,17 +1417,30 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
             // the renderer. The phone finds out via kSessFieldSeqGap instead
             // of silence, unlike a pre-v10 write failure (which could not
             // happen at all under Write With Response).
+            //
+            // The drop is *also* reported upward as FieldOutcome::Dropped.
+            // Staying silent toward the activity was a confirmed real-world
+            // bug: a multi-field batch (title, body, then a final-flagged
+            // field) whose title was lost still committed on the final flag,
+            // so the body updated while the title kept the previous article's
+            // text -- a fresh story under a stale headline. The activity
+            // poisons the batch on this and discards it instead. The phone's
+            // recovery is unchanged: re-push the whole batch on
+            // kSessFieldSeqGap.
             if (g_activeSeqGap) {
               LOG_ERR("CBLE", "field 0x%02x dropped: CHUNK sequence gap under Write Without Response", field);
               const uint8_t payload[3] = {kSessFieldSeqGap, sessionId, field};
               notifySession(payload, sizeof(payload));
+              if (g_contentCb) g_contentCb(field, nullptr, 0, g_activeFinal, FieldOutcome::Dropped);
               break;
             }
-            if (g_contentCb) g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal);
+            if (g_contentCb)
+              g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal, FieldOutcome::Complete);
             break;
 
           default:
-            if (g_contentCb) g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal);
+            if (g_contentCb)
+              g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal, FieldOutcome::Complete);
             break;
         }
         resetReassembly();

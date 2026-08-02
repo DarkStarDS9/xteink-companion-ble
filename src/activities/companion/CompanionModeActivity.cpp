@@ -134,11 +134,34 @@ volatile bool g_pendingCommitReady = false;
 uint32_t g_pendingBatchStartMs = 0;
 constexpr uint32_t kPendingBatchTimeoutMs = 3000;
 
+// Set when any title/body field of the current batch arrived as
+// FieldOutcome::Dropped — i.e. a v10 Write-Without-Response CHUNK sequence gap
+// cost us that field entirely. A batch that lost a field must fail as a whole:
+// committing the rest paints the new body under the *previous* article's title
+// (a confirmed real-world symptom), whereas discarding leaves a coherent, if
+// stale, page on screen. Cleared whenever the batch is resolved — commit,
+// timeout, or disconnect — so the next batch starts clean.
+volatile bool g_pendingBatchPoisoned = false;
+
 // Runs on the NimBLE host task — copy into the fixed buffer and set a flag;
 // CompanionModeActivity::loop() (main loop task) does the rest.
-void onContentField(uint8_t field, const uint8_t* data, size_t len, bool final) {
+void onContentField(uint8_t field, const uint8_t* data, size_t len, bool final, companionble::FieldOutcome outcome) {
+  const bool isTextField = field == companionble::kFieldTitle || field == companionble::kFieldBody;
   portENTER_CRITICAL(&g_mux);
-  const bool wasIdle = !g_pendingTitleReady && !g_pendingBodyReady;
+  // "Idle" has to include the poison flag, or a batch whose only surviving
+  // marker is the poison (first field dropped, nothing buffered yet) would look
+  // like a fresh batch to the next field and restart the timeout clock.
+  const bool wasIdle = !g_pendingTitleReady && !g_pendingBodyReady && !g_pendingBatchPoisoned;
+  if (outcome == companionble::FieldOutcome::Dropped) {
+    // No data to copy — just poison the batch. The clock still has to start
+    // here: if this is the batch's first field and the final flag never
+    // arrives, loop()'s timeout is what clears the poison again.
+    if (isTextField) g_pendingBatchPoisoned = true;
+    if (wasIdle && isTextField) g_pendingBatchStartMs = millis();
+    if (final) g_pendingCommitReady = true;
+    portEXIT_CRITICAL(&g_mux);
+    return;
+  }
   if (field == companionble::kFieldTitle) {
     const size_t n = len > sizeof(g_pendingTitleBuf) ? sizeof(g_pendingTitleBuf) : len;
     memcpy(g_pendingTitleBuf, data, n);
@@ -155,7 +178,7 @@ void onContentField(uint8_t field, const uint8_t* data, size_t len, bool final) 
     g_pendingBodyLen = static_cast<uint16_t>(n);
     g_pendingBodyReady = true;
   }
-  if (wasIdle && (field == companionble::kFieldTitle || field == companionble::kFieldBody)) {
+  if (wasIdle && isTextField) {
     g_pendingBatchStartMs = millis();
   }
   if (final) g_pendingCommitReady = true;
@@ -284,6 +307,7 @@ void CompanionModeActivity::onExit() {
   g_pendingPairingReady = false;
   g_pendingImageReady = false;
   g_pendingBatchStartMs = 0;
+  g_pendingBatchPoisoned = false;
   portEXIT_CRITICAL(&g_mux);
 }
 
@@ -1034,6 +1058,7 @@ void CompanionModeActivity::loop() {
       g_pendingBodyReady = false;
       g_pendingCommitReady = false;
       g_pendingBatchStartMs = 0;
+      g_pendingBatchPoisoned = false;
       portEXIT_CRITICAL(&g_mux);
     }
     // A displayed image is already on the panel and unaffected by the link
@@ -1076,22 +1101,28 @@ void CompanionModeActivity::loop() {
     newBody.assign(reinterpret_cast<char*>(g_pendingBodyBuf), g_pendingBodyLen);
     gotBody = true;
   }
+  bool poisoned = false;
   if (g_pendingCommitReady) {
     commit = true;
-  } else if ((gotTitle || gotBody) && g_pendingBatchStartMs != 0 &&
+  } else if ((gotTitle || gotBody || g_pendingBatchPoisoned) && g_pendingBatchStartMs != 0 &&
              millis() - g_pendingBatchStartMs > kPendingBatchTimeoutMs) {
     // Safety net: the final-flagged field's END never arrived in time (e.g. the
     // app crashed or lost the connection mid-push). Apply whatever we have
     // rather than leaving the screen stuck on stale content indefinitely.
+    // A poisoned batch resolves here too — it still has to be *cleared*, or the
+    // poison would leak into the next batch, it is just discarded rather than
+    // applied.
     LOG_ERR("CMA", "content batch commit flag missed after %lu ms, applying pending fields anyway",
             static_cast<unsigned long>(kPendingBatchTimeoutMs));
     commit = true;
   }
   if (commit) {
+    poisoned = g_pendingBatchPoisoned;
     g_pendingTitleReady = false;
     g_pendingBodyReady = false;
     g_pendingCommitReady = false;
     g_pendingBatchStartMs = 0;
+    g_pendingBatchPoisoned = false;
   }
   if (g_pendingStatusReady) {
     newTagId = g_pendingTagId;
@@ -1125,6 +1156,19 @@ void CompanionModeActivity::loop() {
     gotImage = true;
   }
   portEXIT_CRITICAL(&g_mux);
+
+  if (poisoned) {
+    // A field of this batch was lost to a CHUNK sequence gap. Applying the
+    // survivors would mix this article's body with the last one's title, so the
+    // whole batch goes in the bin and the previous — coherent — page stays on
+    // screen. The phone already has its FIELD_SEQ_GAP notification and both
+    // consumer apps respond by re-pushing the whole batch, so this is a delay,
+    // not a permanent loss.
+    LOG_ERR("CMA", "content batch discarded: a field was lost to a CHUNK sequence gap");
+    gotTitle = false;
+    gotBody = false;
+    commit = false;
+  }
 
   if (gotPairing) {
     RenderLock lock;
