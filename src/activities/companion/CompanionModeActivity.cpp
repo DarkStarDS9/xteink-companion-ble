@@ -107,6 +107,14 @@ volatile bool g_pendingStatusReady = false;
 uint8_t g_pendingTagStateBuf[1 + 2 * companionble::kMaxTags];
 uint8_t g_pendingTagStateLen = 0;
 volatile bool g_pendingTagStateReady = false;
+// Whether that pending tag state arrived *inside* a title/body batch (clients
+// push it last, under the same final flag) or on its own. Only the former is
+// bound to the batch's fate; a standalone tag push — CompanionClient.setTag /
+// CompanionDeviceService.setReadLaterTag toggling one tag with no content
+// change — must keep applying immediately even while some unrelated batch is
+// in trouble. So the discriminator is "did this tag state arrive as part of a
+// batch that got poisoned", never "is the poison flag set right now".
+volatile bool g_pendingTagStateInBatch = false;
 
 // Foreground handover and pairing requests are also host-task events. Paths and
 // names are short and fixed-length here so the critical section stays a memcpy.
@@ -172,6 +180,10 @@ void onContentField(uint8_t field, const uint8_t* data, size_t len, bool final, 
     memcpy(g_pendingTagStateBuf, data, n);
     g_pendingTagStateLen = static_cast<uint8_t>(n);
     g_pendingTagStateReady = true;
+    // A title/body batch already in flight (or already poisoned) means this
+    // tag state belongs to it; an idle handoff means it is a standalone tag
+    // push and owes the batch machinery nothing.
+    g_pendingTagStateInBatch = !wasIdle;
   } else if (field == companionble::kFieldBody) {
     const size_t n = len > sizeof(g_pendingBodyBuf) ? sizeof(g_pendingBodyBuf) : len;
     memcpy(g_pendingBodyBuf, data, n);
@@ -308,6 +320,8 @@ void CompanionModeActivity::onExit() {
   g_pendingImageReady = false;
   g_pendingBatchStartMs = 0;
   g_pendingBatchPoisoned = false;
+  g_pendingTagStateReady = false;
+  g_pendingTagStateInBatch = false;
   portEXIT_CRITICAL(&g_mux);
 }
 
@@ -1059,6 +1073,14 @@ void CompanionModeActivity::loop() {
       g_pendingCommitReady = false;
       g_pendingBatchStartMs = 0;
       g_pendingBatchPoisoned = false;
+      // Tag state belonging to the batch the link just killed goes with it —
+      // otherwise it would surface on the next loop as if it were a standalone
+      // tag push, marking whatever content is still on screen. A genuinely
+      // standalone pending tag push is left alone.
+      if (g_pendingTagStateInBatch) {
+        g_pendingTagStateReady = false;
+        g_pendingTagStateInBatch = false;
+      }
       portEXIT_CRITICAL(&g_mux);
     }
     // A displayed image is already on the panel and unaffected by the link
@@ -1082,6 +1104,7 @@ void CompanionModeActivity::loop() {
   uint8_t newTagId = 0;
   uint8_t newTagStateValue = 0;
   bool gotTagState = false;
+  bool tagStateWasInBatch = false;
   uint8_t newTagStateBuf[sizeof(g_pendingTagStateBuf)] = {0};
   uint8_t newTagStateLen = 0;
   char newForegroundKey[companionpeer::kPeerKeyLen] = {0};
@@ -1134,6 +1157,8 @@ void CompanionModeActivity::loop() {
     memcpy(newTagStateBuf, g_pendingTagStateBuf, g_pendingTagStateLen);
     newTagStateLen = g_pendingTagStateLen;
     g_pendingTagStateReady = false;
+    tagStateWasInBatch = g_pendingTagStateInBatch;
+    g_pendingTagStateInBatch = false;
     gotTagState = true;
   }
   if (g_pendingForegroundReady) {
@@ -1168,6 +1193,12 @@ void CompanionModeActivity::loop() {
     gotTitle = false;
     gotBody = false;
     commit = false;
+    // Tag state that rode this batch goes with it. Letting it through would be
+    // the worst of the three outcomes: the stale article left on screen would
+    // wear the *new* article's tags, i.e. a mark that belongs to content the
+    // user cannot see. Clean failure beats that, and beats a half-applied
+    // batch. A standalone tag push is untouched — see g_pendingTagStateInBatch.
+    if (tagStateWasInBatch) gotTagState = false;
   }
 
   if (gotPairing) {

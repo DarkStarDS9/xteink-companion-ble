@@ -573,6 +573,13 @@ a field is discarded there too, not applied. `FIELD_SEQ_GAP` is unchanged and
 still names only the field that was actually lost; the client's recovery is to
 re-push the whole batch.
 
+"Whole" includes tag state (`0x07`) pushed inside the batch: it is dropped with
+everything else, because the alternative is the stale article on screen wearing
+the *new* article's tags — a mark the user can see attached to content they
+cannot. A tag state pushed **on its own**, outside any title/body batch, is
+unaffected and still applies immediately; only tag state that arrived as part
+of the poisoned batch is discarded.
+
 On the client side this is a small, fully synchronous send loop — there is no
 per-chunk ack. If reliable delivery matters, use "Write" (not "Write Without
 Response") for the CHUNK packets so BLE's own link-layer ack applies.
@@ -1537,6 +1544,11 @@ Images:
     headline. Repeat with the gap in the body. Repeat once more without
     sending the final-flagged field at all, and confirm the batch is still
     discarded (not applied) when the 3 s timeout fires.
+28f. Push an atomic batch of title + body + tag state (`0x07`) with the gap in
+    the title: confirm no tag chip changes on screen — the previous article
+    must keep its own tags, not inherit the new one's. Then toggle a single
+    tag on its own (a standalone `0x07` push, no title/body) and confirm it
+    still applies immediately.
 
 Icons and sleep screen:
 
