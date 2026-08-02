@@ -227,9 +227,8 @@ void CompanionModeActivity::onEnter() {
 #ifdef COMPANION_TEST_CONSOLE
   // The console reports the screen without knowing what a screen is.
   g_screenNameActivity = this;
-  companiontest::setScreenNameProvider([]() -> const char* {
-    return g_screenNameActivity ? g_screenNameActivity->screenName() : "none";
-  });
+  companiontest::setScreenNameProvider(
+      []() -> const char* { return g_screenNameActivity ? g_screenNameActivity->screenName() : "none"; });
   companiontest::setTagStateProvider([](companiontest::TagReport* out, uint8_t maxTags) -> uint8_t {
     return g_screenNameActivity ? g_screenNameActivity->reportTags(out, maxTags) : 0;
   });
@@ -763,6 +762,12 @@ void CompanionModeActivity::handlePendingImage(const std::string& stagedPath, co
   }
 
   RenderLock lock;
+  // Arm the one status this push is owed. Set under the lock, alongside the
+  // state that makes render() take the Screen::Image branch, so the render
+  // task can never observe one without the other. Unconditional: a previous
+  // push that never got its answer (link dropped mid-settle) must not stop
+  // this one from being answered.
+  imagePushAwaitingStatus = true;
   displayedImagePath = path;
   foregroundPushedImageThisSession = true;
   galleryPickerBrowsing = false;  // a live push always wins over picker browsing
@@ -826,8 +831,7 @@ void CompanionModeActivity::showGalleryImage(size_t index) {
 // on Image costs nothing if some future app reuses those routings on Up/Down.
 namespace {
 bool isGalleryClaimable(companionble::ButtonRouting routing) {
-  return routing == companionble::ButtonRouting::None ||
-         routing == companionble::ButtonRouting::LocalPagePrev ||
+  return routing == companionble::ButtonRouting::None || routing == companionble::ButtonRouting::LocalPagePrev ||
          routing == companionble::ButtonRouting::LocalPageNext;
 }
 }  // namespace
@@ -987,6 +991,11 @@ void CompanionModeActivity::loop() {
     RenderLock lock;
     connected = nowConnected;
     if (!connected) {
+      // Nobody left to answer. Anything the departing peer was still owed dies
+      // with the link; carrying the expectation forward would fire IMAGE_STATUS
+      // at whichever peer connects next, on a redraw it never asked for.
+      imagePushAwaitingStatus = false;
+
       // If the peer that just lost the link is image-capable and never
       // pushed anything this session, its own gallery is more useful than an
       // empty "waiting" screen or holding nothing until the idle timeout —
@@ -1694,8 +1703,24 @@ void CompanionModeActivity::renderPreSleepScreen() {
   renderIconGrid(/*inverted=*/true, tr(STR_COMPANION_SLEEPING));
 }
 
+// See the header for why this gate exists. Consuming the flag before the
+// notify (rather than after) means a status that cannot be delivered — the
+// peer disconnected during the multi-second grayscale settle, so
+// notifyImageStatus() finds no foreground session and drops it — still ends
+// the expectation. A flag left set there would surface as a phantom
+// IMAGE_STATUS on the next unrelated redraw.
+void CompanionModeActivity::notifyImagePushResult(companionble::ImageResult result) {
+  if (!imagePushAwaitingStatus) return;
+  imagePushAwaitingStatus = false;
+  companionble::notifyImageStatus(result);
+}
+
 void CompanionModeActivity::renderImage() {
   if (displayedImagePath.empty()) {
+    // The image was superseded before it could be drawn (a text push clears
+    // displayedImagePath). Drop the expectation rather than carry it into an
+    // unrelated future render.
+    imagePushAwaitingStatus = false;
     renderWaiting();
     return;
   }
@@ -1704,7 +1729,7 @@ void CompanionModeActivity::renderImage() {
   if (!decoder) {
     renderer.drawCenteredText(kCompanionFontId, renderer.getScreenHeight() / 2, tr(STR_COMPANION_IMAGE_FAILED), true);
     renderer.displayBuffer();
-    companionble::notifyImageStatus(companionble::ImageResult::DecodeFailed);
+    notifyImagePushResult(companionble::ImageResult::DecodeFailed);
     displayedImagePath.clear();
     return;
   }
@@ -1726,7 +1751,7 @@ void CompanionModeActivity::renderImage() {
     renderer.clearScreen();
     renderer.drawCenteredText(kCompanionFontId, renderer.getScreenHeight() / 2, tr(STR_COMPANION_IMAGE_FAILED), true);
     renderer.displayBuffer();
-    companionble::notifyImageStatus(companionble::ImageResult::DecodeFailed);
+    notifyImagePushResult(companionble::ImageResult::DecodeFailed);
     displayedImagePath.clear();
     return;
   }
@@ -1800,7 +1825,7 @@ void CompanionModeActivity::renderImage() {
     renderTags(renderer.getScreenWidth() - cachedOrientedMarginRight, cachedOrientedMarginTop + lineHeight);
   }
 
-  companionble::notifyImageStatus(companionble::ImageResult::Displayed);
+  notifyImagePushResult(companionble::ImageResult::Displayed);
 }
 
 // Draws the foreground app's visible tags as a right-aligned row.

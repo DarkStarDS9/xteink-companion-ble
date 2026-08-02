@@ -24,14 +24,14 @@ class CompanionModeActivity final : public Activity {
   // What is on screen. An explicit state rather than a pile of booleans: the
   // screens are mutually exclusive and render() must dispatch on exactly one.
   enum class Screen : uint8_t {
-    StartFailed,   // BLE never came up (heap floor or NimBLE init failure)
-    Waiting,       // no app holds the screen, and no enrolled app has an icon
-    IconGrid,      // idle with enrolled apps: the decorative sleep grid
-    GalleryPicker, // interactive: choose which image-capable peer's gallery to browse
-    Pairing,       // "Pair with <app>?" prompt, awaiting CONFIRM/BACK
-    Text,          // title/body from the foreground app
-    Image,         // a pushed photo, full screen
-    Message,       // a transient status line, auto-reverting after a few seconds
+    StartFailed,    // BLE never came up (heap floor or NimBLE init failure)
+    Waiting,        // no app holds the screen, and no enrolled app has an icon
+    IconGrid,       // idle with enrolled apps: the decorative sleep grid
+    GalleryPicker,  // interactive: choose which image-capable peer's gallery to browse
+    Pairing,        // "Pair with <app>?" prompt, awaiting CONFIRM/BACK
+    Text,           // title/body from the foreground app
+    Image,          // a pushed photo, full screen
+    Message,        // a transient status line, auto-reverting after a few seconds
   };
 
   Screen screen = Screen::Waiting;
@@ -88,6 +88,19 @@ class CompanionModeActivity final : public Activity {
   std::vector<std::string> titleLines;  // title wrapped to at most kMaxTitleLines lines
 
   std::string displayedImagePath;
+
+  // True only between an image push committing and its IMAGE_STATUS going out.
+  // IMAGE_STATUS is defined by the protocol as the *response* to a push, but
+  // renderImage() is also reached by every ordinary redraw of an image already
+  // on screen (a central connecting, a foreground change, a gallery page turn).
+  // Without this gate those redraws broadcast IMAGE_STATUS(DISPLAYED) to
+  // whoever holds the foreground, so a client that connects while an older
+  // image is up sees its own pushImage() resolve after a couple of packets and
+  // stops transmitting — reproduced on hardware 6/6 against the iOS app.
+  // Set under RenderLock in handlePendingImage(), consumed exactly once by
+  // notifyImagePushResult(), and cleared on disconnect so an abandoned push
+  // cannot leak a status onto an unrelated later redraw.
+  bool imagePushAwaitingStatus = false;
 
   // Firmware-local browsing of the foreground peer's previously pushed images
   // (CompanionPeerStore's bounded per-peer gallery, kMaxImagesPerPeer entries,
@@ -223,6 +236,12 @@ class CompanionModeActivity final : public Activity {
   void renderStartFailed();
   void renderPage();
   void renderImage();
+  // Sends IMAGE_STATUS only if a pushed image is still awaiting its answer,
+  // and consumes that expectation. Every notify reached from renderImage()
+  // must go through here; the pre-render rejections in handlePendingImage()
+  // and CompanionBle's START-time checks are unconditionally solicited and
+  // call companionble::notifyImageStatus() directly.
+  void notifyImagePushResult(companionble::ImageResult result);
   void renderTags(int rightEdgeX, int centerY) const;
   // Draws a small sleeping indicator (bottom-left, same corner text mode's
   // battery percentage occupies) over the currently-displayed image, without

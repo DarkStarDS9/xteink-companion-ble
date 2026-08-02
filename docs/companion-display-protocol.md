@@ -349,6 +349,13 @@ work out for itself: whether the device stored the asset, and whether the
 image decoded. Everything else about rendering is deterministic from what was
 pushed.
 
+`IMAGE_STATUS` is **strictly a response to an image push**, never a broadcast
+about what is on screen. Exactly one arrives per pushed field `0x04`, and none
+at all for a redraw the client did not cause — connecting while an older image
+is still displayed, a foreground handover, or the user paging the device's
+local gallery all repaint the panel silently. A client may therefore treat the
+first `IMAGE_STATUS` after starting a push as that push's answer.
+
 ### Pairing and tokens
 
 The first `HELLO` from an unknown peer, or one carrying a token the device does
