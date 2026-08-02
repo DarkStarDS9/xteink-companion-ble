@@ -8,10 +8,12 @@ let package = Package(
         .macOS(.v12)
     ],
     products: [
-        .library(name: "CompanionKit", targets: ["CompanionKit"])
+        .library(name: "CompanionKit", targets: ["CompanionKit"]),
+        .executable(name: "companion-bench", targets: ["companion-bench"])
     ],
     targets: [
         .target(name: "CompanionKit"),
+        .executableTarget(name: "companion-bench", dependencies: ["CompanionKit"]),
         .testTarget(name: "CompanionKitTests", dependencies: ["CompanionKit"])
     ]
 )

@@ -817,6 +817,7 @@ extension CompanionClient: CBPeripheralDelegate {
             beginHandshake()
 
         case CompanionProtocol.sessionCharacteristicUUID:
+            log("session notify: \(value.map { String(format: "%02x", $0) }.joined())")
             guard let message = SessionCodec.decode(value) else { return }
             handleSessionMessage(message)
 

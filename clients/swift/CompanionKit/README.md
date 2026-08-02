@@ -180,6 +180,21 @@ settle. That slowness is wanted, not a defect to design around.
   prompt, it is not a secret. Do not push anything confidential.
 - **Session ids are per-connection.** Never persist one. The token is the thing that persists.
 
+## Benchmarking from a Mac
+
+`companion-bench` is an executable target in this package: a CLI that drives `CompanionClient` from
+macOS the same way an iOS app would, over the same CoreBluetooth stack. Use it instead of
+`scripts/push_companion_content.py` (Python/bleak) when you need Mac-measured BLE throughput to
+actually predict iPhone throughput — it removes bleak/asyncio as a variable entirely, since it's
+CompanionKit's real negotiation and chunk-sizing code, not a reimplementation of it.
+
+```bash
+swift run companion-bench /tmp/bench_image.raw   # raw packed-2bpp, no header, matches the device's caps
+```
+
+First run prompts for Bluetooth permission for the terminal. Prints the negotiated transfer time and
+throughput once the device reports the image decoded.
+
 ## Tests
 
 ```bash
