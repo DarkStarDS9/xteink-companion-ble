@@ -84,10 +84,6 @@ DISPLAY_NAME = "Dev Pusher"
 
 TOKEN_STORE = Path.home() / ".crosspoint_companion_tokens.json"
 
-# Conservative chunk payload — comfortably under the ~182 usable bytes a 185-byte
-# MTU leaves, minus the 2 bytes of v6 CHUNK framing.
-CHUNK_PAYLOAD = 176
-
 DEFAULT_TITLE = "Test Article: BLE Push"
 DEFAULT_BODY = (
     "This is a test article pushed directly over BLE, without the phone "
@@ -218,6 +214,13 @@ class Session:
     def __init__(self, client: BleakClient, caps: dict):
         self.client = client
         self.caps = caps
+        # bleak's mtu_size mirrors what CoreBluetooth actually negotiated for
+        # this link (client.mtu_size == ATT MTU, same value CompanionKit's
+        # maximumWriteValueLength(for:.withResponse) is derived from on a real
+        # iPhone) — not the 185 firmware merely requests. 2 bytes off for v6
+        # CHUNK framing (opcode + sessionId), same as CompanionKit's
+        # ContentFramer.chunkPayloadSize.
+        self.chunk_payload = max(1, client.mtu_size - 3 - 2)
         self.session_id = 0
         self.asset_tags: dict[int, bytes] = {}
         self.hello_tag = int.from_bytes(os.urandom(2), "little") or 1
@@ -317,9 +320,9 @@ class Session:
         start = bytes([OP_START, field_byte, self.session_id]) + struct.pack("<I", len(data))
         await self.client.write_gatt_char(CONTENT_CHAR_UUID, start, response=True)
 
-        total = max(1, (len(data) + CHUNK_PAYLOAD - 1) // CHUNK_PAYLOAD)
-        for index, offset in enumerate(range(0, len(data), CHUNK_PAYLOAD)):
-            chunk = data[offset : offset + CHUNK_PAYLOAD]
+        total = max(1, (len(data) + self.chunk_payload - 1) // self.chunk_payload)
+        for index, offset in enumerate(range(0, len(data), self.chunk_payload)):
+            chunk = data[offset : offset + self.chunk_payload]
             await self.client.write_gatt_char(
                 CONTENT_CHAR_UUID, bytes([OP_CHUNK, self.session_id]) + chunk, response=True
             )
@@ -448,6 +451,7 @@ async def run(args) -> None:
         )
 
         session = Session(client, caps)
+        print(f"  ATT MTU {client.mtu_size}, chunk payload {session.chunk_payload}B")
         await client.start_notify(SESSION_CHAR_UUID, session.on_session_notify)
         await client.start_notify(BUTTON_CHAR_UUID, Session.on_button_notify)
 
