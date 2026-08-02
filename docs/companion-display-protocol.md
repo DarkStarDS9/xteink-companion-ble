@@ -360,7 +360,10 @@ signature of a packet dropped or reordered under Write Without Response (see
 ack (a text push is a handful of chunks, not hundreds) and no partial-resume
 protocol — the device drops the whole field rather than render a spliced
 page, and the client's only path forward is re-pushing it from a fresh
-`START`. `field` is the field id that was dropped.
+`START`. `field` is the field id that was dropped. If the dropped field was
+part of an atomic batch, the **whole batch** is discarded — see "Atomic
+multi-field pushes" below — so the correct recovery is to re-push the entire
+batch, not just the field named here.
 
 `ASSET_ACK`, `IMAGE_STATUS` and `FIELD_SEQ_GAP` are the things a client
 genuinely cannot work out for itself: whether the device stored the asset,
@@ -559,6 +562,24 @@ across reconnects. If the client disconnects mid-batch before sending the
 final-flagged field, the device applies whatever was buffered after a short
 timeout (3 s) rather than sitting on stale content indefinitely.
 
+**A batch that loses a field is discarded whole.** If a title or body field in
+the batch is dropped for a CHUNK sequence gap (`FIELD_SEQ_GAP`, see below), the
+device does not commit the surviving fields when the final flag arrives: it
+throws the batch away and leaves the previous content on screen. Committing the
+survivors would render this push's body under the *previous* push's title — a
+fresh story under a stale headline — which is worse than showing a page that is
+merely out of date. The same applies to the 3 s timeout path: a batch that lost
+a field is discarded there too, not applied. `FIELD_SEQ_GAP` is unchanged and
+still names only the field that was actually lost; the client's recovery is to
+re-push the whole batch.
+
+"Whole" includes tag state (`0x07`) pushed inside the batch: it is dropped with
+everything else, because the alternative is the stale article on screen wearing
+the *new* article's tags — a mark the user can see attached to content they
+cannot. A tag state pushed **on its own**, outside any title/body batch, is
+unaffected and still applies immediately; only tag state that arrived as part
+of the poisoned batch is discarded.
+
 On the client side this is a small, fully synchronous send loop — there is no
 per-chunk ack. If reliable delivery matters, use "Write" (not "Write Without
 Response") for the CHUNK packets so BLE's own link-layer ack applies.
@@ -610,7 +631,9 @@ one field is ever in flight at a time) and, the instant a `CHUNK` arrives out
 of sequence, marks the field corrupt and notifies `FIELD_SEQ_GAP` at `END`
 instead of handing a partial or spliced buffer to the renderer. As with the
 image field, there is no partial-resume protocol: recovering from
-`FIELD_SEQ_GAP` means re-pushing the field from a fresh `START`.
+`FIELD_SEQ_GAP` means re-pushing the field from a fresh `START` — and, if the
+field was part of an atomic batch, re-pushing the whole batch, since the device
+discards a batch that lost a field (see "Atomic multi-field pushes").
 
 Unlike the image field, title/body pushes are small enough (a handful of
 chunks for a full page, not hundreds) that no mid-transfer progress ack
@@ -1514,6 +1537,18 @@ Images:
     Also push a rapid sequence of short title+body updates (a few seconds
     apart, full page each) and confirm the on-screen text keeps pace instead
     of visibly lagging behind — the scenario that motivated this change.
+28e. Push an atomic batch (title, body, final-flagged content-id) with a
+    deliberately skipped sequence number in the **title** only: confirm
+    `FIELD_SEQ_GAP` names the title and that the screen still shows the
+    *previous* article's title AND body — not the new body under the old
+    headline. Repeat with the gap in the body. Repeat once more without
+    sending the final-flagged field at all, and confirm the batch is still
+    discarded (not applied) when the 3 s timeout fires.
+28f. Push an atomic batch of title + body + tag state (`0x07`) with the gap in
+    the title: confirm no tag chip changes on screen — the previous article
+    must keep its own tags, not inherit the new one's. Then toggle a single
+    tag on its own (a standalone `0x07` push, no title/body) and confirm it
+    still applies immediately.
 
 Icons and sleep screen:
 

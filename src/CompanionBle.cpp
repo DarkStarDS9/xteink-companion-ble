@@ -15,8 +15,8 @@
 #include <vector>
 
 #include "CompanionPeerStore.h"
-#include "Memory.h"
 #include "Epub/converters/RawBitmapToFramebufferConverter.h"
+#include "Memory.h"
 
 namespace companionble {
 
@@ -146,7 +146,7 @@ ImageStagedCallback g_imageStagedCb = nullptr;
 // Adaptive connection interval / slave latency
 // ---------------------------------------------------------------------------
 //
-// Two link-layer profiles, requested via NimBLEServer::updateConnParams (a
+// Three link-layer profiles, requested via NimBLEServer::updateConnParams (a
 // peripheral can only ever *request* new parameters -- the central, iOS here,
 // grants or ignores it). This is transport tuning, not a protocol change: no
 // wire field, byte layout, or characteristic is affected, so it carries no
@@ -178,57 +178,158 @@ ImageStagedCallback g_imageStagedCb = nullptr;
 // (image writes moved to a dedicated task so a slow SdFat/SPI write or the
 // end-of-image flush()/close() can never stall the BLE host task long enough
 // to miss a scheduled radio event at this tighter interval).
+// Checks: 15 ms is a multiple of 15 ms and meets the >=15 ms floor; latency
+// 0 <= 30; 15 ms * (0+1) = 15 ms <= 6 s; 6000 ms > 15 ms * 1 * 3 = 45 ms.
 constexpr uint16_t kConnIntervalBusyUnits = 12;  // 15 ms (12 * 1.25 ms)
 constexpr uint16_t kConnLatencyBusy = 0;
 constexpr uint16_t kConnTimeoutBusyUnits = 600;  // 6 s (10 ms units) -- iOS's floor
 
-// "Idle": relaxed interval + latency skip once nothing has moved for a
-// while -- the "slave latency" lever from the platform research this change
-// is based on, which alone (independent of modem/light-sleep) measurably cuts
-// average current by letting the peripheral skip waking for idle connection
-// events. 150 ms * (4+1) = 750 ms, comfortably under the 6 s cap; the 6 s
-// timeout is unchanged from the busy profile so relaxing/tightening never
-// crosses a supervision-timeout boundary.
-constexpr uint16_t kConnIntervalIdleUnits = 120;  // 150 ms (120 * 1.25 ms)
-constexpr uint16_t kConnLatencyIdle = 4;
-constexpr uint16_t kConnTimeoutIdleUnits = 600;  // 6 s
+// "Near": the middle stage, for a link that is quiet *right now* but belongs
+// to an app that currently holds the screen -- i.e. one that is very likely
+// to push again within seconds.
+//
+// Why it exists (measured on hardware 2026-08-03, three identical
+// 104544-byte image pushes over one connection):
+//   image 1, started on the busy profile:     1876 ms, 55727 B/s
+//   image 2, started on the relaxed profile:  3733 ms, 28005 B/s
+//   image 3, started on the relaxed profile:  3763 ms, 27782 B/s
+// All three *ended* on the busy profile, so the entire 2x penalty is the
+// ramp-up window at the start of the transfer. A connection-parameter update
+// does not take effect when it is requested: it takes effect at an "instant"
+// roughly 6 connection events out. At the old 150 ms idle interval that is
+// ~900 ms of crawling before the link tightens. The device relaxes ~4.3 s
+// after connect -- during the render of the very first push -- so every
+// transfer after the first one paid it.
+//
+// Near is the compromise: 60 ms * (2+1) = 180 ms effective wake cadence still
+// cuts radio events ~12x versus busy's 15 ms, but the ramp back to busy costs
+// only ~6 * 60 ms = ~360 ms instead of ~900 ms.
+//
+// Checks: 60 ms = 4 * 15 ms (multiple, and >= the 15 ms floor); latency
+// 2 <= 30; 60 ms * (2+1) = 180 ms <= 6 s; 12000 ms is inside 6-18 s and
+// 12000 > 180 * 3 = 540 ms.
+constexpr uint16_t kConnIntervalNearUnits = 48;  // 60 ms (48 * 1.25 ms)
+constexpr uint16_t kConnLatencyNear = 2;
+constexpr uint16_t kConnTimeoutNearUnits = 1200;  // 12 s
+
+// "Deep": relaxed interval + latency skip once the device is genuinely not
+// being driven -- the "slave latency" lever from the platform research this
+// change is based on, which alone (independent of modem/light-sleep)
+// measurably cuts average current by letting the peripheral skip waking for
+// idle connection events. 150 ms * (4+1) = 750 ms effective, a ~50x cut in
+// radio events versus busy, and worth the full ~900 ms ramp for a device
+// nobody is using.
+//
+// Checks: 150 ms = 10 * 15 ms; latency 4 <= 30; 150 ms * (4+1) = 750 ms
+// <= 6 s; 12000 ms is inside 6-18 s and 12000 > 750 * 3 = 2250 ms.
+//
+// The supervision timeout went 6 s -> 12 s here (and on Near) as precautionary
+// insurance, NOT as a demonstrated fix: a 312-second silent-link hold test on
+// the old 6 s timeout did not drop. It only matters when connection events are
+// actually being missed, and at a 750 ms effective cadence 6 s left just 8
+// tolerable consecutive misses. Busy keeps 6 s because at 15 ms that is 400
+// missed events -- there is nothing to buy there.
+constexpr uint16_t kConnIntervalDeepUnits = 120;  // 150 ms (120 * 1.25 ms)
+constexpr uint16_t kConnLatencyDeep = 4;
+constexpr uint16_t kConnTimeoutDeepUnits = 1200;  // 12 s
 
 // How long the link must go without a content/status/session write or an
-// outgoing button notify before it relaxes to the idle profile. Matches
+// outgoing button notify before it relaxes one stage. Matches
 // HalPowerManager::IDLE_POWER_SAVING_MS's idea of "idle" (not its value
 // directly -- that constant lives in a different module -- but the same
 // shape: a short, fixed quiet period before backing off).
 constexpr uint32_t kConnIdleRelaxMs = 3000;
 
+// ...and how long before it drops all the way to Deep. Only reached while a
+// session still holds the screen; with no foreground session the link goes
+// straight from Busy to Deep at kConnIdleRelaxMs, because nothing is going to
+// push content to a screen no app owns.
+constexpr uint32_t kConnDeepRelaxMs = 30000;
+
+// Three discrete link stages rather than a bool: the transition rules below
+// depend on *which* stage is wanted, and an exhaustive switch keeps the
+// parameter triples from drifting apart (see .skills control-flow-clarity).
+enum class ConnProfile : uint8_t { Busy, Near, Deep };
+
+const char* connProfileName(ConnProfile profile) {
+  switch (profile) {
+    case ConnProfile::Busy:
+      return "busy";
+    case ConnProfile::Near:
+      return "near";
+    case ConnProfile::Deep:
+      return "deep";
+  }
+  return "?";
+}
+
 uint32_t g_lastBleActivityMs = 0;
 // Tracks which profile was last requested, so tick() and the activity
 // helpers below don't spam updateConnParams() every call once already in the
-// right state. Starts false (idle) so onConnect()'s noteBleActivity() call
-// always fires an explicit busy request on a fresh connection -- the v6
-// handshake happens right after connect, and should get the tightest
-// round-trip available rather than whatever the central defaulted to.
-bool g_connParamsBusy = false;
+// right state. Starts at Deep so onConnect()'s noteBleActivity() call always
+// fires an explicit Busy request on a fresh connection -- the v6 handshake
+// happens right after connect, and should get the tightest round-trip
+// available rather than whatever the central defaulted to.
+ConnProfile g_connProfile = ConnProfile::Deep;
 
-void requestConnParams(bool busy) {
+// DIAGNOSTIC (2026-08-03 link-robustness investigation): millis() at the last
+// onConnect, so every link-layer log line can carry "t=+Nms into this
+// connection". This is what turns "it disconnects every ~43 seconds" from a
+// stopwatch observation into a measured number correlated with the profile
+// churn and the granted parameters. Remove with the rest of this
+// investigation's instrumentation.
+uint32_t g_connectMs = 0;
+uint32_t connUptimeMs() { return g_connectMs == 0 ? 0 : millis() - g_connectMs; }
+
+// DIAGNOSTIC: what requestConnParams() last asked for, so onConnParamsUpdate()
+// can say whether the central actually granted it. requestConnParams() latches
+// g_connProfile on the *request*; if iOS silently ignores or alters it, the
+// firmware otherwise carries on believing the link is tight.
+uint16_t g_reqIntervalUnits = 0;
+uint16_t g_reqLatency = 0;
+uint16_t g_reqTimeoutUnits = 0;
+
+void requestConnParams(ConnProfile profile) {
   if (!g_server || g_server->getConnectedCount() == 0) return;
-  if (g_connParamsBusy == busy) return;
-  const uint16_t interval = busy ? kConnIntervalBusyUnits : kConnIntervalIdleUnits;
-  const uint16_t latency = busy ? kConnLatencyBusy : kConnLatencyIdle;
-  const uint16_t timeout = busy ? kConnTimeoutBusyUnits : kConnTimeoutIdleUnits;
+  if (g_connProfile == profile) return;
+  uint16_t interval = kConnIntervalBusyUnits;
+  uint16_t latency = kConnLatencyBusy;
+  uint16_t timeout = kConnTimeoutBusyUnits;
+  switch (profile) {
+    case ConnProfile::Busy:
+      interval = kConnIntervalBusyUnits;
+      latency = kConnLatencyBusy;
+      timeout = kConnTimeoutBusyUnits;
+      break;
+    case ConnProfile::Near:
+      interval = kConnIntervalNearUnits;
+      latency = kConnLatencyNear;
+      timeout = kConnTimeoutNearUnits;
+      break;
+    case ConnProfile::Deep:
+      interval = kConnIntervalDeepUnits;
+      latency = kConnLatencyDeep;
+      timeout = kConnTimeoutDeepUnits;
+      break;
+  }
   const auto peer = g_server->getPeerInfo(0);
   g_server->updateConnParams(peer.getConnHandle(), interval, interval, latency, timeout);
-  g_connParamsBusy = busy;
-  LOG_DBG("CBLE", "requested %s conn params (interval=%u latency=%u timeout=%u)", busy ? "busy" : "idle",
-          static_cast<unsigned>(interval), static_cast<unsigned>(latency), static_cast<unsigned>(timeout));
+  g_connProfile = profile;
+  g_reqIntervalUnits = interval;
+  g_reqLatency = latency;
+  g_reqTimeoutUnits = timeout;
+  LOG_DBG("CBLE", "t=+%lums requested %s conn params (interval=%u latency=%u timeout=%u)",
+          static_cast<unsigned long>(connUptimeMs()), connProfileName(profile), static_cast<unsigned>(interval),
+          static_cast<unsigned>(latency), static_cast<unsigned>(timeout));
 }
 
 // Called from every characteristic write and outgoing notify -- i.e. anything
 // that means a phone app is actively driving the link right now. Cheap: a
-// timestamp store and, only on the idle->busy edge, one GAP parameter-update
-// request.
+// timestamp store and, only on the edge back up from Near/Deep, one GAP
+// parameter-update request.
 void noteBleActivity() {
   g_lastBleActivityMs = millis();
-  requestConnParams(/*busy=*/true);
+  requestConnParams(ConnProfile::Busy);
 }
 
 // ---------------------------------------------------------------------------
@@ -342,8 +443,8 @@ void notifyBackground(uint8_t sessionId, BackgroundReason reason) {
 void notifyAssetAck(uint8_t sessionId, uint8_t assetId, companionpeer::AssetStoreResult result, const char* peerKey) {
   uint8_t payload[8] = {kSessAssetAck, sessionId, assetId, static_cast<uint8_t>(result), 0, 0, 0, 0};
   if (result == companionpeer::AssetStoreResult::Stored) {
-    companionpeer::assetTag(peerKey, assetId == kFieldIcon ? companionpeer::kAssetIcon : companionpeer::kAssetUiDeclaration,
-                            payload + 4);
+    companionpeer::assetTag(
+        peerKey, assetId == kFieldIcon ? companionpeer::kAssetIcon : companionpeer::kAssetUiDeclaration, payload + 4);
   }
   notifySession(payload, sizeof(payload));
 }
@@ -561,11 +662,11 @@ enum class ImageWorkType : uint8_t { Open, Chunk, End, Abort };
 struct ImageWorkMsg {
   ImageWorkType type = ImageWorkType::Abort;
   uint16_t len = 0;                                // Chunk: valid bytes in data[]
-  uint8_t data[kMaxImageChunkPayload] = {0};        // Chunk: payload
-  char peerKey[companionpeer::kPeerKeyLen] = {0};   // Open: whose staging file to open
-  uint8_t contentId[kMaxContentIdLen] = {0};        // End: session's content-id, copied here
-  uint8_t contentIdLen = 0;                         // (host task) before enqueueing so a later
-                                                     // session-table reset can't race it
+  uint8_t data[kMaxImageChunkPayload] = {0};       // Chunk: payload
+  char peerKey[companionpeer::kPeerKeyLen] = {0};  // Open: whose staging file to open
+  uint8_t contentId[kMaxContentIdLen] = {0};       // End: session's content-id, copied here
+  uint8_t contentIdLen = 0;                        // (host task) before enqueueing so a later
+                                                   // session-table reset can't race it
 };
 
 // Sized to smooth over the writer task falling behind briefly (a slow SD
@@ -985,10 +1086,14 @@ class SessionCharCallbacks : public NimBLECharacteristicCallbacks {
 
 const char* phyName(uint8_t phy) {
   switch (phy) {
-    case BLE_GAP_LE_PHY_1M: return "1M";
-    case BLE_GAP_LE_PHY_2M: return "2M";
-    case BLE_GAP_LE_PHY_CODED: return "CODED";
-    default: return "?";
+    case BLE_GAP_LE_PHY_1M:
+      return "1M";
+    case BLE_GAP_LE_PHY_2M:
+      return "2M";
+    case BLE_GAP_LE_PHY_CODED:
+      return "CODED";
+    default:
+      return "?";
   }
 }
 
@@ -1027,10 +1132,9 @@ void beginImageStaging(const Session& session) {
 }
 
 void finishAsset(uint8_t field, const Session& session, uint8_t sessionId) {
-  const companionpeer::AssetStoreResult result =
-      companionpeer::storeAsset(session.peerKey, field == kFieldIcon ? companionpeer::kAssetIcon
-                                                                     : companionpeer::kAssetUiDeclaration,
-                                g_activeBuf.get(), g_activeWritten, kIconBytes);
+  const companionpeer::AssetStoreResult result = companionpeer::storeAsset(
+      session.peerKey, field == kFieldIcon ? companionpeer::kAssetIcon : companionpeer::kAssetUiDeclaration,
+      g_activeBuf.get(), g_activeWritten, kIconBytes);
   notifyAssetAck(sessionId, field, result, session.peerKey);
   if (result != companionpeer::AssetStoreResult::Stored) {
     LOG_ERR("CBLE", "asset 0x%02x rejected (%u)", field, static_cast<unsigned>(static_cast<uint8_t>(result)));
@@ -1186,7 +1290,7 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           if (g_activeSeq % kImageChunkAckInterval == 0) {
             const uint16_t ackedSeq = g_activeSeq - 1;
             const uint8_t ack[4] = {kSessImageChunkAck, g_activeSession, static_cast<uint8_t>(ackedSeq & 0xFF),
-                                     static_cast<uint8_t>((ackedSeq >> 8) & 0xFF)};
+                                    static_cast<uint8_t>((ackedSeq >> 8) & 0xFF)};
             notifySession(ack, sizeof(ack));
           }
           recordChunkBusy(chunkEntryMs);
@@ -1256,9 +1360,8 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           case kFieldImage: {
             const uint32_t transferMs = millis() - g_imageTransferStartMs;
             if (transferMs > 0) {
-              LOG_DBG("CBLE", "image transfer: %u bytes in %u ms (%u B/s)",
-                      static_cast<unsigned>(g_activeWritten), static_cast<unsigned>(transferMs),
-                      static_cast<unsigned>(g_activeWritten * 1000UL / transferMs));
+              LOG_DBG("CBLE", "image transfer: %u bytes in %u ms (%u B/s)", static_cast<unsigned>(g_activeWritten),
+                      static_cast<unsigned>(transferMs), static_cast<unsigned>(g_activeWritten * 1000UL / transferMs));
             }
             logChunkTiming();
             logLastConnParams();
@@ -1301,7 +1404,8 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           case kFieldContentId:
             session->contentIdLen = static_cast<uint8_t>(g_activeWritten);
             memcpy(session->contentId, g_activeBuf.get(), session->contentIdLen);
-            if (g_contentCb) g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal);
+            if (g_contentCb)
+              g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal, FieldOutcome::Complete);
             break;
 
           case kFieldTitle:
@@ -1313,17 +1417,30 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
             // the renderer. The phone finds out via kSessFieldSeqGap instead
             // of silence, unlike a pre-v10 write failure (which could not
             // happen at all under Write With Response).
+            //
+            // The drop is *also* reported upward as FieldOutcome::Dropped.
+            // Staying silent toward the activity was a confirmed real-world
+            // bug: a multi-field batch (title, body, then a final-flagged
+            // field) whose title was lost still committed on the final flag,
+            // so the body updated while the title kept the previous article's
+            // text -- a fresh story under a stale headline. The activity
+            // poisons the batch on this and discards it instead. The phone's
+            // recovery is unchanged: re-push the whole batch on
+            // kSessFieldSeqGap.
             if (g_activeSeqGap) {
               LOG_ERR("CBLE", "field 0x%02x dropped: CHUNK sequence gap under Write Without Response", field);
               const uint8_t payload[3] = {kSessFieldSeqGap, sessionId, field};
               notifySession(payload, sizeof(payload));
+              if (g_contentCb) g_contentCb(field, nullptr, 0, g_activeFinal, FieldOutcome::Dropped);
               break;
             }
-            if (g_contentCb) g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal);
+            if (g_contentCb)
+              g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal, FieldOutcome::Complete);
             break;
 
           default:
-            if (g_contentCb) g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal);
+            if (g_contentCb)
+              g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal, FieldOutcome::Complete);
             break;
         }
         resetReassembly();
@@ -1350,8 +1467,49 @@ class StatusCharCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
+// DIAGNOSTIC (2026-08-03): names the HCI reason behind a disconnect. NimBLE
+// hands onDisconnect() a host-stack error, not a raw HCI code -- controller
+// reasons arrive offset by BLE_HS_ERR_HCI_BASE (0x200, ble_hs.h:171), so the
+// low byte is the actual HCI value only for codes in that range.
+//
+// The distinction is the whole point of this instrumentation: 0x08 blames the
+// idle connection profile's 6 s supervision timeout against a 750 ms effective
+// wake cadence; 0x13/0x16 mean iOS or the app deliberately dropped the link
+// (an app-lifecycle timer, not the radio); 0x22/0x28 point at the busy<->idle
+// parameter-update churn colliding with itself.
+const char* disconnectReasonName(int reason) {
+  if (reason >= BLE_HS_ERR_HCI_BASE && reason < BLE_HS_ERR_HCI_BASE + 0x100) {
+    switch (reason - BLE_HS_ERR_HCI_BASE) {
+      case 0x08:
+        return "HCI 0x08 supervision timeout";
+      case 0x13:
+        return "HCI 0x13 remote user terminated";
+      case 0x14:
+        return "HCI 0x14 remote terminated, low resources";
+      case 0x15:
+        return "HCI 0x15 remote terminated, powering off";
+      case 0x16:
+        return "HCI 0x16 local host terminated";
+      case 0x1F:
+        return "HCI 0x1f unspecified error";
+      case 0x22:
+        return "HCI 0x22 LMP/LL response timeout";
+      case 0x28:
+        return "HCI 0x28 instant passed";
+      case 0x3B:
+        return "HCI 0x3b unacceptable conn interval";
+      case 0x3E:
+        return "HCI 0x3e connection failed to establish";
+      default:
+        return "HCI (other)";
+    }
+  }
+  return "host-stack error (not an HCI reason)";
+}
+
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
+    g_connectMs = millis();
     LOG_DBG("CBLE", "central connected");
     // Request the tight profile right away: the v6 HELLO handshake happens
     // immediately after connect, before anything else marks the link busy.
@@ -1388,19 +1546,42 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     g_lastConnIntervalMs = connInfo.getConnInterval() * 1.25f;
     g_lastConnLatency = connInfo.getConnLatency();
     g_lastConnTimeoutMs = connInfo.getConnTimeout() * 10;
-    LOG_DBG("CBLE", "conn params granted: interval=%.2fms latency=%u timeout=%ums", g_lastConnIntervalMs,
-            static_cast<unsigned>(g_lastConnLatency), static_cast<unsigned>(g_lastConnTimeoutMs));
+    LOG_DBG("CBLE", "t=+%lums conn params granted: interval=%.2fms latency=%u timeout=%ums",
+            static_cast<unsigned long>(connUptimeMs()), g_lastConnIntervalMs, static_cast<unsigned>(g_lastConnLatency),
+            static_cast<unsigned>(g_lastConnTimeoutMs));
+    // DIAGNOSTIC: a request the central did not honour leaves the firmware
+    // streaming Write-Without-Response chunks into a link it wrongly believes
+    // is on the 15 ms busy profile. Nothing currently notices; say so loudly.
+    if (g_reqIntervalUnits != 0 &&
+        (connInfo.getConnInterval() != g_reqIntervalUnits || connInfo.getConnLatency() != g_reqLatency ||
+         connInfo.getConnTimeout() != g_reqTimeoutUnits)) {
+      LOG_ERR("CBLE",
+              "conn params DIVERGED from request: asked interval=%u latency=%u timeout=%u, got interval=%u "
+              "latency=%u timeout=%u (units: 1.25ms / events / 10ms)",
+              static_cast<unsigned>(g_reqIntervalUnits), static_cast<unsigned>(g_reqLatency),
+              static_cast<unsigned>(g_reqTimeoutUnits), static_cast<unsigned>(connInfo.getConnInterval()),
+              static_cast<unsigned>(connInfo.getConnLatency()), static_cast<unsigned>(connInfo.getConnTimeout()));
+    }
   }
   void onPhyUpdate(NimBLEConnInfo& /*connInfo*/, uint8_t txPhy, uint8_t rxPhy) override {
     g_lastPhyTx = phyName(txPhy);
     g_lastPhyRx = phyName(rxPhy);
     LOG_DBG("CBLE", "PHY update: tx=%s rx=%s", g_lastPhyTx, g_lastPhyRx);
   }
-  void onDisconnect(NimBLEServer* server, NimBLEConnInfo& /*connInfo*/, int /*reason*/) override {
-    LOG_DBG("CBLE", "central disconnected");
+  void onDisconnect(NimBLEServer* server, NimBLEConnInfo& /*connInfo*/, int reason) override {
+    // DIAGNOSTIC: the reason code was previously discarded, which left every
+    // disconnect indistinguishable -- radio, iOS policy, and our own parameter
+    // churn all looked the same. The uptime alongside it is what a periodic
+    // drop shows up in. Also reports whether a transfer was in flight, since a
+    // drop mid-field is a different story from a drop on an idle link.
+    LOG_ERR("CBLE", "central disconnected after %lums: reason=0x%04x (%s), field-in-flight=0x%02x",
+            static_cast<unsigned long>(connUptimeMs()), static_cast<unsigned>(reason), disconnectReasonName(reason),
+            g_activeField);
+    g_connectMs = 0;
+    g_reqIntervalUnits = 0;
     // The next connect gets a fresh onConnect() -> noteBleActivity() edge;
-    // reset to idle so a stale "already busy" doesn't suppress that request.
-    g_connParamsBusy = false;
+    // reset to Deep so a stale "already Busy" doesn't suppress that request.
+    g_connProfile = ConnProfile::Deep;
     resetReassembly();
     // Sessions do not survive the link. The token does — that is what makes the
     // next connect silent.
@@ -1590,9 +1771,17 @@ void stop() {
 bool isConnected() { return g_begun && g_server && g_server->getConnectedCount() > 0; }
 
 void tick() {
-  if (!isConnected() || !g_connParamsBusy) return;
-  if (millis() - g_lastBleActivityMs < kConnIdleRelaxMs) return;
-  requestConnParams(/*busy=*/false);
+  if (!isConnected()) return;
+  const uint32_t quietMs = millis() - g_lastBleActivityMs;
+  if (quietMs < kConnIdleRelaxMs) return;
+  // Two ways to earn Deep: a long enough quiet spell that even an app holding
+  // the screen has clearly stopped driving, or no session holding the screen
+  // at all -- in which case there is nobody whose next push would pay the
+  // ramp, so the ~50x saving is free. Otherwise sit at Near: quiet, but one
+  // ~360 ms ramp away from full speed instead of ~900 ms.
+  const bool screenOwned = g_foreground != kNoSession;
+  const ConnProfile want = (quietMs >= kConnDeepRelaxMs || !screenOwned) ? ConnProfile::Deep : ConnProfile::Near;
+  requestConnParams(want);
 }
 
 const uint8_t* capabilityValue(size_t& lengthOut) {
@@ -1621,9 +1810,8 @@ bool notifyButtonEvent(ButtonId button, uint16_t durationTicks, bool isFinal) {
   noteBleActivity();
 
   // Header byte: bit7 isFinal, bits6-4 event type, bits3-0 button id.
-  const uint8_t header = (isFinal ? 0x80 : 0x00) |
-                          ((static_cast<uint8_t>(ButtonEventType::ButtonPress) & 0x07) << 4) |
-                          (static_cast<uint8_t>(button) & 0x0F);
+  const uint8_t header = (isFinal ? 0x80 : 0x00) | ((static_cast<uint8_t>(ButtonEventType::ButtonPress) & 0x07) << 4) |
+                         (static_cast<uint8_t>(button) & 0x0F);
   uint8_t payload[4 + kMaxContentIdLen];
   payload[0] = g_foreground;
   payload[1] = header;

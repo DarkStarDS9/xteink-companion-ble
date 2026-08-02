@@ -325,7 +325,18 @@ void resolvePairing(bool accept, bool timedOut = false);
 // handled inside CompanionBle.cpp and do not reach here except via the
 // dedicated callbacks below. `final` mirrors kFinalFieldFlag from this field's
 // START packet.
-using ContentFieldCallback = void (*)(uint8_t field, const uint8_t* data, size_t len, bool final);
+//
+// `outcome` says whether `data` is actually a field. Dropped is reported so a
+// receiver batching fields for an atomic commit can tell "this field did not
+// change" apart from "this field was lost" — committing a batch that lost one
+// field puts a fresh body under a stale headline, which is worse than not
+// committing at all. On Dropped, `data` is nullptr and `len` is 0; `field` and
+// `final` still describe the field that was lost.
+enum class FieldOutcome : uint8_t {
+  Complete,  // fully reassembled; `data`/`len` are the field
+  Dropped,   // reassembly failed (v10 CHUNK sequence gap); no data
+};
+using ContentFieldCallback = void (*)(uint8_t field, const uint8_t* data, size_t len, bool final, FieldOutcome outcome);
 void setContentFieldCallback(ContentFieldCallback cb);
 
 // Callback for a Status characteristic write from the foreground session: set

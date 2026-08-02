@@ -119,6 +119,8 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     private let tokenStore: CompanionTokenStore
     private let assets: CompanionAssetProvider
     private let log: @Sendable (String) -> Void
+    /// Backing store for ``isVerboseLoggingEnabled``; guarded by ``lock``.
+    private var verboseLogging: Bool
     /// Whether the handshake should end by asking for the screen. This is an
     /// app-intent flag, never a lifecycle mirror — see ``acquireScreen()``.
     private var wantsScreen: Bool
@@ -168,17 +170,22 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     ///     display something. Pass `false` if the app connects for other reasons
     ///     and will call ``acquireScreen()`` later; you can also change it at any
     ///     time with ``acquireScreen()`` / ``releaseScreen()`` before connecting.
+    ///   - verboseLogging: whether per-packet BLE transport chatter reaches
+    ///     `log`. Off by default, and it should stay off in shipping builds —
+    ///     see ``isVerboseLoggingEnabled``.
     ///   - log: diagnostics sink. Defaults to dropping them — apps with their own
     ///     event log should pass a closure rather than hunting in os_log.
     public init(identity: CompanionIdentity,
                 tokenStore: CompanionTokenStore = KeychainTokenStore(),
                 assets: CompanionAssetProvider,
                 acquireScreenOnConnect: Bool = true,
+                verboseLogging: Bool = false,
                 log: @escaping @Sendable (String) -> Void = { _ in }) {
         self.identity = identity
         self.tokenStore = tokenStore
         self.assets = assets
         self.wantsScreen = acquireScreenOnConnect
+        self.verboseLogging = verboseLogging
         self.log = log
 
         var continuation: AsyncStream<CompanionEvent>.Continuation!
@@ -186,6 +193,38 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         super.init()
         self.eventContinuation = continuation
         self.central = CBCentralManager(delegate: self, queue: queue)
+    }
+
+    /// Whether per-packet BLE transport chatter is written to the `log` sink.
+    /// Default `false`, and deliberately so.
+    ///
+    /// `log` is not a developer-only os_log in practice: consumer apps wire it
+    /// into user-visible diagnostic tapes (SpokenFeeds' "Copy Tape" JSONL
+    /// export, for one), which people are asked to paste into bug reports. A
+    /// line that fires per packet or per push drowns that tape — the WWR
+    /// ready-with-no-waiters line alone fired twice per push, so a session of
+    /// twenty-five articles buried everything else under fifty lines of it.
+    ///
+    /// So the rule for this flag: anything that fires on the happy path goes
+    /// behind it; anything rare and actionable (the WWR wedge warning,
+    /// sequence-gap drops, state transitions, pairing denials) stays
+    /// unconditional. Toggle it at runtime from a debug menu when chasing a
+    /// transport bug.
+    public var isVerboseLoggingEnabled: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return verboseLogging }
+        set { lock.lock(); verboseLogging = newValue; lock.unlock() }
+    }
+
+    /// Logs only when ``isVerboseLoggingEnabled``. The message is an
+    /// autoclosure so an unwanted line costs no string interpolation at all —
+    /// this is called from inside the WWR chunk loop, which runs hundreds of
+    /// times per image push.
+    private func logVerbose(_ message: @autoclosure () -> String) {
+        lock.lock()
+        let enabled = verboseLogging
+        lock.unlock()
+        guard enabled else { return }
+        log(message())
     }
 
     /// The device's self-description, once connected.
@@ -338,19 +377,86 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     ///
     /// Takes several seconds: BLE transfer plus a two-pass grayscale settle.
     /// `progress` is called on an arbitrary queue with 0...1.
+    ///
+    /// A transient failure is retried once, automatically — see
+    /// ``isTransientImageFailure(_:)`` for which results qualify and why. The
+    /// retry re-sends the whole image (there is no partial-resume anywhere in
+    /// the protocol), so `progress` restarts from 0 and climbs to 1 a second
+    /// time. That is the honest report: a bar that jumps back to the start is
+    /// exactly what is happening on the wire. A caller that wants to say so in
+    /// its UI can watch for the progress value decreasing.
     @discardableResult
     public func pushImage(_ png: Data, progress: (@Sendable (Double) -> Void)? = nil) async throws -> ImageResult {
         try await serialized { [self] in
-            let session = try requireSession()
-            if let limit = deviceCapabilities?.maxImageFieldLength, png.count > limit {
-                throw CompanionError.payloadTooLarge(field: .image, bytes: png.count, limit: limit)
-            }
+            // Note the retry lives *inside* `serialized`: the gate is acquired
+            // once for both attempts. Retrying by re-calling `pushImage` would
+            // try to re-acquire a gate this task already holds, which is a
+            // straight deadlock — CommandGate is a plain non-reentrant mutex.
+            // Holding it across the retry is also what we want semantically:
+            // another push interleaving between the two attempts would make the
+            // device discard whichever field arrived first.
+            let first = try await attemptImagePush(png, progress: progress)
+            if first == .displayed { return first }
+            guard Self.isTransientImageFailure(first) else { throw CompanionError.imageRejected(first) }
 
-            let result = try await withPendingImageStatus {
-                try await self.sendField(.image, payload: png, sessionId: session, isFinal: true, progress: progress)
-            }
-            guard result == .displayed else { throw CompanionError.imageRejected(result) }
-            return result
+            log("image push failed with \(first); retrying once")
+            // Re-checked rather than reused from the first attempt: the screen
+            // can have been preempted, or the link dropped, while the failed
+            // transfer was in flight. `attemptImagePush` calls `requireSession`
+            // again, which throws in either case instead of spending another
+            // ~104 KB of airtime on frames the device will discard.
+            let second = try await attemptImagePush(png, progress: progress)
+            guard second == .displayed else { throw CompanionError.imageRejected(second) }
+            return second
+        }
+    }
+
+    /// One transfer attempt. Assumes the command gate is already held.
+    private func attemptImagePush(_ png: Data,
+                                  progress: (@Sendable (Double) -> Void)?) async throws -> ImageResult {
+        let session = try requireSession()
+        if let limit = deviceCapabilities?.maxImageFieldLength, png.count > limit {
+            throw CompanionError.payloadTooLarge(field: .image, bytes: png.count, limit: limit)
+        }
+        return try await withPendingImageStatus {
+            try await self.sendField(.image, payload: png, sessionId: session, isFinal: true, progress: progress)
+        }
+    }
+
+    /// Whether a non-`displayed` image result is worth one more try.
+    ///
+    /// Retrying is not free — a full-screen image is ~104 KB and takes seconds —
+    /// so this retries only where the same bytes plausibly succeed next time,
+    /// and never where a second attempt would just buy the same failure at
+    /// double the wait. Case by case:
+    ///
+    /// - ``ImageResult/sequenceGap``: **retry.** A CHUNK went missing under
+    ///   Write Without Response, which has no delivery guarantee and no
+    ///   retransmission anywhere in this protocol — one dropped packet
+    ///   currently kills the entire transfer. That is precisely the failure a
+    ///   retry exists for, and it is per-packet luck rather than anything about
+    ///   the image.
+    /// - ``ImageResult/storageFailed``: **retry.** The device stages the image
+    ///   to an SD scratch file; a failed write is a card/filesystem hiccup, not
+    ///   a property of the payload. If the card is genuinely gone the retry
+    ///   fails the same way and the caller sees the error one attempt later.
+    /// - ``ImageResult/rejectedSize``: **no.** Deterministic, and computable
+    ///   from the capability characteristic — the same bytes are the same size
+    ///   next time.
+    /// - ``ImageResult/decodeFailed``: **no.** Also deterministic in the payload:
+    ///   a complete transfer that the device could not make sense of will not
+    ///   make more sense on a second reading. (A *truncated* transfer is not
+    ///   this case — the device reports that as a sequence gap.)
+    /// - ``ImageResult/unknown``: **no.** A result byte this package does not
+    ///   recognise carries no claim that it is transient, and blind retrying on
+    ///   "don't know" is how a future permanent rejection turns into a doubled
+    ///   wait for every caller.
+    private static func isTransientImageFailure(_ result: ImageResult) -> Bool {
+        switch result {
+        case .sequenceGap, .storageFailed:
+            return true
+        case .displayed, .decodeFailed, .rejectedSize, .unknown:
+            return false
         }
     }
 
@@ -565,15 +671,110 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     /// `peripheralIsReady(toSendWriteWithoutResponse:)` once space frees up.
     /// Writing past that without waiting drops the excess silently at the OS
     /// layer — this is what keeps the image CHUNK loop from outrunning it.
-    private var writeWithoutResponseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var writeWithoutResponseWaiters: [WriteWithoutResponseWaiter] = []
+    /// Monotonic id per wait, so the log can pair an enter with its resume and
+    /// name the one that never came back. Introduced by the 2026-08-03
+    /// link-robustness investigation and kept: the fallback message below is
+    /// useless without a way to identify which wait tripped it.
+    private var writeWithoutResponseWaitCounter = 0
+    /// How long a wait may sit unresumed before the fallback resumes it anyway.
+    ///
+    /// Bound justification: the negotiated connection interval on this device is
+    /// 15-60 ms, and CoreBluetooth frees WWR buffer space within a connection
+    /// event or two — a normal wait resolves in well under 150 ms. Two seconds is
+    /// therefore more than an order of magnitude past any legitimate wait, so the
+    /// fallback cannot fire during healthy operation and add spurious dropped
+    /// chunks; and it is short enough that even the pathological case (every
+    /// chunk waiting the full timeout) fails the transfer inside the image
+    /// status timeout rather than parking the caller. It is also comfortably
+    /// under BLE's supervision timeout, so a genuinely dead link produces a
+    /// disconnect (which resumes all waiters) rather than a long series of
+    /// fallbacks.
+    private static let writeWithoutResponseFallbackSeconds: UInt64 = 2
 
+    /// Waits until CoreBluetooth will accept another Write Without Response.
+    ///
+    /// The whole point of this function is a lost-wakeup race that was live from
+    /// v9 (image CHUNKs over WWR) until 2026-08-03. The old shape read
+    /// `canSendWriteWithoutResponse` *outside* the lock and only then took the
+    /// lock to enqueue its continuation, while
+    /// ``peripheralIsReady(toSendWriteWithoutResponse:)`` drains the queue under
+    /// that same lock. Interleave them and the wakeup is lost outright: the
+    /// sender sees `canSend == false`, CoreBluetooth fires `peripheralIsReady`
+    /// and drains an empty queue, and only then does the sender enqueue. Nothing
+    /// will ever resume that continuation — CoreBluetooth re-fires
+    /// `peripheralIsReady` only after a further write attempt, and the only loop
+    /// that would make one is suspended awaiting this very continuation.
+    ///
+    /// The cost of losing it is out of all proportion to the width of the
+    /// window. This runs inside ``sendField``, inside ``push``/``pushImage``,
+    /// which hold the ``CommandGate`` — so a single lost wakeup wedges the gate
+    /// for the life of the connection, every later push queues behind a holder
+    /// that never returns, and the device sits frozen on its last frame until
+    /// the link drops and `CommandGate.reset()` bails everyone out.
+    ///
+    /// Two independent mitigations, because the failure mode is so expensive:
+    ///
+    /// 1. The `canSend` re-check happens *inside* the lock, atomically with the
+    ///    decision to enqueue. That closes the race as such: either we observe
+    ///    room and never enqueue, or we enqueue before any drain can miss us.
+    /// 2. A bounded fallback resumes the waiter anyway if the wakeup somehow
+    ///    still never arrives, so no future CoreBluetooth behaviour can turn a
+    ///    lost edge back into a permanently wedged gate. Worst case we write a
+    ///    chunk the OS drops, the device reports a sequence gap, and the push
+    ///    fails or (for images) retries — recoverable, unlike a hang.
     private func waitUntilReadyForWriteWithoutResponse(on target: CBPeripheral) async {
-        if target.canSendWriteWithoutResponse { return }
-        await withCheckedContinuation { continuation in
+        var waiter: WriteWithoutResponseWaiter?
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             lock.lock()
-            writeWithoutResponseWaiters.append(continuation)
+            // The re-check and the append are one critical section; this is the
+            // actual fix. `peripheralIsReady` cannot slip between them, because
+            // it takes the same lock to drain.
+            if target.canSendWriteWithoutResponse {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            writeWithoutResponseWaitCounter += 1
+            let created = WriteWithoutResponseWaiter(id: writeWithoutResponseWaitCounter,
+                                                     continuation: continuation)
+            writeWithoutResponseWaiters.append(created)
             lock.unlock()
+            waiter = created
+            armWriteWithoutResponseFallback(for: created, on: target)
         }
+
+        // Cancelling only stops the sleep; the resume-once guard inside
+        // ``WriteWithoutResponseWaiter`` is what makes the cancel/fire race safe,
+        // not this call.
+        waiter?.cancelFallback()
+    }
+
+    /// Arms the bounded fallback for one waiter. Split out so the enqueue
+    /// critical section above stays short and obviously non-suspending.
+    private func armWriteWithoutResponseFallback(for waiter: WriteWithoutResponseWaiter,
+                                                 on target: CBPeripheral) {
+        let task = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.writeWithoutResponseFallbackSeconds * 1_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.lock.lock()
+            self.writeWithoutResponseWaiters.removeAll { $0 === waiter }
+            let pendingCount = self.writeWithoutResponseWaiters.count
+            let canSend = target.canSendWriteWithoutResponse
+            self.lock.unlock()
+            // `resume()` returns false if `peripheralIsReady` or the disconnect
+            // teardown got there first, in which case there was no wedge and
+            // there is nothing to report.
+            guard waiter.resume() else { return }
+            self.log("WWR WEDGE: waiter #\(waiter.id) unresumed after "
+                + "\(Self.writeWithoutResponseFallbackSeconds)s "
+                + "(pending=\(pendingCount), canSendWriteWithoutResponse=\(canSend)) "
+                + "— peripheralIsReady never fired for it; resuming it anyway so the "
+                + "command gate cannot wedge. The chunk about to be written may be "
+                + "dropped by the OS and show up as a sequence gap.")
+        }
+        waiter.attachFallback(task)
     }
 
     /// Assets are pushed *before* `ACQUIRE` is legal, so they deliberately skip
@@ -814,7 +1015,8 @@ extension CompanionClient: CBCentralManagerDelegate {
         // Can't throw (CheckedContinuation<Void, Never>) -- waking it just lets
         // an in-flight image push's loop proceed to its next packet, which then
         // fails immediately via requireSession()/target-is-nil the same way any
-        // other post-disconnect send would.
+        // other post-disconnect send would. `resume()` is a no-op for any waiter
+        // the fallback timer already claimed.
         wwrWaiters.forEach { $0.resume() }
         failPending(with: CompanionError.disconnected)
         Task { await gate.reset() }
@@ -930,6 +1132,20 @@ extension CompanionClient: CBPeripheralDelegate {
         let waiters = writeWithoutResponseWaiters
         writeWithoutResponseWaiters = []
         lock.unlock()
+        // DIAGNOSTIC: an empty drain used to be the precondition for the
+        // lost-wakeup race — this callback landing between a sender's
+        // `canSendWriteWithoutResponse` check and its append. It is no longer
+        // dangerous (the check and the append are now one critical section, so
+        // a sender arriving late simply observes the freed buffer space and
+        // never suspends) and it is not on its own evidence of anything: it
+        // also happens benignly whenever no send is in flight at all.
+        //
+        // Verbose-only: it fires twice per push on real hardware, which is far
+        // too much for a shipping app's diagnostic tape. See
+        // ``isVerboseLoggingEnabled``.
+        if waiters.isEmpty {
+            logVerbose("WWR ready fired with no waiters queued")
+        }
         waiters.forEach { $0.resume() }
     }
 
@@ -1008,6 +1224,67 @@ final class StateLock: @unchecked Sendable {
 
     func lock() { pthread_mutex_lock(&mutex) }
     func unlock() { pthread_mutex_unlock(&mutex) }
+}
+
+/// One suspended sender waiting for CoreBluetooth to accept another Write
+/// Without Response.
+///
+/// Exists purely to make the resume exactly-once. Three parties hold a reference
+/// and each has a legitimate reason to wake this waiter:
+///
+/// - `peripheralIsReady(toSendWriteWithoutResponse:)`, the normal path;
+/// - the bounded fallback timer, if that callback never arrives;
+/// - the disconnect teardown, which resumes everything outstanding.
+///
+/// They race freely — the drain copies the array before resuming, so removal
+/// from the array is *not* a claim on the continuation — and double-resuming a
+/// `CheckedContinuation` is a hard crash, not a warning. So the continuation
+/// itself is the claim token: ``resume()`` takes it out under this object's own
+/// lock and nils it in the same critical section, and only the caller that
+/// actually took a non-nil continuation resumes it. Everyone else gets `false`
+/// and does nothing. Same trick as ``Pending``, minus the error channel
+/// (`CheckedContinuation<Void, Never>` cannot fail).
+final class WriteWithoutResponseWaiter: @unchecked Sendable {
+    let id: Int
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var fallback: Task<Void, Never>?
+    private let lock = NSLock()
+
+    init(id: Int, continuation: CheckedContinuation<Void, Never>) {
+        self.id = id
+        self.continuation = continuation
+    }
+
+    /// Attaches the fallback timer. If the waiter was already resumed in the
+    /// window between enqueue and arming — `peripheralIsReady` can fire that
+    /// fast — the timer is cancelled immediately instead of being retained.
+    func attachFallback(_ task: Task<Void, Never>) {
+        lock.lock()
+        let alreadyResumed = continuation == nil
+        if !alreadyResumed { fallback = task }
+        lock.unlock()
+        if alreadyResumed { task.cancel() }
+    }
+
+    /// - Returns: `true` if this call is the one that resumed the continuation,
+    ///   `false` if somebody else got there first.
+    @discardableResult
+    func resume() -> Bool {
+        lock.lock()
+        let taken = continuation
+        continuation = nil
+        lock.unlock()
+        taken?.resume()
+        return taken != nil
+    }
+
+    func cancelFallback() {
+        lock.lock()
+        let task = fallback
+        fallback = nil
+        lock.unlock()
+        task?.cancel()
+    }
 }
 
 /// One outstanding request/reply. Resuming twice traps in Swift, and both a
