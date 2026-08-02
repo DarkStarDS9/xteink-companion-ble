@@ -70,6 +70,34 @@ done until it lands on `companion` in the **main repo checkout**
 merge or cherry-pick onto `companion` there. Don't leave finished work stranded on a worktree
 branch; don't push a `worktree-*` branch as the deliverable.
 
+**Commit before you finish, always.** The commonest stranding here is not an unmerged branch — it
+is edits that were flashed to hardware, confirmed working, and then left uncommitted in the
+worktree. No branch-comparison tool can see those. Run `git status --porcelain` in the worktree
+before reporting a task done; if it is not empty, commit and land it.
+
+**Checking what is stranded: compare patch-ids, not SHAs.**
+
+```bash
+git cherry companion <branch>   # '+' = genuinely not on companion, '-' = already applied
+```
+
+`git log companion..<branch>` and `git rev-list --count companion..<branch>` are SHA-based, and
+landing here is normally done by cherry-pick — which rewrites the SHA, so those commands report
+every landed branch as unlanded forever. Uncommitted work needs a separate sweep:
+
+```bash
+git worktree list --porcelain | awk '/^worktree /{print substr($0,10)}' |
+    while read -r p; do [ -n "$(git -C "$p" status --porcelain)" ] && echo "dirty: $p"; done
+```
+
+A `SessionStart` hook (`.claude/hooks/prune-worktree-bridges.sh`) runs both sweeps automatically
+and reports anything holding uncommitted work or never landed. It never removes a dirty worktree.
+It and `.claude/settings.json` are deliberately **untracked** — `.gitignore`'s `.claude/*` line is
+upstream's, and negating it would be a carried patch that conflicts on every sync — so they must
+be recreated by hand in a fresh clone. Note `git worktree remove` refuses outright on a repo with
+submodules (`--force` does not override), so pruning is report-only here; stale worktrees run to
+gigabytes each and need deleting by hand.
+
 ## Docs that are upstream's, not ours
 
 `GOVERNANCE.md`, `docs/contributing/`, and `docs/translators.md` describe upstream's community
