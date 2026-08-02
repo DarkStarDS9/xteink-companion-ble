@@ -14,12 +14,13 @@ Home/reader entry path in normal operation.
 
 ## Status
 
-**v9 — the current contract.** v6 was a **clean break**: the session handshake
+**v10 — the current contract.** v6 was a **clean break**: the session handshake
 is mandatory, and a client that pushes content without a valid session is
-ignored. A v5 client will connect, push, and see nothing happen. v9 keeps that
-shape unchanged and makes one further breaking change on top of it: the image
-field's `CHUNK` gains a sequence number and is now pushed over Write Without
-Response — see "v9 changes from v8" below.
+ignored. A v5 client will connect, push, and see nothing happen. v10 keeps that
+shape unchanged and makes one further breaking change on top of it: the
+title/body fields' `CHUNK`s gain a sequence number and are now pushed over
+Write Without Response, the same treatment the image field got in v9 — see
+"v10 changes from v9" below.
 
 This document is **authoritative** and is written first on purpose: consumer
 apps are built against it while the firmware side lands. Where the firmware and
@@ -315,6 +316,7 @@ when one app on a shared link is done but the other is still using the device.
 0x87 ASSET_ACK      sessionId  assetId:1  result:1  tag[4]
 0x88 IMAGE_STATUS   sessionId  result:1
 0x89 IMAGE_CHUNK_ACK sessionId seq:2                          -- new in v9
+0x8A FIELD_SEQ_GAP  sessionId  field:1                        -- new in v10
 ```
 
 ```
@@ -351,9 +353,19 @@ correctness and a client that ignores it loses nothing but early failure
 detection. `seq` is the highest contiguous CHUNK sequence number the device
 has processed.
 
-`ASSET_ACK` and `IMAGE_STATUS` are the two things a client genuinely cannot
-work out for itself: whether the device stored the asset, and whether the
-image decoded. Everything else about rendering is deterministic from what was
+`FIELD_SEQ_GAP` is new in v10: sent when a title (`0x01`) or body (`0x02`)
+push's `CHUNK` sequence number skips ahead of what the device expected — the
+signature of a packet dropped or reordered under Write Without Response (see
+"v10 changes from v9" below). Unlike the image field there is no mid-transfer
+ack (a text push is a handful of chunks, not hundreds) and no partial-resume
+protocol — the device drops the whole field rather than render a spliced
+page, and the client's only path forward is re-pushing it from a fresh
+`START`. `field` is the field id that was dropped.
+
+`ASSET_ACK`, `IMAGE_STATUS` and `FIELD_SEQ_GAP` are the things a client
+genuinely cannot work out for itself: whether the device stored the asset,
+whether the image decoded, and whether a title/body push survived the trip
+intact. Everything else about rendering is deterministic from what was
 pushed.
 
 `IMAGE_STATUS` is **strictly a response to an image push**, never a broadcast
@@ -454,7 +466,7 @@ BLE clients can't assume a large MTU (iOS negotiates anywhere from ~185 to
 ~500 bytes; other platforms may negotiate less), so content is sent as a
 sequence of framed packets rather than one write.
 
-### Framing (v6, `CHUNK` amended in v9 for the image field)
+### Framing (v6, `CHUNK` amended in v9 for the image field and v10 for title/body)
 
 ```
 START:  byte 0      opcode = 0x01
@@ -464,12 +476,13 @@ START:  byte 0      opcode = 0x01
 
 CHUNK:  byte 0      opcode = 0x02
         byte 1      sessionId
-        bytes 2..N  payload bytes                    (every field except image)
+        bytes 2..N  payload bytes                    (content-id, UI declaration, icon, tag state)
 
 CHUNK:  byte 0      opcode = 0x02
         byte 1      sessionId
         bytes 2..3  sequence number, uint16 little-endian, starting at 0
-        bytes 4..N  payload bytes                    (image field only, v9+ — see "Image field")
+        bytes 4..N  payload bytes                    (image, title, body — v9+/v10+, see
+                                                       "Image field" and "Title/body fields")
 
 END:    byte 0      opcode = 0x03
         byte 1      sessionId
@@ -477,8 +490,8 @@ END:    byte 0      opcode = 0x03
 
 A push of one field is: one `START` declaring the field and its total byte
 length, one or more `CHUNK`s carrying the bytes in order (each sized to the
-negotiated MTU minus the CHUNK framing overhead — 2 bytes, or 4 for the image
-field), then one `END`. Fields are independent pushes over the same
+negotiated MTU minus the CHUNK framing overhead — 2 bytes, or 4 for image,
+title and body), then one `END`. Fields are independent pushes over the same
 characteristic — send one field's full START/CHUNK…/END before starting the
 next. The device does not assume an order beyond "each field is internally
 ordered".
@@ -550,28 +563,61 @@ On the client side this is a small, fully synchronous send loop — there is no
 per-chunk ack. If reliable delivery matters, use "Write" (not "Write Without
 Response") for the CHUNK packets so BLE's own link-layer ack applies.
 
-**Except the image field, where the recommendation is the opposite as of v9:
-push its CHUNKs with Write Without Response.** Measured on real hardware
-(ESP32-C3, 15ms connection interval, 2M PHY): a write-with-response round trip
-costs ~120ms regardless of connection interval — the peripheral's own handling
-is 0-1ms, so the cost is the ATT round trip itself, not anything the firmware
-does. That floors a ~200-chunk image transfer at several times the link's real
-throughput. Write Without Response has no such round trip, but drops
-CoreBluetooth/BlueZ's own delivery guarantee, which is why the image field's
-CHUNK carries the sequence number described above: a dropped or reordered
-chunk is now something the device *detects* (`IMAGE_STATUS(SEQUENCE_GAP)`)
-instead of something that silently corrupts the reassembled 2bpp payload. Keep
-`START` and `END` on Write, so the phone still gets a reliable begin/end ack.
-Every other field is unaffected — small enough that the per-chunk round trip
-this exists to avoid barely matters, and (having no sequence number) still
-depends on Write's link-layer ack for correctness.
+**Except the image, title and body fields, where the recommendation is the
+opposite: push their CHUNKs with Write Without Response.** Measured on real
+hardware (ESP32-C3, 15ms connection interval, 2M PHY): a write-with-response
+round trip costs ~120ms *regardless of connection interval* — the peripheral's
+own handling is 0-1ms, so the cost is the ATT round trip itself, not anything
+the firmware does. For the image field (v9) that floored a ~200-chunk transfer
+at several times the link's real throughput; for title/body (v10) the same
+cost, paid per chunk of a full page of text, is what made rapid-fire content
+updates (a new article every few seconds, each a full page) visibly fall
+behind — the chunk count is far smaller than an image's, but so is the budget,
+since the whole push has to land before the next one starts. Write Without
+Response has no such round trip, but drops CoreBluetooth/BlueZ's own delivery
+guarantee, which is why these fields' CHUNKs carry the sequence number
+described above: a dropped or reordered chunk is now something the device
+*detects* — `IMAGE_STATUS(SEQUENCE_GAP)` for the image field,
+`FIELD_SEQ_GAP` for title/body — instead of something that silently corrupts
+the reassembled payload. Keep `START` and `END` on Write, so the phone still
+gets a reliable begin/end ack. Every other field is unaffected — small enough
+that the per-chunk round trip this exists to avoid barely matters, and (having
+no sequence number) still depends on Write's link-layer ack for correctness.
 
 A client pushing over Write Without Response should throttle to what the OS
 buffers for un-acked WWR writes (iOS: `CBPeripheral.canSendWriteWithoutResponse`
 / `peripheralIsReady(toSendWriteWithoutResponse:)`) rather than writing in a
-tight loop — `IMAGE_CHUNK_ACK` (above) is a diagnostic on top of that, not a
-substitute for it, since it arrives only every ~32 chunks and says nothing
-about how many writes the OS will currently accept.
+tight loop. `IMAGE_CHUNK_ACK` (above) is a diagnostic on top of that for the
+image field, not a substitute for it, since it arrives only every ~32 chunks
+and says nothing about how many writes the OS will currently accept; title and
+body pushes are short enough (a handful of chunks) that no equivalent
+mid-transfer ack exists for them — `FIELD_SEQ_GAP` (or its absence) at `END`
+is the only signal.
+
+### Title/body fields (`0x01`/`0x02`) — sequence-checked CHUNKs (v10+)
+
+Plain text, up to the max text length advertised in the capability
+characteristic (bytes 3..4). No wire encoding beyond that — send UTF-8 bytes,
+the device wraps and truncates for display.
+
+**As of v10, both fields' `CHUNK`s carry the 2-byte sequence number described
+in "Framing" above**, the same treatment the image field got in v9, and for
+the same reason: pushed over Write Without Response, they need a way to
+detect a dropped or reordered packet instead of silently splicing the wrong
+bytes together. The device tracks the next expected value (reset to 0 at
+`START`, shared with whichever field is currently being reassembled — only
+one field is ever in flight at a time) and, the instant a `CHUNK` arrives out
+of sequence, marks the field corrupt and notifies `FIELD_SEQ_GAP` at `END`
+instead of handing a partial or spliced buffer to the renderer. As with the
+image field, there is no partial-resume protocol: recovering from
+`FIELD_SEQ_GAP` means re-pushing the field from a fresh `START`.
+
+Unlike the image field, title/body pushes are small enough (a handful of
+chunks for a full page, not hundreds) that no mid-transfer progress ack
+exists for them — `FIELD_SEQ_GAP`, or its absence, at `END` is the only
+signal. A client that needs to know a push landed clean before moving on
+should wait for `END`'s round trip (still Write, hence acked) and watch for
+`FIELD_SEQ_GAP` in that window.
 
 ### Content-id field (`0x03`) — opaque correlation token
 
@@ -1018,14 +1064,15 @@ string or a short opaque token. Treat 32 bytes as the contract.
 ## Capability characteristic — introspection
 
 A single read-only value clients query instead of hardcoding assumptions about
-the device. **23 bytes**, unchanged in layout since v6 — v7, v8 and v9 each
-only bumped the version number itself (byte 0), for field `0x04`'s payload
-format change, the `HELLO`/UI-declaration additions, and the image `CHUNK`
-sequence number respectively; see "v7 changes from v6", "v8 changes from v7"
-and "v9 changes from v8":
+the device. **23 bytes**, unchanged in layout since v6 — v7, v8, v9 and v10
+each only bumped the version number itself (byte 0), for field `0x04`'s
+payload format change, the `HELLO`/UI-declaration additions, the image
+`CHUNK` sequence number, and the title/body `CHUNK` sequence number
+respectively; see "v7 changes from v6", "v8 changes from v7", "v9 changes
+from v8" and "v10 changes from v9":
 
 ```
-byte 0        protocol version = 9
+byte 0        protocol version = 10
 byte 1        screen width in characters, at the font Companion Mode uses
 byte 2        screen height in characters (lines per page)
 bytes 3..4    max text field length, uint16 LE — title/body only
@@ -1049,10 +1096,10 @@ future revision. It is the one thing a client can rely on before it knows
 whether it can talk to the device at all.
 
 That makes it the graceful-degradation path across the v5 break, which is the
-whole reason to guarantee it. A v9 client should:
+whole reason to guarantee it. A v10 client should:
 
 1. Read the characteristic immediately after connecting.
-2. Check byte 0. If it is not 9, tell the user *"this reader's firmware is too
+2. Check byte 0. If it is not 10, tell the user *"this reader's firmware is too
    old for this version of <app>"* (or too new) and stop. Do not attempt the
    handshake, and do not guess at the layout — the 23-byte value shares nothing
    past byte 4 with v5's 5-byte one.
@@ -1172,6 +1219,41 @@ growth would make `peers.json` unbounded, and it is parsed into RAM.
 ---
 
 ## Version history
+
+### v10 changes from v9 — **breaking**
+
+1. **The title (`0x01`) and body (`0x02`) fields' `CHUNK`s gain a 2-byte
+   little-endian sequence number**, the same framing the image field got in
+   v9 — see "Framing" and "Title/body fields" above. Content-id, UI
+   declaration, icon and tag state are unchanged.
+2. **Title and body `CHUNK`s are now pushed over Write Without Response**
+   (recommended, not enforced at the GATT level). `START` and `END` stay
+   Write. See "Atomic multi-field pushes" above for the measurement behind
+   this and why the sequence number exists.
+3. **New device → phone notification `FIELD_SEQ_GAP` (`0x8A`)** — the device
+   detected a title/body CHUNK sequence number that skipped ahead of what it
+   expected and dropped the field rather than rendering it. See "Session
+   characteristic" and "Title/body fields" above. Unlike the image field's
+   `SEQUENCE_GAP`, there is no periodic mid-transfer ack for title/body — the
+   push is too short for one to be worth the wire traffic.
+4. **Capability byte 0 bumped from 9 to 10.** No other capability bytes moved.
+
+Why: the same root cause as v9, on a field that gets pushed far more often.
+Measured on real hardware, a write-with-response round trip on the Content
+characteristic costs ~120ms regardless of connection interval — the
+peripheral's own `onWrite` handling is 0-1ms, so the round trip itself is the
+floor. For a large image that floors a bulk transfer; for title/body it
+showed up differently — a consumer app (SpokenFeeds) pushing a full page of
+article text every few seconds started visibly falling behind, because each
+push had to clear its own several-chunk write-with-response tail before the
+next one could start, on top of the busy/idle connection-interval
+renegotiation (see `docs/companion-display-protocol.md`'s adaptive
+connection-interval notes in `src/CompanionBle.cpp`) that a short gap between
+pushes can also trigger. Write Without Response removes the per-chunk round
+trip the same way it did for images, at the same cost (BLE's own delivery
+guarantee), covered the same way (a sequence number, checked device-side).
+There is no partial-resume protocol: recovering from `FIELD_SEQ_GAP` means
+re-pushing the field from a fresh `START`.
 
 ### v9 changes from v8 — **breaking**
 
@@ -1424,6 +1506,14 @@ Images:
     `IMAGE_STATUS(DISPLAYED)`. Then push one with a deliberately skipped
     sequence number: confirm `IMAGE_STATUS(SEQUENCE_GAP)` and that the
     previous screen is retained, the same as a decode failure.
+28d. **(v10)** Push title+body over Write Without Response with correctly
+    incrementing CHUNK sequence numbers: confirm the page renders normally
+    and no `FIELD_SEQ_GAP` arrives. Then push one with a deliberately skipped
+    sequence number: confirm `FIELD_SEQ_GAP` for the affected field and that
+    the previous screen is retained rather than a spliced/corrupted page.
+    Also push a rapid sequence of short title+body updates (a few seconds
+    apart, full page each) and confirm the on-screen text keeps pace instead
+    of visibly lagging behind — the scenario that motivated this change.
 
 Icons and sleep screen:
 

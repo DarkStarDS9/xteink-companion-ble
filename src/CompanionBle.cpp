@@ -52,6 +52,13 @@ constexpr uint8_t kSessImageStatus = 0x88;
 // Response, so the phone can detect a stalled/diverged transfer well before
 // the final IMAGE_STATUS -- see kOpChunk's image branch below.
 constexpr uint8_t kSessImageChunkAck = 0x89;
+// v10: the title/body CHUNK sequence number (see kOpChunk's seq-checked
+// branch below) skipped ahead of what was expected -- a packet was lost or
+// reordered under Write Without Response. Unlike the image field there is no
+// mid-transfer ack (title/body pushes are a handful of chunks, not hundreds),
+// so this is the only signal the phone ever gets that a text push landed
+// corrupt; the device drops the field rather than displaying garbage.
+constexpr uint8_t kSessFieldSeqGap = 0x8A;
 
 // How often (in chunks) to send kSessImageChunkAck during an image push. Not
 // flow control -- iOS's own canSendWriteWithoutResponse/
@@ -404,12 +411,16 @@ bool g_activeImageOverflow = false;
 bool g_activeImageFailed = false;
 // v9+: image CHUNKs carry a 2-byte sequence number (see kOpChunk below) so a
 // dropped/reordered chunk under Write Without Response is detected instead of
-// silently corrupting the reassembled 2bpp payload. g_activeImageSeq is the
-// next expected value, reset to 0 at START; g_activeImageSeqGap latches once
-// a mismatch is seen, reported distinctly from StorageFailed at END so the
-// app can tell "the link dropped a packet" from "the SD card failed".
-uint16_t g_activeImageSeq = 0;
-bool g_activeImageSeqGap = false;
+// silently corrupting the reassembled payload. v10 extends this to the
+// title/body fields (also pushed over Write Without Response as of v10) --
+// shared rather than duplicated per field because only one field is ever
+// being reassembled at a time (see g_activeField). g_activeSeq is the next
+// expected value, reset to 0 at START (via resetReassembly()); g_activeSeqGap
+// latches once a mismatch is seen. Image reports this distinctly from
+// StorageFailed via IMAGE_STATUS; title/body report it via
+// kSessFieldSeqGap and drop the field instead of displaying garbage.
+uint16_t g_activeSeq = 0;
+bool g_activeSeqGap = false;
 // Wall-clock span of the image CHUNK sequence only -- set at START, read at
 // END -- so BLE transfer time can be told apart from decode/settle time
 // without needing a host-side script to measure it. Deliberately computed
@@ -742,10 +753,16 @@ void resetReassembly() {
   g_activeFinal = false;
   g_activeImageOverflow = false;
   g_activeImageFailed = false;
-  g_activeImageSeq = 0;
-  g_activeImageSeqGap = false;
+  g_activeSeq = 0;
+  g_activeSeqGap = false;
   g_activeBuf.reset();
 }
+
+// v10: which fields go out over Write Without Response and therefore need
+// CHUNK-level sequence-gap detection -- title/body joined the image field in
+// v10 (see docs/companion-display-protocol.md "Text fields"). Every other
+// field stays on ordinary Write, which already guarantees delivery order.
+bool fieldUsesSeqChunk(uint8_t field) { return field == kFieldImage || field == kFieldTitle || field == kFieldBody; }
 
 uint32_t fieldCap(uint8_t field) {
   switch (field) {
@@ -789,7 +806,7 @@ void computeCapabilityValue(const GfxRenderer& renderer, int fontId) {
   const uint64_t mac = ESP.getEfuseMac();
 
   size_t offset = 0;
-  g_capabilityValue[offset++] = 9;  // protocol version
+  g_capabilityValue[offset++] = 10;  // protocol version
   g_capabilityValue[offset++] = static_cast<uint8_t>(screenWidthChars > 255 ? 255 : screenWidthChars);
   g_capabilityValue[offset++] = static_cast<uint8_t>(screenHeightChars > 255 ? 255 : screenHeightChars);
   g_capabilityValue[offset++] = static_cast<uint8_t>(kMaxFieldLen & 0xFF);
@@ -1108,7 +1125,7 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           // of when the write arrived, not what this task did with it.
           const uint32_t chunkEntryMs = millis();
           recordChunkGap(chunkEntryMs);
-          if (g_activeImageOverflow || g_activeImageFailed || g_activeImageSeqGap) return;
+          if (g_activeImageOverflow || g_activeImageFailed || g_activeSeqGap) return;
           // v9: image CHUNKs carry a 2-byte little-endian sequence number
           // right after sessionId -- byte 0 opcode, byte 1 sessionId, bytes
           // 2-3 seq, bytes 4..N payload. Every other field's CHUNK is
@@ -1120,16 +1137,16 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           // silently corrupt the raw 2bpp payload instead of failing loudly.
           if (len < 4) {
             LOG_ERR("CBLE", "image CHUNK too short for seq header (%u bytes)", static_cast<unsigned>(len));
-            g_activeImageSeqGap = true;
+            g_activeSeqGap = true;
             enqueueImageAbort();
             return;
           }
           uint16_t seq;
           memcpy(&seq, data + 2, sizeof(seq));  // data may be unaligned
-          if (seq != g_activeImageSeq) {
-            LOG_ERR("CBLE", "image CHUNK sequence gap: expected %u got %u", static_cast<unsigned>(g_activeImageSeq),
+          if (seq != g_activeSeq) {
+            LOG_ERR("CBLE", "image CHUNK sequence gap: expected %u got %u", static_cast<unsigned>(g_activeSeq),
                     static_cast<unsigned>(seq));
-            g_activeImageSeqGap = true;
+            g_activeSeqGap = true;
             enqueueImageAbort();
             return;
           }
@@ -1165,15 +1182,54 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           // comment) -- nothing else does, so a few bytes of skew in the rare
           // failure case is harmless.
           g_activeWritten += imgPayloadLen;
-          ++g_activeImageSeq;
-          if (g_activeImageSeq % kImageChunkAckInterval == 0) {
-            const uint16_t ackedSeq = g_activeImageSeq - 1;
+          ++g_activeSeq;
+          if (g_activeSeq % kImageChunkAckInterval == 0) {
+            const uint16_t ackedSeq = g_activeSeq - 1;
             const uint8_t ack[4] = {kSessImageChunkAck, g_activeSession, static_cast<uint8_t>(ackedSeq & 0xFF),
                                      static_cast<uint8_t>((ackedSeq >> 8) & 0xFF)};
             notifySession(ack, sizeof(ack));
           }
           recordChunkBusy(chunkEntryMs);
           return;
+        }
+
+        if (fieldUsesSeqChunk(g_activeField)) {
+          // v10: title/body CHUNKs carry the same 2-byte little-endian
+          // sequence number as the image field (see the kFieldImage branch
+          // above) -- title/body moved to Write Without Response in v10 too
+          // (docs/companion-display-protocol.md "Text fields"), for the same
+          // reason: a ~120ms write-with-response round trip per CHUNK, paid
+          // regardless of connection interval, dominated a full-page text
+          // push. Unlike the image field there is no mid-transfer ack -- a
+          // text push is a handful of chunks, not hundreds -- so a gap is
+          // simply latched here and the whole field is dropped at END rather
+          // than risk displaying a spliced, corrupted page.
+          if (g_activeSeqGap) return;
+          if (len < 4) {
+            LOG_ERR("CBLE", "field 0x%02x CHUNK too short for seq header (%u bytes)", g_activeField,
+                    static_cast<unsigned>(len));
+            g_activeSeqGap = true;
+            return;
+          }
+          uint16_t seq;
+          memcpy(&seq, data + 2, sizeof(seq));  // data may be unaligned
+          if (seq != g_activeSeq) {
+            LOG_ERR("CBLE", "field 0x%02x CHUNK sequence gap: expected %u got %u", g_activeField,
+                    static_cast<unsigned>(g_activeSeq), static_cast<unsigned>(seq));
+            g_activeSeqGap = true;
+            return;
+          }
+          ++g_activeSeq;
+          if (!g_activeBuf) return;
+          const uint8_t* fieldPayload = data + 4;
+          const size_t fieldPayloadLen = len - 4;
+          const size_t remaining = g_activeTotalLen - g_activeWritten;
+          const size_t toCopy = fieldPayloadLen < remaining ? fieldPayloadLen : remaining;
+          if (toCopy > 0) {
+            memcpy(g_activeBuf.get() + g_activeWritten, fieldPayload, toCopy);
+            g_activeWritten += toCopy;
+          }
+          break;
         }
 
         if (!g_activeBuf) return;
@@ -1208,7 +1264,7 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
             logLastConnParams();
             if (g_activeImageOverflow) {
               notifyImageStatus(ImageResult::RejectedSize);
-            } else if (g_activeImageSeqGap) {
+            } else if (g_activeSeqGap) {
               // Distinct from StorageFailed: the SD path never ran into
               // trouble here, a CHUNK's sequence number skipped ahead of
               // what was expected -- the signature of a dropped Write
@@ -1245,6 +1301,24 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           case kFieldContentId:
             session->contentIdLen = static_cast<uint8_t>(g_activeWritten);
             memcpy(session->contentId, g_activeBuf.get(), session->contentIdLen);
+            if (g_contentCb) g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal);
+            break;
+
+          case kFieldTitle:
+          case kFieldBody:
+            // v10: pushed over Write Without Response -- see the seq-checked
+            // CHUNK branch above. A gap here means part of this field never
+            // arrived or arrived out of order; the partially-filled buffer is
+            // not a valid page, so the field is dropped rather than handed to
+            // the renderer. The phone finds out via kSessFieldSeqGap instead
+            // of silence, unlike a pre-v10 write failure (which could not
+            // happen at all under Write With Response).
+            if (g_activeSeqGap) {
+              LOG_ERR("CBLE", "field 0x%02x dropped: CHUNK sequence gap under Write Without Response", field);
+              const uint8_t payload[3] = {kSessFieldSeqGap, sessionId, field};
+              notifySession(payload, sizeof(payload));
+              break;
+            }
             if (g_contentCb) g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal);
             break;
 

@@ -9,16 +9,17 @@ import Foundation
 ///
 /// ```
 /// START:  0x01 | field|final | sessionId | length uint32 LE      (7 bytes)
-/// CHUNK:  0x02 | sessionId   | payload...                          (other fields)
-/// CHUNK:  0x02 | sessionId   | seq uint16 LE | payload...           (field 0x04, image, v9+)
+/// CHUNK:  0x02 | sessionId   | payload...                          (content-id, UI decl, icon, tag state)
+/// CHUNK:  0x02 | sessionId   | seq uint16 LE | payload...           (image v9+, title/body v10+)
 /// END:    0x03 | sessionId
 /// ```
 ///
-/// The image field's CHUNK carries an extra 2-byte sequence number because it
-/// is the one field pushed over Write Without Response (see
-/// `docs/companion-display-protocol.md` "Image field") — without a sequence
-/// number a dropped chunk would shift every byte after it and silently
-/// corrupt the reassembled raw 2bpp payload instead of failing loudly.
+/// The image, title and body fields' CHUNKs carry an extra 2-byte sequence
+/// number because they are pushed over Write Without Response (see
+/// `docs/companion-display-protocol.md` "Image field" and "Title/body
+/// fields") — without a sequence number a dropped chunk would shift every
+/// byte after it and silently corrupt the reassembled payload instead of
+/// failing loudly.
 public struct ContentFramer: Sequence {
     public let field: CompanionField
     public let sessionId: UInt8
@@ -31,9 +32,10 @@ public struct ContentFramer: Sequence {
     /// framing overhead — see ``ContentFramer/chunkPayloadSize(forATTPayload:field:)``.
     public let maxChunkPayload: Int
 
-    /// `true` for ``CompanionField/image`` — every other field's CHUNK is
+    /// `true` for ``CompanionField/image`` (v9+) and ``CompanionField/title``/
+    /// ``CompanionField/body`` (v10+) — every other field's CHUNK is
     /// unchanged from pre-v9.
-    var includesSequenceNumber: Bool { field == .image }
+    var includesSequenceNumber: Bool { field == .image || field == .title || field == .body }
 
     public init(field: CompanionField,
                 sessionId: UInt8,
@@ -49,16 +51,18 @@ public struct ContentFramer: Sequence {
     }
 
     /// Usable CHUNK payload for a given ATT payload size (`maximumWriteValueLength`
-    /// on iOS, which already excludes the 3-byte ATT header) and field — the
-    /// image field's CHUNK carries 2 extra bytes of sequence number.
+    /// on iOS, which already excludes the 3-byte ATT header) and field —
+    /// image/title/body CHUNKs carry 2 extra bytes of sequence number.
     public static func chunkPayloadSize(forATTPayload attPayload: Int, field: CompanionField) -> Int {
-        Swift.max(1, attPayload - (field == .image ? 4 : 2))
+        let hasSeq = field == .image || field == .title || field == .body
+        return Swift.max(1, attPayload - (hasSeq ? 4 : 2))
     }
 
-    /// Deprecated: assumes non-image framing overhead (2 bytes). Prefer
-    /// ``chunkPayloadSize(forATTPayload:field:)``.
+    /// Deprecated: assumes the 2-byte non-sequenced framing overhead (true of
+    /// content-id, UI declaration, icon and tag state; no longer true of
+    /// title/body as of v10). Prefer ``chunkPayloadSize(forATTPayload:field:)``.
     public static func chunkPayloadSize(forATTPayload attPayload: Int) -> Int {
-        chunkPayloadSize(forATTPayload: attPayload, field: .title)
+        chunkPayloadSize(forATTPayload: attPayload, field: .contentId)
     }
 
     /// Number of packets this framer will emit, START and END included.

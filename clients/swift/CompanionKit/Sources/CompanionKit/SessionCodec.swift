@@ -14,6 +14,11 @@ public enum SessionMessage: Equatable, Sendable {
     /// ``SessionNotification/imageChunkAck``. `seq` is the highest
     /// contiguous CHUNK sequence number the device has processed.
     case imageChunkAck(sessionId: UInt8, seq: UInt16)
+    /// v10: a title/body push's CHUNK sequence number skipped ahead of what
+    /// the device expected — see ``SessionNotification/fieldSeqGap``. The
+    /// field named by `field` was dropped; recovering means re-pushing it
+    /// from a fresh START.
+    case fieldSeqGap(sessionId: UInt8, field: UInt8)
 }
 
 /// Encoders and decoders for the Session characteristic. Pure functions over
@@ -127,6 +132,10 @@ public enum SessionCodec {
         case .imageChunkAck:
             guard let sessionId = data.byte(1), let seq = data.uint16LE(at: 2) else { return nil }
             return .imageChunkAck(sessionId: sessionId, seq: seq)
+
+        case .fieldSeqGap:
+            guard let sessionId = data.byte(1), let field = data.byte(2) else { return nil }
+            return .fieldSeqGap(sessionId: sessionId, field: field)
         }
     }
 

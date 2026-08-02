@@ -61,6 +61,11 @@ public enum CompanionEvent: Sendable {
     /// chunks — see ``SessionNotification/imageChunkAck``. Diagnostic only;
     /// `pushImage` still resolves from the final `imageStatus`.
     case imageChunkAck(seq: UInt16)
+    /// v10: a title/body push's CHUNK sequence number skipped ahead of what
+    /// the device expected, under Write Without Response — see
+    /// ``SessionNotification/fieldSeqGap``. The device already dropped the
+    /// field; a caller that wants it on screen has to re-push it.
+    case fieldSeqGap(field: CompanionField)
     case disconnected(reason: String?)
     case failure(CompanionError)
 }
@@ -518,19 +523,23 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         lock.unlock()
         guard let characteristic, let target else { throw CompanionError.notConnected }
 
-        // The image field's bulk CHUNKs go out over Write Without Response —
-        // see docs/companion-display-protocol.md "Image field" (v9). A
-        // write-with-response round trip costs ~120ms regardless of the
-        // negotiated connection interval (measured on real hardware, see
-        // companion-bench), which floors a ~200-chunk image transfer at
-        // several times the link's real throughput. WWR has no such round
-        // trip, but drops CoreBluetooth's own delivery guarantee, which is
-        // why the image CHUNK format carries a sequence number (device-side
-        // gap detection) and the device sends a periodic ack (early failure
-        // detection) — see ``SessionMessage/imageChunkAck``. START and END
-        // stay Write, so the phone still gets a reliable begin/end ack; every
-        // other field is untouched (Write throughout, same as pre-v9).
-        let chunkWriteType: CBCharacteristicWriteType = field == .image ? .withoutResponse : .withResponse
+        // The image field's bulk CHUNKs go out over Write Without Response as
+        // of v9, joined by title/body in v10 — see
+        // docs/companion-display-protocol.md "Image field" and "Title/body
+        // fields". A write-with-response round trip costs ~120ms regardless
+        // of the negotiated connection interval (measured on real hardware,
+        // see companion-bench), which floors a bulk image transfer and, for
+        // title/body, made a rapid sequence of full-page pushes visibly fall
+        // behind the content driving them. WWR has no such round trip, but
+        // drops CoreBluetooth's own delivery guarantee, which is why these
+        // fields' CHUNK format carries a sequence number (device-side gap
+        // detection) — image additionally gets a periodic ack (see
+        // ``SessionMessage/imageChunkAck``); title/body are short enough that
+        // ``SessionMessage/fieldSeqGap`` at END is the only signal. START and
+        // END stay Write, so the phone still gets a reliable begin/end ack;
+        // every other field is untouched (Write throughout, same as pre-v9).
+        let chunkWriteType: CBCharacteristicWriteType =
+            (field == .image || field == .title || field == .body) ? .withoutResponse : .withResponse
         let attPayload = target.maximumWriteValueLength(for: chunkWriteType)
         let framer = ContentFramer(field: field,
                                    sessionId: sessionId,
@@ -742,6 +751,12 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         case let .imageChunkAck(session, seq):
             guard session == currentSession else { return }
             emit(.imageChunkAck(seq: seq))
+
+        case let .fieldSeqGap(session, fieldByte):
+            guard session == currentSession else { return }
+            guard let field = CompanionField(rawValue: fieldByte) else { return }
+            log("field 0x\(String(format: "%02x", fieldByte)) dropped: CHUNK sequence gap")
+            emit(.fieldSeqGap(field: field))
         }
     }
 }

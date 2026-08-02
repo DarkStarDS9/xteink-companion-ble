@@ -147,6 +147,14 @@ final class SessionCodecTests: XCTestCase {
                        .imageStatus(sessionId: 1, result: .decodeFailed))
     }
 
+    func testDecodeFieldSeqGap() {
+        // v10: sent when a title/body CHUNK sequence number skips ahead of
+        // what the device expected — see "Title/body fields" in
+        // docs/companion-display-protocol.md.
+        XCTAssertEqual(SessionCodec.decode(Data([0x8A, 0x01, 0x02])),
+                       .fieldSeqGap(sessionId: 1, field: 0x02))
+    }
+
     func testUnknownReasonCodesDecodeAsUnknownRatherThanFailing() {
         // A newer device may add a reason. Losing the detail is fine; dropping
         // the whole message would strand the handshake.

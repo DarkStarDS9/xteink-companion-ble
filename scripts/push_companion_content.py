@@ -61,7 +61,11 @@ SESS_HELLO, SESS_BYE, SESS_ACQUIRE, SESS_RELEASE = 0x01, 0x02, 0x03, 0x04
     SESS_ASSET_ACK,
     SESS_IMAGE_STATUS,
     SESS_IMAGE_CHUNK_ACK,
-) = (0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89)
+    SESS_FIELD_SEQ_GAP,
+) = (0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A)
+
+# v9: image; v10: title/body too — see push_field()'s has_seq.
+SEQ_CHUNK_FIELDS = (FIELD_IMAGE, FIELD_TITLE, FIELD_BODY)
 
 DENIED_REASONS = {
     0x00: "user rejected",
@@ -283,6 +287,13 @@ class Session:
             # awaits it.
             seq = struct.unpack_from("<H", data, 2)[0]
             print(f"  chunk ack: seq={seq}")
+        elif opcode == SESS_FIELD_SEQ_GAP:
+            # v10: a title/body CHUNK sequence number skipped ahead of what
+            # the device expected -- the field was dropped, not rendered.
+            # push_field() has no future to resolve for content fields (only
+            # push_asset/push_image await a device-side result), so this is
+            # print-only, same as SESS_IMAGE_CHUNK_ACK.
+            print(f"  FIELD_SEQ_GAP: field {data[2]:#04x} dropped (CHUNK sequence gap)")
 
     def _resolve(self, attr: str, value) -> None:
         future = getattr(self, attr, None)
@@ -335,20 +346,26 @@ class Session:
 
         # v9: the image field's CHUNK carries a 2-byte little-endian sequence
         # number right after sessionId (see "Image field" in
-        # docs/companion-display-protocol.md) -- every other field's CHUNK is
-        # unchanged. This script still writes with response (bleak has no
-        # cross-platform equivalent of CoreBluetooth's
-        # canSendWriteWithoutResponse flow control), so the seq number is
-        # belt-and-suspenders here rather than load-bearing -- but the device
-        # requires it unconditionally for field 0x04, regardless of which ATT
-        # write type carried it.
-        is_image = field == FIELD_IMAGE
-        chunk_payload = max(1, self.chunk_payload - 2) if is_image else self.chunk_payload
+        # docs/companion-display-protocol.md); v10 adds title/body to that set
+        # (see "Title/body fields") -- every other field's CHUNK is unchanged.
+        # This script still writes with response (bleak has no cross-platform
+        # equivalent of CoreBluetooth's canSendWriteWithoutResponse flow
+        # control), so the seq number is belt-and-suspenders here rather than
+        # load-bearing -- but the device requires it unconditionally for these
+        # fields, regardless of which ATT write type carried it. Sending it to
+        # a pre-v10 device would instead be silently corrupting: those two
+        # bytes would land as the first two bytes of the title/body payload,
+        # which is why title/body are gated on caps["version"] the same way
+        # push_image() already gates the image field.
+        has_seq = field in SEQ_CHUNK_FIELDS
+        if field in (FIELD_TITLE, FIELD_BODY) and self.caps["version"] < 10:
+            raise SystemExit(f"Device speaks protocol v{self.caps['version']}, title/body push needs v10+.")
+        chunk_payload = max(1, self.chunk_payload - 2) if has_seq else self.chunk_payload
         total = max(1, (len(data) + chunk_payload - 1) // chunk_payload)
         for index, offset in enumerate(range(0, len(data), chunk_payload)):
             chunk = data[offset : offset + chunk_payload]
             header = bytes([OP_CHUNK, self.session_id])
-            if is_image:
+            if has_seq:
                 header += struct.pack("<H", index)
             await self.client.write_gatt_char(CONTENT_CHAR_UUID, header + chunk, response=True)
             if progress and (index % 25 == 0 or index == total - 1):

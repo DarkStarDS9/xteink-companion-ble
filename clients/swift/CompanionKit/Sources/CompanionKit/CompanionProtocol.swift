@@ -13,7 +13,7 @@ public enum CompanionProtocol {
     /// on an older number than a connected device's firmware is just as broken
     /// as the reverse, and looks confusingly like the *device* needs an update
     /// when it's actually this package that's behind.
-    public static let version: UInt8 = 9
+    public static let version: UInt8 = 10
 
     public static let serviceUUID = "7C9C0000-3E4A-4B1A-9C1E-6D8A1F2B0001"
     public static let contentCharacteristicUUID = "7C9C0001-3E4A-4B1A-9C1E-6D8A1F2B0001"
@@ -76,6 +76,11 @@ enum SessionNotification: UInt8 {
     /// transfer early. Not flow control (CoreBluetooth's own
     /// `canSendWriteWithoutResponse` already handles that).
     case imageChunkAck = 0x89
+    /// v10: sent when a title/body push's CHUNK sequence number skipped ahead
+    /// of what the device expected — the field was dropped rather than
+    /// rendered corrupt. See ``CompanionField/title``/``CompanionField/body``
+    /// and `docs/companion-display-protocol.md` "Title/body fields".
+    case fieldSeqGap = 0x8A
 }
 
 public enum HelloDeniedReason: UInt8, Sendable {
