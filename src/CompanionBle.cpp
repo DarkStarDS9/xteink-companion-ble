@@ -9,6 +9,7 @@
 #include <freertos/queue.h>
 #include <freertos/task.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -394,6 +395,86 @@ bool g_activeImageFailed = false;
 // here on the host task rather than in the writer task, so a slow flush/close
 // or a backlog of still-queued CHUNKs never inflates this number.
 uint32_t g_imageTransferStartMs = 0;
+
+// Temporary instrumentation: per-CHUNK timing taken directly in
+// ContentCharCallbacks::onWrite() (host task), to tell apart "peripheral is
+// slow to return from onWrite" (our bug -- e.g. blocking on a full write
+// queue) from "the link only delivers one write per N connection events"
+// (central scheduling, nothing this task can fix). gap = wall-clock between
+// one CHUNK's onWrite() entry and the next's, dominated by the ATT
+// write-with-response round trip if onWrite itself is fast. busy = time
+// onWrite() itself takes to return for a successful CHUNK -- normally just
+// enqueueImageWork()'s memcpy onto the queue, occasionally its brief
+// full-queue wait (see kImageEnqueueTimeoutTicks). Reset at START, dumped as
+// a histogram at END alongside the writer-task counters above.
+// TODO remove once the real bottleneck is identified.
+uint32_t g_chunkGapLastEntryMs = 0;
+uint32_t g_chunkGapMinMs = UINT32_MAX;
+uint32_t g_chunkGapMaxMs = 0;
+uint32_t g_chunkGapSumMs = 0;
+uint32_t g_chunkGapCount = 0;
+uint32_t g_chunkBusyMaxMs = 0;
+uint32_t g_chunkBusySumMs = 0;
+uint32_t g_chunkBusyCount = 0;
+// Bucket upper bounds in ms; last bucket catches everything >= 100ms.
+constexpr uint32_t kChunkGapBucketBoundsMs[7] = {5, 10, 15, 20, 30, 50, 100};
+uint32_t g_chunkGapHistogram[8] = {0};
+
+void resetChunkTiming() {
+  g_chunkGapLastEntryMs = 0;
+  g_chunkGapMinMs = UINT32_MAX;
+  g_chunkGapMaxMs = 0;
+  g_chunkGapSumMs = 0;
+  g_chunkGapCount = 0;
+  g_chunkBusyMaxMs = 0;
+  g_chunkBusySumMs = 0;
+  g_chunkBusyCount = 0;
+  memset(g_chunkGapHistogram, 0, sizeof(g_chunkGapHistogram));
+}
+
+void recordChunkGap(uint32_t entryMs) {
+  if (g_chunkGapLastEntryMs != 0) {
+    const uint32_t gapMs = entryMs - g_chunkGapLastEntryMs;
+    g_chunkGapSumMs += gapMs;
+    ++g_chunkGapCount;
+    if (gapMs < g_chunkGapMinMs) g_chunkGapMinMs = gapMs;
+    if (gapMs > g_chunkGapMaxMs) g_chunkGapMaxMs = gapMs;
+    size_t bucket = 7;
+    for (size_t i = 0; i < 7; ++i) {
+      if (gapMs < kChunkGapBucketBoundsMs[i]) {
+        bucket = i;
+        break;
+      }
+    }
+    ++g_chunkGapHistogram[bucket];
+  }
+  g_chunkGapLastEntryMs = entryMs;
+}
+
+void recordChunkBusy(uint32_t entryMs) {
+  const uint32_t busyMs = millis() - entryMs;
+  g_chunkBusySumMs += busyMs;
+  ++g_chunkBusyCount;
+  if (busyMs > g_chunkBusyMaxMs) g_chunkBusyMaxMs = busyMs;
+}
+
+void logChunkTiming() {
+  if (g_chunkGapCount > 0) {
+    LOG_DBG("CBLE",
+            "chunk gap: min=%ums max=%ums avg=%ums (n=%u) buckets"
+            " <5/<10/<15/<20/<30/<50/<100/>=100ms = %u/%u/%u/%u/%u/%u/%u/%u",
+            static_cast<unsigned>(g_chunkGapMinMs), static_cast<unsigned>(g_chunkGapMaxMs),
+            static_cast<unsigned>(g_chunkGapSumMs / g_chunkGapCount), static_cast<unsigned>(g_chunkGapCount),
+            static_cast<unsigned>(g_chunkGapHistogram[0]), static_cast<unsigned>(g_chunkGapHistogram[1]),
+            static_cast<unsigned>(g_chunkGapHistogram[2]), static_cast<unsigned>(g_chunkGapHistogram[3]),
+            static_cast<unsigned>(g_chunkGapHistogram[4]), static_cast<unsigned>(g_chunkGapHistogram[5]),
+            static_cast<unsigned>(g_chunkGapHistogram[6]), static_cast<unsigned>(g_chunkGapHistogram[7]));
+  }
+  if (g_chunkBusyCount > 0) {
+    LOG_DBG("CBLE", "chunk onWrite busy: max=%ums avg=%ums (n=%u)", static_cast<unsigned>(g_chunkBusyMaxMs),
+            static_cast<unsigned>(g_chunkBusySumMs / g_chunkBusyCount), static_cast<unsigned>(g_chunkBusyCount));
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Image write-behind task
@@ -862,6 +943,33 @@ class SessionCharCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
+const char* phyName(uint8_t phy) {
+  switch (phy) {
+    case BLE_GAP_LE_PHY_1M: return "1M";
+    case BLE_GAP_LE_PHY_2M: return "2M";
+    case BLE_GAP_LE_PHY_CODED: return "CODED";
+    default: return "?";
+  }
+}
+
+// Last conn params/PHY this session saw, from ServerCallbacks::
+// onConnParamsUpdate()/onPhyUpdate() below -- negotiation is bimodal on this
+// hardware (15ms/2M vs 30ms/1M with a much shorter supervision timeout), so
+// echoing what was actually granted next to the per-image throughput/
+// histogram log lets a run be attributed to link scheduling without
+// cross-referencing timestamps against the connect-time log line.
+float g_lastConnIntervalMs = 0;
+uint16_t g_lastConnLatency = 0;
+uint16_t g_lastConnTimeoutMs = 0;
+const char* g_lastPhyTx = "?";
+const char* g_lastPhyRx = "?";
+
+void logLastConnParams() {
+  LOG_DBG("CBLE", "conn params at end of transfer: interval=%.2fms latency=%u timeout=%ums phy=%s/%s",
+          g_lastConnIntervalMs, static_cast<unsigned>(g_lastConnLatency), static_cast<unsigned>(g_lastConnTimeoutMs),
+          g_lastPhyTx, g_lastPhyRx);
+}
+
 // ---------------------------------------------------------------------------
 // Content characteristic
 // ---------------------------------------------------------------------------
@@ -951,6 +1059,7 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           g_activeImageOverflow = totalLen > cap;
           g_activeTotalLen = totalLen;
           g_imageTransferStartMs = millis();
+          resetChunkTiming();
           if (!g_activeImageOverflow) beginImageStaging(*session);
           return;
         }
@@ -970,6 +1079,12 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
         const size_t payloadLen = len - 2;
 
         if (g_activeField == kFieldImage) {
+          // Gap is recorded on every CHUNK entry, even ones that bail out
+          // below, so an overflow/failed transfer's tail doesn't silently
+          // vanish from the histogram -- the gap itself is purely a function
+          // of when the write arrived, not what this task did with it.
+          const uint32_t chunkEntryMs = millis();
+          recordChunkGap(chunkEntryMs);
           if (g_activeImageOverflow || g_activeImageFailed) return;
           if (payloadLen > kMaxImageChunkPayload) {
             // Cannot happen at the negotiated MTU (185, see ensureStarted()) --
@@ -1001,6 +1116,7 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           // comment) -- nothing else does, so a few bytes of skew in the rare
           // failure case is harmless.
           g_activeWritten += payloadLen;
+          recordChunkBusy(chunkEntryMs);
           return;
         }
 
@@ -1032,6 +1148,8 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
                       static_cast<unsigned>(g_activeWritten), static_cast<unsigned>(transferMs),
                       static_cast<unsigned>(g_activeWritten * 1000UL / transferMs));
             }
+            logChunkTiming();
+            logLastConnParams();
             if (g_activeImageOverflow) {
               notifyImageStatus(ImageResult::RejectedSize);
             } else if (g_activeImageFailed) {
@@ -1131,20 +1249,16 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // Confirms what the central actually granted -- requestConnParams() above
     // only logs what was asked for; a peripheral request can be silently
     // ignored, leaving the previous interval in place.
-    LOG_DBG("CBLE", "conn params granted: interval=%.2fms latency=%u timeout=%ums",
-            connInfo.getConnInterval() * 1.25f, static_cast<unsigned>(connInfo.getConnLatency()),
-            static_cast<unsigned>(connInfo.getConnTimeout() * 10));
+    g_lastConnIntervalMs = connInfo.getConnInterval() * 1.25f;
+    g_lastConnLatency = connInfo.getConnLatency();
+    g_lastConnTimeoutMs = connInfo.getConnTimeout() * 10;
+    LOG_DBG("CBLE", "conn params granted: interval=%.2fms latency=%u timeout=%ums", g_lastConnIntervalMs,
+            static_cast<unsigned>(g_lastConnLatency), static_cast<unsigned>(g_lastConnTimeoutMs));
   }
   void onPhyUpdate(NimBLEConnInfo& /*connInfo*/, uint8_t txPhy, uint8_t rxPhy) override {
-    auto phyName = [](uint8_t phy) {
-      switch (phy) {
-        case BLE_GAP_LE_PHY_1M: return "1M";
-        case BLE_GAP_LE_PHY_2M: return "2M";
-        case BLE_GAP_LE_PHY_CODED: return "CODED";
-        default: return "?";
-      }
-    };
-    LOG_DBG("CBLE", "PHY update: tx=%s rx=%s", phyName(txPhy), phyName(rxPhy));
+    g_lastPhyTx = phyName(txPhy);
+    g_lastPhyRx = phyName(rxPhy);
+    LOG_DBG("CBLE", "PHY update: tx=%s rx=%s", g_lastPhyTx, g_lastPhyRx);
   }
   void onDisconnect(NimBLEServer* server, NimBLEConnInfo& /*connInfo*/, int /*reason*/) override {
     LOG_DBG("CBLE", "central disconnected");
