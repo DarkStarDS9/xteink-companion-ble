@@ -246,6 +246,19 @@ enum class RenderResult : uint8_t {
   // CompanionModeActivity.cpp's g_pendingBatchPoisoned and
   // docs/companion-display-protocol.md's "Atomic multi-field pushes".
   SequenceGap = 0x04,
+  // v11: a second push arrived before this one reached the panel and took the
+  // screen instead, so the superseded push will never render. A content push
+  // sets Screen::Text and an image push sets Screen::Image, so whichever lands
+  // second decides what render() actually draws -- the first one's render
+  // simply never happens.
+  //
+  // Reported rather than silently dropped because the device owes exactly one
+  // answer per push. Without it, a caller awaiting the superseded push (see
+  // CompanionClient's push(..., awaitRender:)) sits out its entire timeout
+  // waiting for a render the device already knows will never occur. Distinct
+  // from every other case here in that nothing actually went wrong: the push
+  // was merely overtaken, and a caller may well not want to retry it.
+  Superseded = 0x05,
 };
 
 // Why a session lost the screen, reported as BACKGROUND.

@@ -804,7 +804,9 @@ void CompanionModeActivity::handlePendingImage(const std::string& stagedPath, co
   // state that makes render() take the Screen::Image branch, so the render
   // task can never observe one without the other. Unconditional: a previous
   // push that never got its answer (link dropped mid-settle) must not stop
-  // this one from being answered.
+  // this one from being answered — but it does get told it lost the screen
+  // first, rather than being silently overwritten.
+  supersedePendingRenderStatus();
   renderAwaitingStatus = true;
   renderAwaitingField = companionble::kFieldImage;
   displayedImagePath = path;
@@ -1244,7 +1246,10 @@ void CompanionModeActivity::loop() {
     // alongside the state that makes render() take the Screen::Text branch, so
     // the render task can never observe the flag without the content it names.
     // Consumed exactly once, from render()'s Screen::Text case, once the panel
-    // actually shows this batch -- see notifyRenderPushResult().
+    // actually shows this batch -- see notifyRenderPushResult(). Any push still
+    // awaiting an answer here is told it was superseded before this one arms,
+    // rather than being silently overwritten.
+    supersedePendingRenderStatus();
     renderAwaitingStatus = true;
     renderAwaitingField = companionble::kFieldBody;
     if (gotTitle) {
@@ -1822,6 +1827,36 @@ void CompanionModeActivity::notifyRenderPushResult(companionble::RenderResult re
   if (!renderAwaitingStatus) return;
   renderAwaitingStatus = false;
   companionble::notifyRenderStatus(result, renderAwaitingField);
+}
+
+// Both arm sites (handlePendingImage() and loop()'s content-commit block) set
+// renderAwaitingField unconditionally, and each also sets `screen` — so the
+// push that lands second decides which branch render() takes, and the first
+// one's render never happens at all. The expectation it armed was previously
+// just overwritten, leaving its caller to wait out the full client-side
+// timeout for an answer the device already knew would never come.
+//
+// How narrow is this? Narrower than it first looks, and NOT reproduced on
+// hardware. push(awaitRender: false) releases the client's command gate when
+// the wire transfer finishes (~0.24s measured) while the render it triggered
+// still has ~1.7s to run, so an app can start an image push mid-render. But
+// handlePendingImage() takes RenderLock, so it blocks until that render
+// completes and the superseded push gets its honest Displayed after all --
+// confirmed on hardware 2026-08-03 (text push then an image 0.3s later
+// answered Displayed, not Superseded).
+//
+// What is left is the sliver where the image's staging finishes and
+// handlePendingImage() wins RenderLock *before* the render task has taken it
+// for the text render queued a moment earlier. Both run from loop(), so this
+// needs the render task not to have been scheduled in between -- rare, timing
+// dependent, and not something a test can reliably provoke.
+//
+// Kept anyway: the cost is one no-op call on the common path, and the failure
+// it prevents is a caller hanging for its entire timeout on an answer the
+// device already knows will never come. Cheap insurance against a real hole,
+// not a fix for an observed bug -- do not let this comment imply otherwise.
+void CompanionModeActivity::supersedePendingRenderStatus() {
+  notifyRenderPushResult(companionble::RenderResult::Superseded);
 }
 
 void CompanionModeActivity::renderImage() {

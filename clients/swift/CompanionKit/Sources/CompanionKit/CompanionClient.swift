@@ -504,6 +504,11 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     ///   a complete transfer that the device could not make sense of will not
     ///   make more sense on a second reading. (A *truncated* transfer is not
     ///   this case — the device reports that as a sequence gap.)
+    /// - ``RenderResult/superseded``: **no**, and emphatically so. Something
+    ///   newer already took the screen, so a retry would re-push content the app
+    ///   itself has moved past — and, worse, would race whatever superseded it,
+    ///   potentially putting stale content back on the panel. This is the one
+    ///   case here that is not a failure at all.
     /// - ``RenderResult/unknown``: **no.** A result byte this package does not
     ///   recognise carries no claim that it is transient, and blind retrying on
     ///   "don't know" is how a future permanent rejection turns into a doubled
@@ -512,7 +517,7 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         switch result {
         case .sequenceGap, .storageFailed:
             return true
-        case .displayed, .decodeFailed, .rejectedSize, .unknown:
+        case .displayed, .decodeFailed, .rejectedSize, .superseded, .unknown:
             return false
         }
     }

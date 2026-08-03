@@ -259,6 +259,14 @@ class CompanionModeActivity final : public Activity {
   // START-time checks are unconditionally solicited and call
   // companionble::notifyRenderStatus() directly.
   void notifyRenderPushResult(companionble::RenderResult result);
+  // Answers a still-armed render expectation with RenderResult::Superseded and
+  // disarms it, so a new push can arm its own. Call immediately before arming,
+  // from every site that arms — both arm sites overwrite renderAwaitingField
+  // unconditionally, and whichever push lands second also sets `screen`, so the
+  // first one's render never runs and its caller would otherwise wait out its
+  // whole timeout for an answer that was never coming. No-op when nothing is
+  // armed, which is the overwhelmingly common case.
+  void supersedePendingRenderStatus();
   void renderTags(int rightEdgeX, int centerY) const;
   // Draws a small sleeping indicator (bottom-left, same corner text mode's
   // battery percentage occupies) over the currently-displayed image, without

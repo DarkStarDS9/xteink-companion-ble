@@ -350,6 +350,9 @@ RENDER_STATUS result     0x00 DISPLAYED
                                                 was expected (image), or a title/body/tag batch
                                                 was discarded because one of its fields hit that
                                                 -- see "Image field" and "Atomic multi-field pushes"
+                         0x05 SUPERSEDED        a later push took the screen before this one
+                                                reached the panel, so it never rendered. Not an
+                                                error -- see "Superseded pushes" below
 
 RENDER_STATUS field      0x04 the image field (0x04) -- an image push
                          0x02 the body field (0x02), standing in for a whole
@@ -684,6 +687,32 @@ loses a field is discarded whole" above), `RENDER_STATUS(SequenceGap,
 field=0x02)` is sent immediately instead, since no render is ever coming for
 it — see `FIELD_SEQ_GAP` above for the field-level version of the same
 signal.
+
+#### Superseded pushes
+
+**The device owes exactly one `RENDER_STATUS` per push, including when that push
+never renders.** A content push selects the text render branch and an image push
+selects the image one, so if a second push arrives before the first has reached
+the panel, the second one's content is what gets drawn and the first one's render
+never happens. The superseded push is answered with
+`RENDER_STATUS(Superseded, field=<the superseded push's field>)` at the moment it
+is overtaken, so a client awaiting it fails fast instead of waiting out its own
+timeout for an answer that was never coming.
+
+`Superseded` is **not an error**. Nothing failed and nothing was corrupted — the
+content was simply overtaken by something newer, which is very often exactly what
+the app intended. Do not retry on it: the app has already moved on, and re-pushing
+would race whatever superseded it and could put stale content back on the panel.
+
+**Expect this to be rare.** A client that does not await the render is done with a
+push as soon as its wire transfer completes (~0.24s) while the render it triggered
+still has ~1.7s to run, so an image push can start mid-render — but the device
+serialises the two behind its render lock, so the earlier push normally still
+reaches the panel and reports `Displayed`. Measured on hardware: a text push
+followed 0.3s later by an image answered `Displayed`, not `Superseded`. The
+remaining window is the sliver where an image finishes staging and takes the
+screen before the queued text render has begun. Handle `Superseded` because it is
+cheap to, not because it is likely.
 
 ### Content-id field (`0x03`) — opaque correlation token
 

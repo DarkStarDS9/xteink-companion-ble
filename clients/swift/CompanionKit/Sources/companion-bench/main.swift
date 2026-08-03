@@ -82,7 +82,7 @@ func say(_ message: String) {
 
 // Only the image-bearing scenarios need the file; text-burst and idle-hold run
 // without one, so a missing /tmp/bench_image.raw must not block them.
-let needsImage = scenario == "image" || scenario == "image-repeat"
+let needsImage = scenario == "image" || scenario == "image-repeat" || scenario == "supersede"
 var imageData = Data()
 if needsImage {
     guard let loaded = FileManager.default.contents(atPath: imagePath) else {
@@ -253,6 +253,35 @@ func runIdleHold(holdSeconds: Double) async {
     say("idle-hold complete without the harness sending anything")
 }
 
+
+/// Reproduces the supersede case: push text WITHOUT awaiting its render, then
+/// immediately push an image. push() returns when the wire transfer finishes
+/// (~0.24s) while the text render still has ~1.7s to run, so the image arrives
+/// mid-render and takes the screen -- the text render never happens. Before the
+/// Superseded result existed, the text push's waiter simply got no answer at all.
+func runSupersede(imageData: Data) async {
+    say("supersede: text push (not awaited), then an image immediately after")
+    let renderBox = ElapsedBox()
+    let started = Date()
+    async let textPush: Void = {
+        do {
+            let r = try await client.push(title: syntheticTitle(index: 99),
+                                          body: syntheticBody(index: 99),
+                                          contentId: "bench-supersede",
+                                          awaitRender: true)
+            renderBox.setIfUnset(Date().timeIntervalSince(started))
+            say("text push answered after \(String(format: "%.2f", Date().timeIntervalSince(started)))s: \(r.map { "\($0)" } ?? "nil")")
+        } catch {
+            say("text push threw: \(error)")
+        }
+    }()
+    try? await Task.sleep(nanoseconds: 300_000_000)
+    say("pushing image now, text render should still be in flight")
+    await runImageOnce(label: "supersede image:", imageData: imageData)
+    await textPush
+    say("supersede complete")
+}
+
 // MARK: - Event loop
 
 var scenarioStarted = false
@@ -295,6 +324,8 @@ let listener = Task {
                 await runTextBurst(count: positionalInt(0, default: 12),
                                    gapSeconds: positionalDouble(1, default: 3),
                                    awaitRender: scenario == "text-burst-render")
+            case "supersede":
+                await runSupersede(imageData: imageData)
             case "idle-hold":
                 await runIdleHold(holdSeconds: positionalDouble(0, default: 300))
             default:

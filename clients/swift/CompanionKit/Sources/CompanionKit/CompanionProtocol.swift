@@ -153,6 +153,23 @@ public enum RenderResult: UInt8, Sendable {
     /// ``CompanionClient/push(title:body:contentId:tags:awaitRender:)`` to
     /// time out.
     case sequenceGap = 0x04
+    /// v11: a later push took the screen before this one reached the panel, so
+    /// it will never render. A content push and an image push select different
+    /// render branches on the device, and whichever lands second wins.
+    ///
+    /// Rare in practice. `push(awaitRender: false)` returns once the *wire*
+    /// transfer completes (~0.24s measured) while the render it triggered still
+    /// has ~1.7s to run, so an app can start an image push mid-render — but the
+    /// device serialises the two behind its render lock, so the earlier push
+    /// normally still reaches the panel and reports ``displayed``. Verified on
+    /// hardware: a text push followed 0.3s later by an image answered
+    /// ``displayed``. Expect this case to be uncommon, and handle it because it
+    /// is cheap to, not because it is likely.
+    ///
+    /// **Not an error.** Nothing failed; the content was overtaken by something
+    /// newer, which is usually exactly what the app intended. Retrying would
+    /// re-push content the app has already moved on from.
+    case superseded = 0x05
     case unknown = 0xFF
 
     init(wire: UInt8) { self = RenderResult(rawValue: wire) ?? .unknown }
