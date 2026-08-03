@@ -525,14 +525,20 @@ def verify_screenshot_matches(raw2bpp: bytes, width: int, height: int, actual_fr
 # its own substrings to check_no_errors(allowed=...) instead of widening this,
 # so that exemption stays scoped to the one section that earned it.
 ALLOWED_ERR_SUBSTRINGS: tuple[str, ...] = (
-    # The peripheral asks for a 15 ms connection interval and logs it at ERR
-    # when the central grants something else. macOS/CoreBluetooth always grants
-    # something else (and re-negotiates as the link goes busy/idle), so this
-    # fires several times in every run on this host. It reports the central's
-    # decision, not a device-side failure: nothing on the device fell back and
-    # nothing was dropped. (Whether it should be LOG_ERR at all is a firmware
-    # question, not this harness's to answer.)
-    "conn params DIVERGED from request",
+    # The peripheral asks for a connection interval and the central declines to
+    # honour it for 3 s. This reports the *central's* decision, not a device-side
+    # failure: nothing on the device fell back and nothing was dropped, and the
+    # firmware keeps working at whatever the link actually settled on.
+    #
+    # Measured on this host (bleak/CoreBluetooth, 2026-08-03): a connection opens
+    # at the central's own 30 ms interval / 720 ms supervision timeout and the
+    # peripheral's 15 ms "busy" request is simply never granted, while the later
+    # "deep" request is granted exactly. So this can legitimately fire here.
+    # It is exempt because it says something true about the host's radio policy
+    # rather than about the firmware under test -- but if it starts appearing on
+    # a real iPhone it is worth investigating, since the busy profile is what
+    # bulk image throughput depends on.
+    "conn params NOT honoured after",
     # The harness's own clean disconnect between the first and second BLE
     # links. Deliberately matched with the trailing field-in-flight=0x00: a
     # disconnect that interrupted a transfer reports a non-zero field id there

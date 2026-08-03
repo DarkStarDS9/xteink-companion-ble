@@ -295,6 +295,23 @@ uint32_t connUptimeMs() { return g_connectMs == 0 ? 0 : millis() - g_connectMs; 
 uint16_t g_reqIntervalUnits = 0;
 uint16_t g_reqLatency = 0;
 uint16_t g_reqTimeoutUnits = 0;
+// millis() of the last requestConnParams() call, and whether the most recent
+// update event matched what it asked for. Together these let tick() report a
+// request the central never honoured, without mistaking the link's own opening
+// parameters for a refusal -- see onConnParamsUpdate() for why that distinction
+// cost a false ERR on every connection before it existed.
+uint32_t g_connParamsRequestedMs = 0;
+bool g_connParamsMatchedRequest = true;
+bool g_connParamsDivergenceLogged = false;
+uint16_t g_lastGrantedIntervalUnits = 0;
+uint16_t g_lastGrantedLatency = 0;
+uint16_t g_lastGrantedTimeoutUnits = 0;
+// How long the central gets to honour a parameter request before the mismatch
+// is reported. A connection-parameter update takes effect at an instant several
+// connection events out, and the measured round trip on real hardware is
+// ~150-550 ms; 3 s is far past any legitimate negotiation without letting a
+// genuinely ignored request go unnoticed for long.
+constexpr uint32_t kConnParamsGraceMs = 3000;
 
 void requestConnParams(ConnProfile profile) {
   if (!g_server || g_server->getConnectedCount() == 0) return;
@@ -325,6 +342,9 @@ void requestConnParams(ConnProfile profile) {
   g_reqIntervalUnits = interval;
   g_reqLatency = latency;
   g_reqTimeoutUnits = timeout;
+  g_connParamsRequestedMs = millis();
+  g_connParamsMatchedRequest = false;  // until an update event says otherwise
+  g_connParamsDivergenceLogged = false;
   LOG_DBG("CBLE", "t=+%lums requested %s conn params (interval=%u latency=%u timeout=%u)",
           static_cast<unsigned long>(connUptimeMs()), connProfileName(profile), static_cast<unsigned>(interval),
           static_cast<unsigned>(latency), static_cast<unsigned>(timeout));
@@ -1585,19 +1605,29 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     LOG_DBG("CBLE", "t=+%lums conn params granted: interval=%.2fms latency=%u timeout=%ums",
             static_cast<unsigned long>(connUptimeMs()), g_lastConnIntervalMs, static_cast<unsigned>(g_lastConnLatency),
             static_cast<unsigned>(g_lastConnTimeoutMs));
-    // DIAGNOSTIC: a request the central did not honour leaves the firmware
-    // streaming Write-Without-Response chunks into a link it wrongly believes
-    // is on the 15 ms busy profile. Nothing currently notices; say so loudly.
-    if (g_reqIntervalUnits != 0 &&
-        (connInfo.getConnInterval() != g_reqIntervalUnits || connInfo.getConnLatency() != g_reqLatency ||
-         connInfo.getConnTimeout() != g_reqTimeoutUnits)) {
-      LOG_ERR("CBLE",
-              "conn params DIVERGED from request: asked interval=%u latency=%u timeout=%u, got interval=%u "
-              "latency=%u timeout=%u (units: 1.25ms / events / 10ms)",
-              static_cast<unsigned>(g_reqIntervalUnits), static_cast<unsigned>(g_reqLatency),
-              static_cast<unsigned>(g_reqTimeoutUnits), static_cast<unsigned>(connInfo.getConnInterval()),
-              static_cast<unsigned>(connInfo.getConnLatency()), static_cast<unsigned>(connInfo.getConnTimeout()));
-    }
+    // DIAGNOSTIC: does the link actually end up where we asked? A request the
+    // central never honours leaves the firmware streaming Write-Without-Response
+    // chunks into a link it wrongly believes is on the 15 ms busy profile.
+    //
+    // Deliberately only RECORDS the mismatch here rather than logging it. The
+    // first update event of a connection carries the parameters the *central*
+    // chose when it established the link, which naturally differ from a request
+    // we sent microseconds earlier and that nothing has answered yet. Measured
+    // on hardware 2026-08-03 against a bleak/CoreBluetooth central: request at
+    // t=+1ms for 15ms/0/6s, first update at t=+300ms reporting the central's own
+    // 30ms/0/720ms, then the next request granted exactly. Logging on every
+    // update turned that normal opening handshake into an ERR line on every
+    // single connection -- loud enough that the e2e harness had to allowlist the
+    // string, which is precisely how a diagnostic stops being read.
+    //
+    // tick() does the actual reporting once the request has had time to land.
+    g_connParamsMatchedRequest =
+        (g_reqIntervalUnits == 0 ||
+         (connInfo.getConnInterval() == g_reqIntervalUnits && connInfo.getConnLatency() == g_reqLatency &&
+          connInfo.getConnTimeout() == g_reqTimeoutUnits));
+    g_lastGrantedIntervalUnits = connInfo.getConnInterval();
+    g_lastGrantedLatency = connInfo.getConnLatency();
+    g_lastGrantedTimeoutUnits = connInfo.getConnTimeout();
   }
   void onPhyUpdate(NimBLEConnInfo& /*connInfo*/, uint8_t txPhy, uint8_t rxPhy) override {
     g_lastPhyTx = phyName(txPhy);
@@ -1808,6 +1838,24 @@ bool isConnected() { return g_begun && g_server && g_server->getConnectedCount()
 
 void tick() {
   if (!isConnected()) return;
+
+  // DIAGNOSTIC: report a parameter request the central never honoured, once per
+  // request, and only after it has had kConnParamsGraceMs to land. Checking here
+  // rather than in onConnParamsUpdate() is the whole point: the opening update
+  // of a connection reports the central's own chosen parameters, not a reply to
+  // us, and flagging that produced an ERR line on every single connection.
+  if (!g_connParamsMatchedRequest && !g_connParamsDivergenceLogged && g_reqIntervalUnits != 0 &&
+      g_connParamsRequestedMs != 0 && millis() - g_connParamsRequestedMs > kConnParamsGraceMs) {
+    g_connParamsDivergenceLogged = true;
+    LOG_ERR("CBLE",
+            "conn params NOT honoured after %lums: asked interval=%u latency=%u timeout=%u, link is interval=%u "
+            "latency=%u timeout=%u (units: 1.25ms / events / 10ms)",
+            static_cast<unsigned long>(kConnParamsGraceMs), static_cast<unsigned>(g_reqIntervalUnits),
+            static_cast<unsigned>(g_reqLatency), static_cast<unsigned>(g_reqTimeoutUnits),
+            static_cast<unsigned>(g_lastGrantedIntervalUnits), static_cast<unsigned>(g_lastGrantedLatency),
+            static_cast<unsigned>(g_lastGrantedTimeoutUnits));
+  }
+
   const uint32_t quietMs = millis() - g_lastBleActivityMs;
   if (quietMs < kConnIdleRelaxMs) return;
   // Two ways to earn Deep: a long enough quiet spell that even an app holding
