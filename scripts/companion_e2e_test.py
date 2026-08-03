@@ -391,6 +391,12 @@ class Link:
         elif opcode == SESS_ASSET_ACK:
             self._resolve(f"asset:{data[1]}:{data[2]}", (data[3], bytes(data[4:8])))
         elif opcode == SESS_IMAGE_STATUS:
+            # data[3] is the pushId the device echoes back (v11; briefly a
+            # `field` byte before that, replaced the same day it landed).
+            # Ignored here: this harness never has two image pushes
+            # outstanding on the same session at once, so keying the future
+            # on session id alone (as this already does) cannot misroute one
+            # push's answer to another's waiter.
             self._resolve(f"image:{data[1]}", data[2])
 
     def on_button(self, _sender, data: bytearray) -> None:
@@ -442,7 +448,9 @@ class Link:
         )
         return await asyncio.wait_for(future, timeout=timeout)
 
-    async def push_field(self, peer: Peer, field_id: int, data: bytes, final: bool = False) -> None:
+    async def push_field(
+        self, peer: Peer, field_id: int, data: bytes, final: bool = False, push_id: int = 0
+    ) -> None:
         start = bytes([OP_START, field_id | (FINAL_FLAG if final else 0), peer.session_id])
         start += struct.pack("<I", len(data))
         await self.client.write_gatt_char(CONTENT_CHAR_UUID, start, response=True)
@@ -452,7 +460,17 @@ class Link:
                 bytes([OP_CHUNK, peer.session_id]) + data[offset : offset + CHUNK_PAYLOAD],
                 response=True,
             )
-        await self.client.write_gatt_char(CONTENT_CHAR_UUID, bytes([OP_END, peer.session_id]), response=True)
+        # v11: END grew a required third byte, pushId, echoed back on the
+        # eventual RENDER_STATUS -- see docs/companion-display-protocol.md's
+        # END framing. 0 ("don't answer") is right for every push_field() call
+        # in this harness except push_image()'s: none of the title/body/
+        # content-id/tag-state/asset pushes above ever await a render (the
+        # "content" and "tags" sections below assert on serial state instead),
+        # so there is nothing here that would ever look at a RENDER_STATUS for
+        # them.
+        await self.client.write_gatt_char(
+            CONTENT_CHAR_UUID, bytes([OP_END, peer.session_id, push_id & 0xFF]), response=True
+        )
 
     async def push_asset(self, peer: Peer, field_id: int, payload: bytes, timeout: float = 15.0):
         future = self.expect(f"asset:{peer.session_id}:{field_id}")
@@ -461,7 +479,13 @@ class Link:
 
     async def push_image(self, peer: Peer, raw: bytes, timeout: float = 180.0):
         future = self.expect(f"image:{peer.session_id}")
-        await self.push_field(peer, FIELD_IMAGE, raw, final=True)
+        # push_id=1: the only push_field() call in this file that actually
+        # awaits a RENDER_STATUS (see on_session's SESS_IMAGE_STATUS branch),
+        # so it needs a non-zero id or the device would never notify and this
+        # would just burn its full timeout. Any non-zero constant would do --
+        # this harness never has two image pushes outstanding on the same
+        # session at once, so there is no second id to collide with.
+        await self.push_field(peer, FIELD_IMAGE, raw, final=True, push_id=1)
         return await asyncio.wait_for(future, timeout=timeout)
 
     async def set_tag(self, peer: Peer, tag_id: int, state: int) -> None:

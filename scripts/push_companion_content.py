@@ -280,6 +280,10 @@ class Session:
             if future and not future.done():
                 self.loop.call_soon_threadsafe(future.set_result, (data[3], bytes(data[4:8])))
         elif opcode == SESS_IMAGE_STATUS:
+            # data[3] is the pushId the device is echoing (v11; a `field` byte
+            # for one day before that) -- ignored here since this script only
+            # ever has one push outstanding at a time (see push_image()), so
+            # there is nothing to correlate against.
             self._resolve("image_future", data[2])
         elif opcode == SESS_IMAGE_CHUNK_ACK:
             # Diagnostic only -- progress marker during an in-flight image
@@ -339,7 +343,9 @@ class Session:
 
     # -- content ------------------------------------------------------------ #
 
-    async def push_field(self, field: int, data: bytes, final: bool = False, progress: bool = False) -> None:
+    async def push_field(
+        self, field: int, data: bytes, final: bool = False, progress: bool = False, push_id: int = 0
+    ) -> None:
         field_byte = field | (FINAL_FLAG if final else 0)
         start = bytes([OP_START, field_byte, self.session_id]) + struct.pack("<I", len(data))
         await self.client.write_gatt_char(CONTENT_CHAR_UUID, start, response=True)
@@ -373,7 +379,18 @@ class Session:
         if progress:
             print()
 
-        await self.client.write_gatt_char(CONTENT_CHAR_UUID, bytes([OP_END, self.session_id]), response=True)
+        # v11: END grew a required third byte, pushId, echoed back verbatim on
+        # the eventual RENDER_STATUS (see docs/companion-display-protocol.md's
+        # END framing). 0 means "don't bother answering" and is the right
+        # default for most of what this script pushes -- it has no future to
+        # resolve for a text/asset field (see the SESS_FIELD_SEQ_GAP handler's
+        # comment above) -- but push_image() overrides it: that call *does*
+        # await a RENDER_STATUS via image_future, so it must pass a non-zero
+        # id or the device will never notify and that wait_for() would just
+        # burn its full 180s timeout for nothing.
+        await self.client.write_gatt_char(
+            CONTENT_CHAR_UUID, bytes([OP_END, self.session_id, push_id & 0xFF]), response=True
+        )
 
     async def push_asset(self, field: int, payload: bytes) -> int:
         future = self.loop.create_future()
@@ -400,7 +417,11 @@ class Session:
             raise SystemExit(f"Image is {len(raw_bitmap)} bytes, device cap is {self.caps['max_image']}.")
         self.image_future = self.loop.create_future()
         transfer_start = time.perf_counter()
-        await self.push_field(FIELD_IMAGE, raw_bitmap, final=True, progress=True)
+        # push_id=1: this script only ever has one push in flight at a time
+        # (everything here is a single sequential `await`, never overlapped),
+        # so there is no correlation to get wrong -- any non-zero constant
+        # would do. 1 just reads as "the id", not as anything meaningful.
+        await self.push_field(FIELD_IMAGE, raw_bitmap, final=True, progress=True, push_id=1)
         transfer_s = time.perf_counter() - transfer_start
         print(f"  BLE transfer: {transfer_s:.2f}s ({len(raw_bitmap) / transfer_s:.0f} B/s)")
         print("  Waiting for the device to develop it (decode + grayscale settle)...")
