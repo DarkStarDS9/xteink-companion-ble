@@ -89,18 +89,34 @@ class CompanionModeActivity final : public Activity {
 
   std::string displayedImagePath;
 
-  // True only between an image push committing and its IMAGE_STATUS going out.
-  // IMAGE_STATUS is defined by the protocol as the *response* to a push, but
-  // renderImage() is also reached by every ordinary redraw of an image already
-  // on screen (a central connecting, a foreground change, a gallery page turn).
-  // Without this gate those redraws broadcast IMAGE_STATUS(DISPLAYED) to
-  // whoever holds the foreground, so a client that connects while an older
-  // image is up sees its own pushImage() resolve after a couple of packets and
-  // stops transmitting — reproduced on hardware 6/6 against the iOS app.
-  // Set under RenderLock in handlePendingImage(), consumed exactly once by
-  // notifyImagePushResult(), and cleared on disconnect so an abandoned push
-  // cannot leak a status onto an unrelated later redraw.
-  bool imagePushAwaitingStatus = false;
+  // True only between a push (image OR, since v11, a title/body/tag content
+  // batch) committing and its RENDER_STATUS going out. RENDER_STATUS is
+  // defined by the protocol as the *response* to a push, but both renderImage()
+  // and renderPage() are also reached by ordinary redraws that were never asked
+  // for (a central connecting, a foreground change, a gallery/page turn, a
+  // tag-only redraw). Without this gate those redraws broadcast
+  // RENDER_STATUS(DISPLAYED) to whoever holds the foreground, so a client that
+  // connects while older content is up sees its own push resolve after a
+  // couple of packets and stops transmitting — reproduced on hardware 6/6
+  // against the iOS app for the image case (see commit 2cdbb3a7), and the same
+  // mechanism generalizes to text rather than growing a second flag.
+  //
+  // One shared bool rather than one per pushable field: only one push (image
+  // or content) is ever rendering at a time — the two screens are mutually
+  // exclusive (see loop()'s "text replaces an image, and vice versa") — so
+  // there is never a moment where two renders could both be legitimately
+  // awaiting an answer. `renderAwaitingField` records which field's push this
+  // is, so the eventual RENDER_STATUS names the right one.
+  //
+  // Set under RenderLock in handlePendingImage() (image) or loop()'s content
+  // commit block (text), consumed exactly once by notifyRenderPushResult(),
+  // and cleared on disconnect so an abandoned push cannot leak a status onto
+  // an unrelated later redraw.
+  bool renderAwaitingStatus = false;
+  // kFieldImage or kFieldBody — see renderAwaitingStatus above and
+  // notifyRenderStatus()'s doc comment in CompanionBle.h for why kFieldBody
+  // stands in for the whole title/body/content-id/tag batch.
+  uint8_t renderAwaitingField = 0;
 
   // Firmware-local browsing of the foreground peer's previously pushed images
   // (CompanionPeerStore's bounded per-peer gallery, kMaxImagesPerPeer entries,
@@ -236,12 +252,13 @@ class CompanionModeActivity final : public Activity {
   void renderStartFailed();
   void renderPage();
   void renderImage();
-  // Sends IMAGE_STATUS only if a pushed image is still awaiting its answer,
-  // and consumes that expectation. Every notify reached from renderImage()
-  // must go through here; the pre-render rejections in handlePendingImage()
-  // and CompanionBle's START-time checks are unconditionally solicited and
-  // call companionble::notifyImageStatus() directly.
-  void notifyImagePushResult(companionble::ImageResult result);
+  // Sends RENDER_STATUS only if a push (image or content) is still awaiting
+  // its answer, and consumes that expectation. Every notify reached from
+  // renderImage() or the Screen::Text branch of render() must go through here;
+  // the pre-render rejections in handlePendingImage() and CompanionBle's
+  // START-time checks are unconditionally solicited and call
+  // companionble::notifyRenderStatus() directly.
+  void notifyRenderPushResult(companionble::RenderResult result);
   void renderTags(int rightEdgeX, int centerY) const;
   // Draws a small sleeping indicator (bottom-left, same corner text mode's
   // battery percentage occupies) over the currently-displayed image, without

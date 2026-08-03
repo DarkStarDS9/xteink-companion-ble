@@ -789,13 +789,13 @@ void CompanionModeActivity::handlePendingImage(const std::string& stagedPath, co
   ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(path);
   if (!decoder) {
     LOG_ERR("CMA", "no decoder for staged image %s", path.c_str());
-    companionble::notifyImageStatus(companionble::ImageResult::DecodeFailed);
+    companionble::notifyRenderStatus(companionble::RenderResult::DecodeFailed, companionble::kFieldImage);
     return;
   }
   ImageDimensions dims{};
   if (!decoder->getDimensions(path, dims)) {
     LOG_ERR("CMA", "staged image %s did not decode", path.c_str());
-    companionble::notifyImageStatus(companionble::ImageResult::DecodeFailed);
+    companionble::notifyRenderStatus(companionble::RenderResult::DecodeFailed, companionble::kFieldImage);
     return;
   }
 
@@ -805,7 +805,8 @@ void CompanionModeActivity::handlePendingImage(const std::string& stagedPath, co
   // task can never observe one without the other. Unconditional: a previous
   // push that never got its answer (link dropped mid-settle) must not stop
   // this one from being answered.
-  imagePushAwaitingStatus = true;
+  renderAwaitingStatus = true;
+  renderAwaitingField = companionble::kFieldImage;
   displayedImagePath = path;
   foregroundPushedImageThisSession = true;
   galleryPickerBrowsing = false;  // a live push always wins over picker browsing
@@ -1030,9 +1031,10 @@ void CompanionModeActivity::loop() {
     connected = nowConnected;
     if (!connected) {
       // Nobody left to answer. Anything the departing peer was still owed dies
-      // with the link; carrying the expectation forward would fire IMAGE_STATUS
-      // at whichever peer connects next, on a redraw it never asked for.
-      imagePushAwaitingStatus = false;
+      // with the link; carrying the expectation forward would fire
+      // RENDER_STATUS at whichever peer connects next, on a redraw it never
+      // asked for.
+      renderAwaitingStatus = false;
 
       // If the peer that just lost the link is image-capable and never
       // pushed anything this session, its own gallery is more useful than an
@@ -1199,6 +1201,18 @@ void CompanionModeActivity::loop() {
     // user cannot see. Clean failure beats that, and beats a half-applied
     // batch. A standalone tag push is untouched — see g_pendingTagStateInBatch.
     if (tagStateWasInBatch) gotTagState = false;
+
+    // A discarded batch never renders, so nothing will reach the Screen::Text
+    // branch of render() to answer it the normal way (see notifyRenderStatus()
+    // calls below). A client awaiting RENDER_STATUS after this push would
+    // otherwise block until its own timeout for a render that is never coming
+    // -- answer immediately instead, same opcode, SequenceGap standing in for
+    // "discarded" the same way it already does for a single dropped field via
+    // FIELD_SEQ_GAP. This bypasses renderAwaitingStatus entirely (nothing was
+    // armed for this batch — the arm only happens once a commit is about to
+    // render, below) so it cannot race or double-answer a render that does
+    // happen to land.
+    companionble::notifyRenderStatus(companionble::RenderResult::SequenceGap, companionble::kFieldBody);
   }
 
   if (gotPairing) {
@@ -1224,6 +1238,15 @@ void CompanionModeActivity::loop() {
     // One lock for both halves so a render can never land between the title and
     // body updates of a single push and see a mismatched pairing.
     RenderLock lock;
+    // Arm the one status this push is owed, same mechanism and same caveats as
+    // handlePendingImage()'s image arm above: unconditional (a previous push
+    // that never got its answer must not block this one), set under the lock
+    // alongside the state that makes render() take the Screen::Text branch, so
+    // the render task can never observe the flag without the content it names.
+    // Consumed exactly once, from render()'s Screen::Text case, once the panel
+    // actually shows this batch -- see notifyRenderPushResult().
+    renderAwaitingStatus = true;
+    renderAwaitingField = companionble::kFieldBody;
     if (gotTitle) {
       title = newTitle;
       updateTitleLayout();
@@ -1533,6 +1556,17 @@ void CompanionModeActivity::render(RenderLock&&) {
       } else {
         renderWaiting();
       }
+      // Both branches above end with the actual displayBuffer()/
+      // displayWithRefreshCycle() call that puts pixels on the panel, so
+      // control reaching here means this redraw is done -- whichever branch
+      // ran. Placed at the Screen::Text case rather than inside renderPage()
+      // itself so a content push that names a title with no body yet (haveContent
+      // still false, so renderWaiting() runs instead) still gets answered
+      // instead of leaving renderAwaitingStatus armed until some unrelated
+      // future push resolves it. notifyRenderPushResult() no-ops unless a push
+      // actually armed the flag, so an ordinary redraw (reconnect, tag change,
+      // page turn) with no push in flight is silent, exactly like renderImage().
+      notifyRenderPushResult(companionble::RenderResult::Displayed);
       break;
     case Screen::Waiting:
       renderWaiting();
@@ -1781,13 +1815,13 @@ void CompanionModeActivity::renderPreSleepScreen() {
 // See the header for why this gate exists. Consuming the flag before the
 // notify (rather than after) means a status that cannot be delivered — the
 // peer disconnected during the multi-second grayscale settle, so
-// notifyImageStatus() finds no foreground session and drops it — still ends
+// notifyRenderStatus() finds no foreground session and drops it — still ends
 // the expectation. A flag left set there would surface as a phantom
-// IMAGE_STATUS on the next unrelated redraw.
-void CompanionModeActivity::notifyImagePushResult(companionble::ImageResult result) {
-  if (!imagePushAwaitingStatus) return;
-  imagePushAwaitingStatus = false;
-  companionble::notifyImageStatus(result);
+// RENDER_STATUS on the next unrelated redraw.
+void CompanionModeActivity::notifyRenderPushResult(companionble::RenderResult result) {
+  if (!renderAwaitingStatus) return;
+  renderAwaitingStatus = false;
+  companionble::notifyRenderStatus(result, renderAwaitingField);
 }
 
 void CompanionModeActivity::renderImage() {
@@ -1795,7 +1829,7 @@ void CompanionModeActivity::renderImage() {
     // The image was superseded before it could be drawn (a text push clears
     // displayedImagePath). Drop the expectation rather than carry it into an
     // unrelated future render.
-    imagePushAwaitingStatus = false;
+    renderAwaitingStatus = false;
     renderWaiting();
     return;
   }
@@ -1804,7 +1838,7 @@ void CompanionModeActivity::renderImage() {
   if (!decoder) {
     renderer.drawCenteredText(kCompanionFontId, renderer.getScreenHeight() / 2, tr(STR_COMPANION_IMAGE_FAILED), true);
     renderer.displayBuffer();
-    notifyImagePushResult(companionble::ImageResult::DecodeFailed);
+    notifyRenderPushResult(companionble::RenderResult::DecodeFailed);
     displayedImagePath.clear();
     return;
   }
@@ -1826,7 +1860,7 @@ void CompanionModeActivity::renderImage() {
     renderer.clearScreen();
     renderer.drawCenteredText(kCompanionFontId, renderer.getScreenHeight() / 2, tr(STR_COMPANION_IMAGE_FAILED), true);
     renderer.displayBuffer();
-    notifyImagePushResult(companionble::ImageResult::DecodeFailed);
+    notifyRenderPushResult(companionble::RenderResult::DecodeFailed);
     displayedImagePath.clear();
     return;
   }
@@ -1900,7 +1934,7 @@ void CompanionModeActivity::renderImage() {
     renderTags(renderer.getScreenWidth() - cachedOrientedMarginRight, cachedOrientedMarginTop + lineHeight);
   }
 
-  notifyImagePushResult(companionble::ImageResult::Displayed);
+  notifyRenderPushResult(companionble::RenderResult::Displayed);
 }
 
 // Draws the foreground app's visible tags as a right-aligned row.
