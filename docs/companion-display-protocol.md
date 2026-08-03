@@ -31,34 +31,50 @@ doesn't generalize the way `pushId` does.) See "Session characteristic" and
 "Content characteristic" below, and "Version history" for why this is a
 breaking change rather than an addition.
 
-This document is **authoritative** and is written first on purpose: consumer
-apps are built against it while the firmware side lands. Where the firmware and
-this document disagree, the firmware is wrong.
+This document is **authoritative**: consumer apps are built against it, not
+against whatever the firmware happens to do. Where the firmware and this
+document disagree, the firmware is wrong. It is also written first by
+convention — a wire change lands here in the same commit as the code that
+implements it, never after.
 
-> ### ⚠ Nothing in v6 has ever executed on the wire
+> ### What has actually run on the wire
 >
-> As of 2026-07-28, the firmware implements **all** of v6 and **none of it has
-> been exercised by a BLE client.** Not one handshake, content push, image, icon
-> or tag has crossed the link. The device boots, advertises and answers serial
-> commands; that is the whole of what has been confirmed.
+> **As of 2026-08-03, v11 is exercised end-to-end on real hardware.** This
+> replaces a warning that stood here from 2026-07-28 to 2026-08-03 saying that
+> nothing in v6 had ever crossed the link — that is no longer true, and the
+> earlier caution should not be read into the current state.
 >
-> BLE itself works fine on this development machine — the gap is that the
-> automated test harness that would exercise the checklist below has not been
-> run yet. See "Manual verification checklist" at the end of this document —
-> 36 items, all open — and `docs/companion-test-console.md` for how to run
-> them.
+> Proven by `scripts/companion_e2e_test.py` against a `[env:test]` build
+> (66 assertions, passing, exit 0): enrollment from never-paired including the
+> CONFIRM press, token reconnect, `ACQUIRE` gating, atomic multi-field content
+> batches and their `RENDER_STATUS`, `pushId` correlation and the `pushId 0`
+> silence rule, both sequence-gap paths, a batch discarded whole leaving the
+> previous page intact, tags, preemption between two apps on one link, and a
+> full-screen image push diffed pixel-for-pixel against `CMD:SCREENSHOT`. The
+> device's own `[ERR]` log is scanned throughout, so a path that fails and
+> silently falls back is caught rather than self-reported as success.
 >
-> **`docs/companion-mode-implementation-notes.md` § "v6 bring-up log" is the
-> single authoritative answer** to what has and has not been proven, with the
-> risks ranked and the measured budgets.
+> Proven separately through `CompanionKit` (the client the consumer apps
+> actually use), via `companion-bench`: image push throughput, text pushes with
+> `awaitRender`, and the connection-profile ladder.
 >
-> **Treat every behaviour described here as specified-and-implemented, not
-> proven.** Highest-risk unproven areas: SD access from the NimBLE host task
-> during pairing and image staging (4 KB stack, a crash would look like a
-> pairing failure), the entire image decode and grayscale-settle path (which
-> already yielded one real bug found by reading rather than running — see
-> `renderImage()`'s black/white base), and everything that draws: icon grid,
-> tag chips, pairing prompt.
+> **Still not proven**, and worth treating with the old caution:
+>
+> - **The consumer apps on v11.** Neither SpokenFeeds nor Snap2Ink has been
+>   rebuilt against it. Everything above was driven by test harnesses on a Mac,
+>   not by an iPhone.
+> - **`RENDER_STATUS(Superseded)`.** Deliberately untested — the window is small
+>   enough that a test for it would be an intermittent race rather than a check
+>   (see "Superseded pushes").
+> - **Long-run link stability.** A periodic disconnect reported in real
+>   SpokenFeeds use is unexplained and did not reproduce from a Mac; the
+>   firmware now logs the HCI reason on every disconnect, which is what will
+>   identify it.
+> - **Power and battery behaviour** of the connection-profile ladder over a real
+>   discharge.
+>
+> `docs/companion-mode-implementation-notes.md` § "v6 bring-up log" remains the
+> ranked risk list and the measured memory budgets.
 
 This is a **BLE peripheral/GATT-server role**, not something upstream
 CrossPoint or this fork's `feat-bluetooth` branch already has — that branch's
