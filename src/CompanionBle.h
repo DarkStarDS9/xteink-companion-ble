@@ -330,22 +330,32 @@ const char* foregroundPeerKey();
 bool notifyButtonEvent(ButtonId button, uint16_t durationTicks, bool isFinal);
 
 // Reports the outcome of a push to the app that made it, as RENDER_STATUS:
-// {kSessRenderStatus, sessionId, result, field}. `field` says WHAT rendered --
-// kFieldImage for an image push, kFieldBody standing in for a title/body/
-// content-id/tag content batch (there is no single field id for "the batch";
-// body is the field a text-awaiting client is actually waiting to see, and is
-// present in the overwhelming majority of content pushes). Called from the
-// main loop once the pushed content has actually been decoded/laid out and
-// flipped to the panel (or failed, or -- v11 -- discarded whole; see
-// RenderResult::SequenceGap).
+// {kSessRenderStatus, sessionId, result, pushId}. `pushId` is simply echoed
+// back from whatever the pushing client sent on the final-flagged field's END
+// -- the device never interprets it, so the same mechanism answers an image
+// push, a text batch, or any future push type with no protocol growth. This
+// replaced an earlier `field` byte (kFieldImage / kFieldBody, the latter
+// standing in for "the whole title/body/content-id/tag batch" since there was
+// no single field id for a batch) on the same day v11 landed, before any
+// consumer app had adopted it -- see the "v11" note below and the commit that
+// made this change for why redefining it was free.
 //
-// v10 and earlier clients only ever received this 3 bytes long (no `field`),
-// and only for an image push -- text pushes were silent. A v10 client fed a
-// 4-byte notification triggered by a text push would misparse it, which is
-// exactly why generalizing this past images is a protocol version bump
-// (10 -> 11), not a silent behavior change. See
+// pushId 0 means "the client did not ask for an answer" and MUST NOT produce
+// a notification -- callers that armed nothing (pushId == 0) simply never
+// call this, and this function itself no-ops if handed one anyway, as a
+// belt-and-suspenders guard against a future call site forgetting the check.
+//
+// Called from the main loop once the pushed content has actually been
+// decoded/laid out and flipped to the panel (or failed, or -- v11 --
+// discarded whole; see RenderResult::SequenceGap).
+//
+// v10 and earlier clients only ever received this 3 bytes long (no trailing
+// byte at all), and only for an image push -- text pushes were silent. A v10
+// client fed a 4-byte notification triggered by a text push would misparse
+// it, which is exactly why generalizing this past images was a protocol
+// version bump (10 -> 11) in the first place. See
 // docs/companion-display-protocol.md's RENDER_STATUS section.
-void notifyRenderStatus(RenderResult result, uint8_t field);
+void notifyRenderStatus(RenderResult result, uint8_t pushId);
 
 // Answers a pending pairing prompt. Called from the main loop when the user
 // presses CONFIRM/BACK, or when the prompt times out. Writing the peer record
@@ -373,11 +383,23 @@ void resolvePairing(bool accept, bool timedOut = false);
 // field puts a fresh body under a stale headline, which is worse than not
 // committing at all. On Dropped, `data` is nullptr and `len` is 0; `field` and
 // `final` still describe the field that was lost.
+//
+// `pushId` is this field's END byte 2, verbatim -- but it only MEANS anything
+// when `final` is true. A batch is several fields (title, then body, then
+// maybe content-id/tag-state) each with their own END and their own pushId on
+// the wire, yet the batch is answered exactly once, so only the id riding the
+// final-flagged field's END identifies it; the receiver is expected to ignore
+// this value on every non-final call and latch it on the final one. Kept as a
+// plain byte here rather than resolved to "the batch's pushId" inside
+// CompanionBle.cpp because only the receiver (CompanionModeActivity.cpp) knows
+// when a batch actually commits vs. gets discarded/timed-out -- see
+// g_pendingBatchPushId there.
 enum class FieldOutcome : uint8_t {
   Complete,  // fully reassembled; `data`/`len` are the field
   Dropped,   // reassembly failed (v10 CHUNK sequence gap); no data
 };
-using ContentFieldCallback = void (*)(uint8_t field, const uint8_t* data, size_t len, bool final, FieldOutcome outcome);
+using ContentFieldCallback = void (*)(uint8_t field, const uint8_t* data, size_t len, bool final,
+                                      FieldOutcome outcome, uint8_t pushId);
 void setContentFieldCallback(ContentFieldCallback cb);
 
 // Callback for a Status characteristic write from the foreground session: set
@@ -410,9 +432,11 @@ void setForegroundChangeCallback(ForegroundChangeCallback cb);
 // for the activity to hand to CompanionPeerStore::commitImage() so the
 // gallery's sidecar index can record it. The activity decodes on the main loop
 // (never on the host task — decoding touches the framebuffer) and then calls
-// notifyRenderStatus().
+// notifyRenderStatus() with `pushId` (this image's END byte 2, echoed
+// verbatim -- an image push is always a single field, so unlike
+// ContentFieldCallback's pushId there is no "only when final" caveat here).
 using ImageStagedCallback = void (*)(const char* peerKey, const char* path, const uint8_t* contentId,
-                                     size_t contentIdLen);
+                                     size_t contentIdLen, uint8_t pushId);
 void setImageStagedCallback(ImageStagedCallback cb);
 
 }  // namespace companionble

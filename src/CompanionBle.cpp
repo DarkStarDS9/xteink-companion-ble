@@ -676,6 +676,9 @@ struct ImageWorkMsg {
   uint8_t contentId[kMaxContentIdLen] = {0};       // End: session's content-id, copied here
   uint8_t contentIdLen = 0;                        // (host task) before enqueueing so a later
                                                    // session-table reset can't race it
+  uint8_t pushId = 0;                              // End: this transfer's END byte 2, carried
+                                                   // through to the eventual RENDER_STATUS --
+                                                   // see notifyRenderStatus()'s doc comment.
 };
 
 // Sized to smooth over the writer task falling behind briefly (a slow SD
@@ -768,7 +771,7 @@ void imageWriteTaskLoop(void* /*param*/) {
                   static_cast<unsigned>(spanMs > 0 ? (g_writerWriteBusyMs * 100UL / spanMs) : 0));
         }
         if (!g_activeImageFile.isOpen()) {
-          notifyRenderStatus(RenderResult::StorageFailed, kFieldImage);
+          notifyRenderStatus(RenderResult::StorageFailed, msg.pushId);
         } else {
           const uint32_t flushStartMs = millis();
           g_activeImageFile.flush();
@@ -780,7 +783,8 @@ void imageWriteTaskLoop(void* /*param*/) {
           // fixed-size buffers under its own critical section, so calling it
           // from this task rather than the host task is safe.
           if (g_imageStagedCb) {
-            g_imageStagedCb(g_activeImagePeerKey, g_activeImagePath.c_str(), msg.contentId, msg.contentIdLen);
+            g_imageStagedCb(g_activeImagePeerKey, g_activeImagePath.c_str(), msg.contentId, msg.contentIdLen,
+                            msg.pushId);
           }
           g_activeImagePath.clear();  // ownership passes to the activity
         }
@@ -1356,7 +1360,21 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
       }
 
       case kOpEnd: {
-        if (g_activeField == 0 || len < 2 || data[1] != g_activeSession) return;
+        // v11: END grew a required third byte, pushId -- see
+        // docs/companion-display-protocol.md's END framing and
+        // notifyRenderStatus()'s doc comment in CompanionBle.h. A 2-byte END
+        // was the whole wire format through v10; now it is simply malformed,
+        // rejected the same way START's own length guard rejects a too-short
+        // packet above, rather than tolerated as an optional trailing byte --
+        // these are our own client and tooling, so there is no outside caller
+        // to stay compatible with, and carrying an "END might be 2 or 3
+        // bytes" branch forever would be a permanent tax for a distinction
+        // that stopped existing the same day it was introduced.
+        if (len < 3) {
+          LOG_ERR("CBLE", "END packet too short (%u bytes)", static_cast<unsigned>(len));
+          return;
+        }
+        if (g_activeField == 0 || data[1] != g_activeSession) return;
         Session* session = sessionById(g_activeSession);
         if (!session) {
           resetReassembly();
@@ -1364,6 +1382,11 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
         }
         const uint8_t field = g_activeField;
         const uint8_t sessionId = g_activeSession;
+        // Client-chosen, echoed verbatim in the eventual RENDER_STATUS -- the
+        // device never interprets it. Meaningful only when this field is the
+        // final one of its batch (see ContentFieldCallback's doc comment);
+        // pulled out here, once, so every branch below can just use it.
+        const uint8_t pushId = data[2];
 
         switch (field) {
           case kFieldImage: {
@@ -1375,30 +1398,34 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
             logChunkTiming();
             logLastConnParams();
             if (g_activeImageOverflow) {
-              notifyRenderStatus(RenderResult::RejectedSize, kFieldImage);
+              notifyRenderStatus(RenderResult::RejectedSize, pushId);
             } else if (g_activeSeqGap) {
               // Distinct from StorageFailed: the SD path never ran into
               // trouble here, a CHUNK's sequence number skipped ahead of
               // what was expected -- the signature of a dropped Write
               // Without Response packet, not a card write failure.
-              notifyRenderStatus(RenderResult::SequenceGap, kFieldImage);
+              notifyRenderStatus(RenderResult::SequenceGap, pushId);
             } else if (g_activeImageFailed) {
               // The writer task already knows (or will shortly, via the
               // Abort enqueued when the failure happened) that this transfer
               // is dead -- report it here rather than waiting on an End
               // message it may process very late, if ever.
-              notifyRenderStatus(RenderResult::StorageFailed, kFieldImage);
+              notifyRenderStatus(RenderResult::StorageFailed, pushId);
             } else {
               // flush()/close() (and, on an open/write failure the writer
               // task hit earlier, StorageFailed) now happen on the writer
               // task once it drains any CHUNKs still ahead of this message in
-              // the queue -- see "Image write-behind task" above.
+              // the queue -- see "Image write-behind task" above. pushId rides
+              // along on the message so the eventual RENDER_STATUS -- fired
+              // from that task once decode/settle finishes, well after this
+              // handler returns -- can still echo it.
               ImageWorkMsg msg;
               msg.type = ImageWorkType::End;
               memcpy(msg.contentId, session->contentId, sizeof(msg.contentId));
               msg.contentIdLen = session->contentIdLen;
+              msg.pushId = pushId;
               if (!enqueueImageWork(msg, "end")) {
-                notifyRenderStatus(RenderResult::StorageFailed, kFieldImage);
+                notifyRenderStatus(RenderResult::StorageFailed, pushId);
                 enqueueImageAbort();
               }
             }
@@ -1414,7 +1441,7 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
             session->contentIdLen = static_cast<uint8_t>(g_activeWritten);
             memcpy(session->contentId, g_activeBuf.get(), session->contentIdLen);
             if (g_contentCb)
-              g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal, FieldOutcome::Complete);
+              g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal, FieldOutcome::Complete, pushId);
             break;
 
           case kFieldTitle:
@@ -1440,16 +1467,16 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
               LOG_ERR("CBLE", "field 0x%02x dropped: CHUNK sequence gap under Write Without Response", field);
               const uint8_t payload[3] = {kSessFieldSeqGap, sessionId, field};
               notifySession(payload, sizeof(payload));
-              if (g_contentCb) g_contentCb(field, nullptr, 0, g_activeFinal, FieldOutcome::Dropped);
+              if (g_contentCb) g_contentCb(field, nullptr, 0, g_activeFinal, FieldOutcome::Dropped, pushId);
               break;
             }
             if (g_contentCb)
-              g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal, FieldOutcome::Complete);
+              g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal, FieldOutcome::Complete, pushId);
             break;
 
           default:
             if (g_contentCb)
-              g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal, FieldOutcome::Complete);
+              g_contentCb(field, g_activeBuf.get(), g_activeWritten, g_activeFinal, FieldOutcome::Complete, pushId);
             break;
         }
         resetReassembly();
@@ -1832,9 +1859,14 @@ bool notifyButtonEvent(ButtonId button, uint16_t durationTicks, bool isFinal) {
   return g_buttonChar->notify();
 }
 
-void notifyRenderStatus(RenderResult result, uint8_t field) {
+void notifyRenderStatus(RenderResult result, uint8_t pushId) {
+  // pushId 0 is the client's explicit "I don't want an answer" -- see this
+  // function's doc comment in CompanionBle.h. Guarding it here, rather than
+  // trusting every call site to check first, means a future call site can
+  // never regress into notifying on a push nobody asked to hear about.
+  if (pushId == 0) return;
   if (g_foreground == kNoSession) return;
-  const uint8_t payload[4] = {kSessRenderStatus, g_foreground, static_cast<uint8_t>(result), field};
+  const uint8_t payload[4] = {kSessRenderStatus, g_foreground, static_cast<uint8_t>(result), pushId};
   notifySession(payload, sizeof(payload));
 }
 

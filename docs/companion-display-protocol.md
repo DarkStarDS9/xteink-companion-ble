@@ -21,9 +21,15 @@ shape unchanged and made one further breaking change on top of it: the
 title/body fields' `CHUNK`s gain a sequence number and are now pushed over
 Write Without Response, the same treatment the image field got in v9 — see
 "v10 changes from v9" below. v11 widens `IMAGE_STATUS` (renamed
-`RENDER_STATUS`) to also answer a text push, appending a `field` byte to the
-existing 3-byte payload — see "Session characteristic" below and "Version
-history" for why this, too, is a breaking change rather than an addition.
+`RENDER_STATUS`) to also answer a text push, and correlates each answer to the
+push that earned it with a `pushId` the *client* chooses and the device simply
+echoes back — appended as `END`'s new required third byte and returned
+verbatim as `RENDER_STATUS`'s trailing byte. (An earlier shape of this same
+release answered with a `field` byte instead; it was replaced before any
+consumer app had adopted it — see "Version history" for why a `field` byte
+doesn't generalize the way `pushId` does.) See "Session characteristic" and
+"Content characteristic" below, and "Version history" for why this is a
+breaking change rather than an addition.
 
 This document is **authoritative** and is written first on purpose: consumer
 apps are built against it while the firmware side lands. Where the firmware and
@@ -317,7 +323,7 @@ when one app on a shared link is done but the other is still using the device.
 0x85 BACKGROUND     sessionId  reason:1
 0x86 ACQUIRE_DENIED sessionId  reason:1
 0x87 ASSET_ACK      sessionId  assetId:1  result:1  tag[4]
-0x88 RENDER_STATUS  sessionId  result:1  field:1               -- widened in v11
+0x88 RENDER_STATUS  sessionId  result:1  pushId:1              -- widened in v11
 0x89 IMAGE_CHUNK_ACK sessionId seq:2                          -- new in v9
 0x8A FIELD_SEQ_GAP  sessionId  field:1                        -- new in v10
 ```
@@ -354,12 +360,16 @@ RENDER_STATUS result     0x00 DISPLAYED
                                                 reached the panel, so it never rendered. Not an
                                                 error -- see "Superseded pushes" below
 
-RENDER_STATUS field      0x04 the image field (0x04) -- an image push
-                         0x02 the body field (0x02), standing in for a whole
-                              title/body/content-id/tag content batch -- there
-                              is no separate field id for "the batch", and body
-                              is the field a client awaiting render completion
-                              is actually waiting to see
+RENDER_STATUS pushId     Whatever the pushing client sent as END's third byte
+                         for the push this answers (see "Content characteristic"
+                         below) -- the device never interprets this value, only
+                         echoes it back. For a multi-field atomic batch, this is
+                         specifically the pushId from the *final*-flagged
+                         field's END; every other field's pushId is not looked
+                         at, since the batch is answered exactly once. pushId
+                         0 means the pushing client did not want an answer at
+                         all, and the device never sends RENDER_STATUS for a
+                         push whose final END carried 0.
 ```
 
 `IMAGE_CHUNK_ACK` is a progress marker only, sent roughly every 32 CHUNKs
@@ -388,23 +398,35 @@ from what was pushed.
 
 `RENDER_STATUS` — named `IMAGE_STATUS` through v10, when it only ever answered
 an image push; widened in v11 to also answer a title/body/content-id/tag
-content batch, on the same opcode (`0x88`) with one appended `field` byte
-rather than a second opcode. Motivation: a v10 client had no way to know when
-pushed text was actually visible on the panel — the wire transfer for a text
-push completes in ~0.24s, but the panel's own multi-pass grayscale/refresh
-settle takes a further ~2.2s measured on hardware, and only an image push got
-an answer once that settle finished. `RENDER_STATUS` is **strictly a response
-to a push**, never a broadcast about what is on screen. Exactly one arrives
-per pushed field `0x04`, or per committed title/body/content-id/tag batch
-(`field` 0x02), and none at all for a redraw the client did not cause —
-connecting while older content is still displayed, a foreground handover, a
-tag-only redraw, or the user paging the device's local gallery all repaint the
-panel silently. A client may therefore treat the first `RENDER_STATUS` naming
-the field it pushed as that push's answer.
+content batch, on the same opcode (`0x88`) with one appended byte rather than a
+second opcode. Motivation: a v10 client had no way to know when pushed text
+was actually visible on the panel — the wire transfer for a text push
+completes in ~0.24s, but the panel's own multi-pass grayscale/refresh settle
+takes a further ~2.2s measured on hardware, and only an image push got an
+answer once that settle finished. `RENDER_STATUS` is **strictly a response to
+a push**, never a broadcast about what is on screen. Exactly one arrives per
+push that asked for one (a pushed field `0x04`, or a committed
+title/body/content-id/tag batch), and none at all for a redraw the client did
+not cause — connecting while older content is still displayed, a foreground
+handover, a tag-only redraw, or the user paging the device's local gallery all
+repaint the panel silently. A client correlates the answer to the push that
+earned it via `pushId` (see "Content characteristic" below) rather than by
+guessing from field identity.
+
+That appended byte was, for exactly one day of this same v11 release, a
+`field` id (`0x04` for an image push, `0x02` — standing in for "the batch",
+since there is no single field id for one — for a text batch). It was replaced
+before any consumer app had adopted it, because it does not generalize: every
+future push type would need its own field id, and a client juggling two
+outstanding pushes still has to trust the device never answers them out of
+order. `pushId`, chosen by the *pushing client* and simply echoed back,
+generalizes to any future push type for free and lets a client run two pushes
+concurrently (say, an image and a text batch) without the answers being
+distinguishable only by what kind of push they were.
 
 **v10 and earlier clients must not be fed a v11 `RENDER_STATUS`.** A v10
 parser reads this notification as a fixed 3 bytes (`{opcode, sessionId,
-result}`); a text push now also emitting it, plus the appended `field` byte,
+result}`); a text push now also emitting it, plus the appended `pushId` byte,
 both change what a v10 client would observe on the wire for an opcode it
 already knew — which is exactly why this is a protocol version bump (10 → 11),
 not a silent behavior change. See "Version history" below.
@@ -500,7 +522,7 @@ BLE clients can't assume a large MTU (iOS negotiates anywhere from ~185 to
 ~500 bytes; other platforms may negotiate less), so content is sent as a
 sequence of framed packets rather than one write.
 
-### Framing (v6, `CHUNK` amended in v9 for the image field and v10 for title/body)
+### Framing (v6, `CHUNK` amended in v9 for the image field and v10 for title/body; `END` amended in v11)
 
 ```
 START:  byte 0      opcode = 0x01
@@ -520,6 +542,7 @@ CHUNK:  byte 0      opcode = 0x02
 
 END:    byte 0      opcode = 0x03
         byte 1      sessionId
+        byte 2      pushId
 ```
 
 A push of one field is: one `START` declaring the field and its total byte
@@ -529,6 +552,29 @@ title and body), then one `END`. Fields are independent pushes over the same
 characteristic — send one field's full START/CHUNK…/END before starting the
 next. The device does not assume an order beyond "each field is internally
 ordered".
+
+**`END`'s `pushId` (v11, required) is chosen by the client and simply echoed
+back on `RENDER_STATUS` — the device never interprets it.** A 2-byte `END`
+(the only shape that ever existed before v11) is now malformed and rejected
+the same way any other too-short frame on this characteristic is, logged and
+dropped rather than tolerated as an optional trailing byte: these are all
+first-party clients (this repo's own Swift package and Python scripts), so
+there is no outside caller to stay backward-compatible with, and carrying an
+"`END` might be 2 or 3 bytes" branch forever would be a permanent tax for a
+distinction that stopped existing the same day it was introduced. Two rules
+govern the value:
+
+- **`pushId` 0 means "I am not awaiting a `RENDER_STATUS` for this push."** The
+  device never sends one for a push whose relevant `END` (see below) carried
+  0 — arming an answer nobody asked for would just be wasted notification
+  traffic on every push that doesn't care, which in practice is most content
+  pushes and every UI-declaration/icon asset push.
+- **For an atomic multi-field batch (see "Atomic multi-field pushes" below),
+  every field's `END` carries a `pushId`, but only the *final*-flagged
+  field's is retained** — that is the id `RENDER_STATUS` answers the whole
+  batch with. A client sends the same `pushId` on every field of one batch in
+  practice (there is no reason to vary it), but the device does not require
+  that; it simply never looks at a non-final field's value.
 
 **`sessionId` is on every frame, including `CHUNK`.** It costs one byte per
 packet and buys the guarantee that a stray write from a background app can
@@ -674,7 +720,7 @@ should wait for `END`'s round trip (still Write, hence acked) and watch for
 `FIELD_SEQ_GAP` in that window.
 
 **As of v11, a title/body/content-id/tag batch also gets a completion signal:
-`RENDER_STATUS(Displayed, field=0x02)`, once the batch actually reaches the
+`RENDER_STATUS(Displayed, pushId)`, once the batch actually reaches the
 panel** — not merely once the wire transfer finishes. This is the answer to
 "is my last push actually showing yet", not "did my last push land intact"
 (that's still `FIELD_SEQ_GAP`/`END`'s round trip, above). The gap between the
@@ -683,21 +729,24 @@ but the panel's own settle (page layout + e-ink refresh cycle) measured a
 further ~2.2s on hardware. A client that only watched for the wire transfer to
 finish — the only option before v11 — could not tell those apart, and had to
 guess with a fixed delay. If the batch is discarded whole (see "A batch that
-loses a field is discarded whole" above), `RENDER_STATUS(SequenceGap,
-field=0x02)` is sent immediately instead, since no render is ever coming for
-it — see `FIELD_SEQ_GAP` above for the field-level version of the same
-signal.
+loses a field is discarded whole" above), `RENDER_STATUS(SequenceGap, pushId)`
+is sent immediately instead, since no render is ever coming for it — see
+`FIELD_SEQ_GAP` above for the field-level version of the same signal.
+(`pushId` here is the one from the batch's final-flagged field's `END`, per
+"Framing" above — or the device sends nothing at all if that was 0.)
 
 #### Superseded pushes
 
-**The device owes exactly one `RENDER_STATUS` per push, including when that push
-never renders.** A content push selects the text render branch and an image push
-selects the image one, so if a second push arrives before the first has reached
-the panel, the second one's content is what gets drawn and the first one's render
-never happens. The superseded push is answered with
-`RENDER_STATUS(Superseded, field=<the superseded push's field>)` at the moment it
-is overtaken, so a client awaiting it fails fast instead of waiting out its own
-timeout for an answer that was never coming.
+**The device owes exactly one `RENDER_STATUS` per push that asked for one,
+including when that push never renders.** A content push selects the text
+render branch and an image push selects the image one, so if a second push
+arrives before the first has reached the panel, the second one's content is
+what gets drawn and the first one's render never happens. The superseded push
+is answered with `RENDER_STATUS(Superseded, pushId)` — using *its own*
+`pushId`, not the push that overtook it — at the moment it is overtaken, so a
+client awaiting it fails fast instead of waiting out its own timeout for an
+answer that was never coming. (If the superseded push's `pushId` was 0, this
+is simply not sent, same as any other answer to a push that asked for none.)
 
 `Superseded` is **not an error**. Nothing failed and nothing was corrupted — the
 content was simply overtaken by something newer, which is very often exactly what
@@ -1317,37 +1366,55 @@ growth would make `peers.json` unbounded, and it is parsed into RAM.
 
 ### v11 changes from v10 — **breaking**
 
+> **Note on how this section reads.** v11 landed in two steps on the same day,
+> before any consumer app had adopted either shape — so what follows describes
+> only the shape that actually shipped, not the intermediate one. The first
+> pass widened `RENDER_STATUS` with a `field` byte (`0x04` for an image push,
+> `0x02` standing in for a whole title/body/content-id/tag batch). That was
+> replaced, still within v11, by the `pushId` scheme below before any client
+> or script depended on the `field` byte, because a fixed field id does not
+> generalize past "image" and "the one text batch field" the way a
+> client-chosen, device-echoed id does. The version number was **not** bumped
+> a second time for this — see the note at the top of "Status" above.
+
 1. **`IMAGE_STATUS` (`0x88`) is renamed `RENDER_STATUS` and gains a 4th byte,
-   `field`.** Payload goes from `{opcode, sessionId, result}` to `{opcode,
-   sessionId, result, field}`. `field` is `0x04` (image) for an image push or
-   `0x02` (body) for a title/body/content-id/tag content batch — see "Session
-   characteristic" above.
-2. **A title/body/content-id/tag content batch now emits `RENDER_STATUS`
-   (`Displayed`, field `0x02`) once it actually reaches the panel.** Before
-   v11 a text push got no completion signal at all; a client could only guess
-   with a fixed delay. Motivated by SpokenFeeds wanting to hold audio playback
-   until an article's text is visible: measured on hardware, a text push
-   completes on the wire in ~0.24s but the panel's own settle takes a further
-   ~2.2s.
-3. **A content batch discarded whole because one of its fields hit
-   `FIELD_SEQ_GAP` now also emits `RENDER_STATUS(SEQUENCE_GAP, field=0x02)`,**
+   `pushId`.** Payload goes from `{opcode, sessionId, result}` to `{opcode,
+   sessionId, result, pushId}`. `pushId` is whatever the pushing client sent
+   as the third byte of the `END` that triggered this answer — the device
+   never interprets it, only echoes it — see "Session characteristic" and
+   "Content characteristic" above.
+2. **`END` gains a required third byte, `pushId`,** for the same reason: a
+   2-byte `END` (the only shape that ever existed before v11) is now
+   malformed and rejected. `pushId` 0 means "I am not awaiting a
+   `RENDER_STATUS` for this push" and the device never notifies for one. For
+   a multi-field atomic batch, only the *final*-flagged field's `pushId` is
+   retained as the batch's own id — see "Framing" above.
+3. **A title/body/content-id/tag content batch now emits `RENDER_STATUS`
+   (`Displayed`, `pushId`) once it actually reaches the panel.** Before v11 a
+   text push got no completion signal at all; a client could only guess with a
+   fixed delay. Motivated by SpokenFeeds wanting to hold audio playback until
+   an article's text is visible: measured on hardware, a text push completes
+   on the wire in ~0.24s but the panel's own settle takes a further ~2.2s.
+4. **A content batch discarded whole because one of its fields hit
+   `FIELD_SEQ_GAP` now also emits `RENDER_STATUS(SEQUENCE_GAP, pushId)`,**
    immediately rather than leaving the client to wait out its own timeout for
    a render that was never going to happen — see "Atomic multi-field pushes".
-4. **Capability byte 0 bumped from 10 to 11.** No other capability bytes
+5. **Capability byte 0 bumped from 10 to 11.** No other capability bytes
    moved.
 
 Why breaking, not additive: a v10 client parses `IMAGE_STATUS` as a fixed
-3-byte payload and only expects it in response to an image push. Under v11 a
-text push also triggers this opcode, and every occurrence — image or text —
-now carries an extra trailing byte. A v10 client fed either change would
-misparse the notification (reading a byte of the next notification as this
-one's `field`) or misattribute a text push's answer to an image push it never
-made (see `CompanionClient.swift`'s `pendingImageStatus`/`pendingRenderStatus`
-routing, which is exactly the race this field byte exists to prevent). Reusing
-`0x88` rather than adding a second opcode was a deliberate choice: the
-receiver's job — "was this thing on screen" — is identical for both, and a
-second opcode would have meant a second, near-duplicate implementation on both
-sides for no behavioural gain.
+3-byte payload and only expects it in response to an image push, and parses
+`END` as a fixed 2-byte frame. Under v11 a text push also triggers
+`RENDER_STATUS`, every occurrence — image or text — now carries an extra
+trailing byte, and every `END` on the wire carries one more byte than it used
+to. A v10 client (or a v11-`field`-byte client, had one shipped) fed any of
+these changes would misparse the notification, misattribute a text push's
+answer to an image push it never made (see `CompanionClient.swift`'s
+`pendingRenders`, keyed by `pushId` for exactly this reason), or send a
+now-malformed `END`. Reusing `0x88` rather than adding a second opcode was a
+deliberate choice: the receiver's job — "was this thing on screen" — is
+identical for both, and a second opcode would have meant a second,
+near-duplicate implementation on both sides for no behavioural gain.
 
 ### v10 changes from v9 — **breaking**
 
@@ -1606,9 +1673,10 @@ Content and sessions:
 Images:
 
 24. Push an exactly-sized raw packed 2bpp image (see "Image field (`0x04`)"
-    for the byte layout) using only sample values `{0, 1, 2, 3}`: confirm it
-    renders full-screen, the grayscale settle runs, and
-    `RENDER_STATUS(DISPLAYED, field=0x04)` arrives.
+    for the byte layout), with a non-zero `pushId` on `END`, using only sample
+    values `{0, 1, 2, 3}`: confirm it renders full-screen, the grayscale
+    settle runs, and `RENDER_STATUS(DISPLAYED, pushId)` arrives echoing that
+    same id.
 23b. **Bisect the image path with two encoders.** Snap2Ink ships a calibration
     target (eight bands answering "count the distinct greys", "is this band
     striped or flat", "is the border one pixel or two") that bypasses its own
@@ -1621,20 +1689,25 @@ Images:
 24. Confirm the staged file lands under `peers/<peerKey>/data/` and that free
     heap during the transfer stays near its idle value (nothing image-sized was
     allocated).
-25. Push garbage bytes as field `0x04`: `RENDER_STATUS(DECODE_FAILED, field=0x04)`
-    and the previous screen is retained.
+25. Push garbage bytes as field `0x04` with a non-zero `pushId`:
+    `RENDER_STATUS(DECODE_FAILED, pushId)` and the previous screen is retained.
+    Also push one with `pushId` 0 and confirm no `RENDER_STATUS` arrives at
+    all.
 26. Disconnect mid-image: confirm the partial staged file is discarded and the
     device does not try to decode it.
 27. Push an image larger than the advertised max:
-    `RENDER_STATUS(REJECTED_SIZE, field=0x04)`.
+    `RENDER_STATUS(REJECTED_SIZE, pushId)`.
+27b. **(v11)** Send a 2-byte `END` (no `pushId`) on any field: confirm the
+    device logs a rejection and the field is dropped rather than tolerated —
+    see "Framing" above.
 28. Push a body after an image and confirm the screen returns to text.
 28b. With a tag visible, push an image and confirm the chip is drawn over the
     print; hide every tag, re-push, and confirm the print is untouched.
 28c. **(v9)** Push an image over Write Without Response with correctly
     incrementing CHUNK sequence numbers: confirm `IMAGE_CHUNK_ACK` notifies
     roughly every 32 chunks and the transfer still ends in
-    `RENDER_STATUS(DISPLAYED, field=0x04)`. Then push one with a deliberately
-    skipped sequence number: confirm `RENDER_STATUS(SEQUENCE_GAP, field=0x04)`
+    `RENDER_STATUS(DISPLAYED, pushId)`. Then push one with a deliberately
+    skipped sequence number: confirm `RENDER_STATUS(SEQUENCE_GAP, pushId)`
     and that the previous screen is retained, the same as a decode failure.
 28d. **(v10)** Push title+body over Write Without Response with correctly
     incrementing CHUNK sequence numbers: confirm the page renders normally
@@ -1656,15 +1729,20 @@ Images:
     must keep its own tags, not inherit the new one's. Then toggle a single
     tag on its own (a standalone `0x07` push, no title/body) and confirm it
     still applies immediately.
-28g. **(v11)** Push title+body (final-flagged body) and time the gap between
-    `END`'s write completing and `RENDER_STATUS(Displayed, field=0x02)`
-    arriving: expect roughly the ~2.2s settle measured on hardware, not an
+28g. **(v11)** Push title+body (final-flagged body) with a non-zero `pushId`
+    on the final field's `END`, and time the gap between that `END`'s write
+    completing and `RENDER_STATUS(Displayed, pushId)` arriving, confirming the
+    id matches: expect roughly the ~2.2s settle measured on hardware, not an
     immediate reply. While a page is on screen, turn a page locally (a button
     press, no new push) and confirm no `RENDER_STATUS` fires — only a push
-    gets an answer. Then repeat the sequence-gap test from 28d/28e and confirm
-    `RENDER_STATUS(SequenceGap, field=0x02)` arrives immediately (not after the
+    gets an answer. Repeat with `pushId` 0 on the final field and confirm no
+    `RENDER_STATUS` arrives even once the settle finishes. Then repeat the
+    sequence-gap test from 28d/28e (with a non-zero `pushId`) and confirm
+    `RENDER_STATUS(SequenceGap, pushId)` arrives immediately (not after the
     settle) alongside the existing `FIELD_SEQ_GAP`, since the batch never
-    renders at all.
+    renders at all — and confirm the id echoed is the one from the batch's
+    *final*-flagged field's `END`, not an earlier field's, by giving an
+    earlier field a different `pushId`.
 
 Icons and sleep screen:
 

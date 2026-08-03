@@ -127,6 +127,13 @@ char g_pendingImagePath[96] = {0};
 char g_pendingImagePeerKey[companionpeer::kPeerKeyLen] = {0};
 uint8_t g_pendingImageContentId[companionble::kMaxContentIdLen] = {0};
 uint8_t g_pendingImageContentIdLen = 0;
+// This image push's END byte 2, latched here so it survives the hop from the
+// image write-behind task's callback (onImageStaged, below) to loop()'s
+// drain, and from there into handlePendingImage()'s arm. An image push is
+// always a single field, so — unlike the batch pushId below — there is no
+// "only when final" subtlety: whatever pushId rode this transfer's END is
+// the one RENDER_STATUS must echo.
+uint8_t g_pendingImagePushId = 0;
 volatile bool g_pendingImageReady = false;
 
 // Set once a field's END arrives with kFinalFieldFlag set. loop() only applies
@@ -151,15 +158,32 @@ constexpr uint32_t kPendingBatchTimeoutMs = 3000;
 // timeout, or disconnect — so the next batch starts clean.
 volatile bool g_pendingBatchPoisoned = false;
 
+// The pushId of this batch, as chosen by the client. A batch is several
+// fields (title, body, maybe content-id/tag-state), each with its own END and
+// its own pushId on the wire, but the device owes exactly one RENDER_STATUS
+// per batch — so only the id riding the *final*-flagged field's END is kept;
+// every earlier field's pushId is simply not looked at (see
+// ContentFieldCallback's doc comment in CompanionBle.h). Read and cleared
+// alongside g_pendingBatchPoisoned wherever a batch resolves — commit,
+// timeout, discard, or disconnect — so it can never leak into the next batch.
+volatile uint8_t g_pendingBatchPushId = 0;
+
 // Runs on the NimBLE host task — copy into the fixed buffer and set a flag;
 // CompanionModeActivity::loop() (main loop task) does the rest.
-void onContentField(uint8_t field, const uint8_t* data, size_t len, bool final, companionble::FieldOutcome outcome) {
+void onContentField(uint8_t field, const uint8_t* data, size_t len, bool final, companionble::FieldOutcome outcome,
+                    uint8_t pushId) {
   const bool isTextField = field == companionble::kFieldTitle || field == companionble::kFieldBody;
   portENTER_CRITICAL(&g_mux);
   // "Idle" has to include the poison flag, or a batch whose only surviving
   // marker is the poison (first field dropped, nothing buffered yet) would look
   // like a fresh batch to the next field and restart the timeout clock.
   const bool wasIdle = !g_pendingTitleReady && !g_pendingBodyReady && !g_pendingBatchPoisoned;
+  // Only the final-flagged field's END names the batch — see
+  // g_pendingBatchPushId's doc comment above. This still runs on the Dropped
+  // path below: a dropped field's END still carried a real pushId, and a
+  // poisoned batch is answered with it same as a clean one (see loop()'s
+  // discard path).
+  if (final) g_pendingBatchPushId = pushId;
   if (outcome == companionble::FieldOutcome::Dropped) {
     // No data to copy — just poison the batch. The clock still has to start
     // here: if this is the batch's first field and the final flag never
@@ -220,13 +244,15 @@ void onForegroundChange(const char* peerKey, const char* displayName) {
   portEXIT_CRITICAL(&g_mux);
 }
 
-void onImageStaged(const char* peerKey, const char* path, const uint8_t* contentId, size_t contentIdLen) {
+void onImageStaged(const char* peerKey, const char* path, const uint8_t* contentId, size_t contentIdLen,
+                   uint8_t pushId) {
   portENTER_CRITICAL(&g_mux);
   snprintf(g_pendingImagePath, sizeof(g_pendingImagePath), "%s", path ? path : "");
   snprintf(g_pendingImagePeerKey, sizeof(g_pendingImagePeerKey), "%s", peerKey ? peerKey : "");
   const size_t n = contentIdLen > sizeof(g_pendingImageContentId) ? sizeof(g_pendingImageContentId) : contentIdLen;
   if (n > 0) memcpy(g_pendingImageContentId, contentId, n);
   g_pendingImageContentIdLen = static_cast<uint8_t>(n);
+  g_pendingImagePushId = pushId;
   g_pendingImageReady = true;
   portEXIT_CRITICAL(&g_mux);
 }
@@ -320,6 +346,7 @@ void CompanionModeActivity::onExit() {
   g_pendingImageReady = false;
   g_pendingBatchStartMs = 0;
   g_pendingBatchPoisoned = false;
+  g_pendingBatchPushId = 0;
   g_pendingTagStateReady = false;
   g_pendingTagStateInBatch = false;
   portEXIT_CRITICAL(&g_mux);
@@ -776,7 +803,7 @@ void CompanionModeActivity::applyForegroundChange() {
 // push instead of being overwritten by it — see this feature's commit message
 // for why that lives in firmware rather than the phone.
 void CompanionModeActivity::handlePendingImage(const std::string& stagedPath, const std::string& peerKey,
-                                               const uint8_t* contentId, size_t contentIdLen) {
+                                               const uint8_t* contentId, size_t contentIdLen, uint8_t pushId) {
   std::string path = companionpeer::commitImage(peerKey.c_str(), stagedPath, contentId, contentIdLen);
   if (path.empty()) {
     // The gallery move failed (e.g. SD write error); fall back to displaying
@@ -789,13 +816,13 @@ void CompanionModeActivity::handlePendingImage(const std::string& stagedPath, co
   ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(path);
   if (!decoder) {
     LOG_ERR("CMA", "no decoder for staged image %s", path.c_str());
-    companionble::notifyRenderStatus(companionble::RenderResult::DecodeFailed, companionble::kFieldImage);
+    companionble::notifyRenderStatus(companionble::RenderResult::DecodeFailed, pushId);
     return;
   }
   ImageDimensions dims{};
   if (!decoder->getDimensions(path, dims)) {
     LOG_ERR("CMA", "staged image %s did not decode", path.c_str());
-    companionble::notifyRenderStatus(companionble::RenderResult::DecodeFailed, companionble::kFieldImage);
+    companionble::notifyRenderStatus(companionble::RenderResult::DecodeFailed, pushId);
     return;
   }
 
@@ -805,10 +832,13 @@ void CompanionModeActivity::handlePendingImage(const std::string& stagedPath, co
   // task can never observe one without the other. Unconditional: a previous
   // push that never got its answer (link dropped mid-settle) must not stop
   // this one from being answered — but it does get told it lost the screen
-  // first, rather than being silently overwritten.
+  // first, rather than being silently overwritten. renderAwaitingStatus only
+  // ends up true when pushId is non-zero -- see renderAwaitingPushId's doc
+  // comment -- so an image pushed with pushId 0 settles onto the panel with
+  // no RENDER_STATUS traffic at all.
   supersedePendingRenderStatus();
-  renderAwaitingStatus = true;
-  renderAwaitingField = companionble::kFieldImage;
+  renderAwaitingStatus = pushId != 0;
+  renderAwaitingPushId = pushId;
   displayedImagePath = path;
   foregroundPushedImageThisSession = true;
   galleryPickerBrowsing = false;  // a live push always wins over picker browsing
@@ -1077,6 +1107,7 @@ void CompanionModeActivity::loop() {
       g_pendingCommitReady = false;
       g_pendingBatchStartMs = 0;
       g_pendingBatchPoisoned = false;
+      g_pendingBatchPushId = 0;
       // Tag state belonging to the batch the link just killed goes with it —
       // otherwise it would surface on the next loop as if it were a standalone
       // tag push, marking whatever content is still on screen. A genuinely
@@ -1118,6 +1149,7 @@ void CompanionModeActivity::loop() {
   char newImagePeerKey[sizeof(g_pendingImagePeerKey)] = {0};
   uint8_t newImageContentId[sizeof(g_pendingImageContentId)] = {0};
   uint8_t newImageContentIdLen = 0;
+  uint8_t newImagePushId = 0;
 
   portENTER_CRITICAL(&g_mux);
   if (g_pendingTitleReady) {
@@ -1129,6 +1161,14 @@ void CompanionModeActivity::loop() {
     gotBody = true;
   }
   bool poisoned = false;
+  // Only meaningful when commit ends up true, and even then only when the
+  // final-flagged field's END actually arrived (the normal case) rather than
+  // this being the kPendingBatchTimeoutMs safety net below, in which case
+  // g_pendingBatchPushId is still 0 (its cleared-at-rest value) because no
+  // field of this batch was ever final-flagged before the timeout fired --
+  // there is no client-chosen id to answer with, so 0 ("no answer wanted") is
+  // the honest value here, not a bug.
+  uint8_t batchPushId = 0;
   if (g_pendingCommitReady) {
     commit = true;
   } else if ((gotTitle || gotBody || g_pendingBatchPoisoned) && g_pendingBatchStartMs != 0 &&
@@ -1145,11 +1185,13 @@ void CompanionModeActivity::loop() {
   }
   if (commit) {
     poisoned = g_pendingBatchPoisoned;
+    batchPushId = g_pendingBatchPushId;
     g_pendingTitleReady = false;
     g_pendingBodyReady = false;
     g_pendingCommitReady = false;
     g_pendingBatchStartMs = 0;
     g_pendingBatchPoisoned = false;
+    g_pendingBatchPushId = 0;
   }
   if (g_pendingStatusReady) {
     newTagId = g_pendingTagId;
@@ -1181,6 +1223,7 @@ void CompanionModeActivity::loop() {
     memcpy(newImagePeerKey, g_pendingImagePeerKey, sizeof(newImagePeerKey));
     memcpy(newImageContentId, g_pendingImageContentId, sizeof(newImageContentId));
     newImageContentIdLen = g_pendingImageContentIdLen;
+    newImagePushId = g_pendingImagePushId;
     g_pendingImageReady = false;
     gotImage = true;
   }
@@ -1213,8 +1256,11 @@ void CompanionModeActivity::loop() {
     // FIELD_SEQ_GAP. This bypasses renderAwaitingStatus entirely (nothing was
     // armed for this batch — the arm only happens once a commit is about to
     // render, below) so it cannot race or double-answer a render that does
-    // happen to land.
-    companionble::notifyRenderStatus(companionble::RenderResult::SequenceGap, companionble::kFieldBody);
+    // happen to land. batchPushId is the id from the batch's own final-flagged
+    // field (or 0 if the client asked for no answer, or if the timeout safety
+    // net above fired before any field was ever final-flagged) --
+    // notifyRenderStatus() itself no-ops on 0.
+    companionble::notifyRenderStatus(companionble::RenderResult::SequenceGap, batchPushId);
   }
 
   if (gotPairing) {
@@ -1233,7 +1279,7 @@ void CompanionModeActivity::loop() {
   }
 
   if (gotImage) {
-    handlePendingImage(newImagePath, newImagePeerKey, newImageContentId, newImageContentIdLen);
+    handlePendingImage(newImagePath, newImagePeerKey, newImageContentId, newImageContentIdLen, newImagePushId);
   }
 
   if (commit && (gotTitle || gotBody)) {
@@ -1248,10 +1294,15 @@ void CompanionModeActivity::loop() {
     // Consumed exactly once, from render()'s Screen::Text case, once the panel
     // actually shows this batch -- see notifyRenderPushResult(). Any push still
     // awaiting an answer here is told it was superseded before this one arms,
-    // rather than being silently overwritten.
+    // rather than being silently overwritten. supersede runs regardless of
+    // whether *this* push wants an answer -- the previous one's expectation
+    // still has to be resolved, since this push is taking the screen either
+    // way -- but the arm itself only actually fires RENDER_STATUS traffic
+    // later if batchPushId is non-zero (renderAwaitingStatus false otherwise;
+    // notifyRenderPushResult() no-ops when it is).
     supersedePendingRenderStatus();
-    renderAwaitingStatus = true;
-    renderAwaitingField = companionble::kFieldBody;
+    renderAwaitingStatus = batchPushId != 0;
+    renderAwaitingPushId = batchPushId;
     if (gotTitle) {
       title = newTitle;
       updateTitleLayout();
@@ -1826,15 +1877,17 @@ void CompanionModeActivity::renderPreSleepScreen() {
 void CompanionModeActivity::notifyRenderPushResult(companionble::RenderResult result) {
   if (!renderAwaitingStatus) return;
   renderAwaitingStatus = false;
-  companionble::notifyRenderStatus(result, renderAwaitingField);
+  companionble::notifyRenderStatus(result, renderAwaitingPushId);
 }
 
 // Both arm sites (handlePendingImage() and loop()'s content-commit block) set
-// renderAwaitingField unconditionally, and each also sets `screen` — so the
-// push that lands second decides which branch render() takes, and the first
-// one's render never happens at all. The expectation it armed was previously
-// just overwritten, leaving its caller to wait out the full client-side
-// timeout for an answer the device already knew would never come.
+// renderAwaitingPushId unconditionally (whether or not the push that just
+// landed wants an answer -- see each site's own comment) and each also sets
+// `screen` — so the push that lands second decides which branch render()
+// takes, and the first one's render never happens at all. The expectation it
+// armed was previously just overwritten, leaving its caller to wait out the
+// full client-side timeout for an answer the device already knew would never
+// come.
 //
 // How narrow is this? Narrower than it first looks, and NOT reproduced on
 // hardware. push(awaitRender: false) releases the client's command gate when

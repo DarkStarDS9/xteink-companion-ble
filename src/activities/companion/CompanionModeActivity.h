@@ -105,18 +105,21 @@ class CompanionModeActivity final : public Activity {
   // or content) is ever rendering at a time — the two screens are mutually
   // exclusive (see loop()'s "text replaces an image, and vice versa") — so
   // there is never a moment where two renders could both be legitimately
-  // awaiting an answer. `renderAwaitingField` records which field's push this
-  // is, so the eventual RENDER_STATUS names the right one.
+  // awaiting an answer. `renderAwaitingPushId` records which push this is, so
+  // the eventual RENDER_STATUS names the right one.
   //
   // Set under RenderLock in handlePendingImage() (image) or loop()'s content
   // commit block (text), consumed exactly once by notifyRenderPushResult(),
   // and cleared on disconnect so an abandoned push cannot leak a status onto
-  // an unrelated later redraw.
+  // an unrelated later redraw. Only ever set true when the push's pushId is
+  // non-zero — see both arm sites' comments — so a client that did not ask
+  // for an answer (pushId 0) never causes RENDER_STATUS traffic at all.
   bool renderAwaitingStatus = false;
-  // kFieldImage or kFieldBody — see renderAwaitingStatus above and
-  // notifyRenderStatus()'s doc comment in CompanionBle.h for why kFieldBody
-  // stands in for the whole title/body/content-id/tag batch.
-  uint8_t renderAwaitingField = 0;
+  // The pushId this armed expectation must echo — see notifyRenderStatus()'s
+  // doc comment in CompanionBle.h. Replaced the v11-launch-day `field` byte
+  // (kFieldImage/kFieldBody) with the pushing client's own chosen id: exact
+  // correlation, and a future push type costs nothing here.
+  uint8_t renderAwaitingPushId = 0;
 
   // Firmware-local browsing of the foreground peer's previously pushed images
   // (CompanionPeerStore's bounded per-peer gallery, kMaxImagesPerPeer entries,
@@ -225,7 +228,7 @@ class CompanionModeActivity final : public Activity {
   bool handleMappedButton(MappedInputManager::Button role, companionble::ButtonId id);
   void applyForegroundChange();
   void handlePendingImage(const std::string& stagedPath, const std::string& peerKey, const uint8_t* contentId,
-                          size_t contentIdLen);
+                          size_t contentIdLen, uint8_t pushId);
   void refreshGalleryForForeground();
   void loadGalleryForPeer(const std::string& peerKey);
   bool handleGalleryNav();
@@ -261,7 +264,7 @@ class CompanionModeActivity final : public Activity {
   void notifyRenderPushResult(companionble::RenderResult result);
   // Answers a still-armed render expectation with RenderResult::Superseded and
   // disarms it, so a new push can arm its own. Call immediately before arming,
-  // from every site that arms — both arm sites overwrite renderAwaitingField
+  // from every site that arms — both arm sites overwrite renderAwaitingPushId
   // unconditionally, and whichever push lands second also sets `screen`, so the
   // first one's render never runs and its caller would otherwise wait out its
   // whole timeout for an answer that was never coming. No-op when nothing is
