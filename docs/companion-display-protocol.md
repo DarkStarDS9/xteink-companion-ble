@@ -1602,14 +1602,24 @@ READ_LATER) and added the Status characteristic.
   implementing discovery, the handshake, token/appId/installId persistence,
   ACQUIRE/RELEASE, asset digest compare-and-push, the framer, and button-event
   decoding. Shared by this fork's consumer apps; see its `README.md`.
-- **Python client**: `scripts/push_companion_content.py` pushes title/body/
-  content-id, a UI declaration, an icon and an image over BLE straight from a dev
-  machine (`bleak`, see `scripts/requirements.txt`). Run with `--help`. It
-  implements the exact framing above and is the fastest way to exercise the
-  firmware without an app.
-- No firmware-side automated tests exist — this project has no on-target test
-  harness. CompanionKit's framer and handshake codec have `swift test` unit
-  tests; everything on-device is verified by the checklist below.
+- **Python client**: `scripts/companion_protocol.py` is the single Python
+  implementation of everything above — UUIDs, opcodes, field ids, the
+  notification decoder, capability parsing, the handshake, token persistence
+  and the START/CHUNK/END framer. `scripts/push_companion_content.py` (pushes
+  title/body/content-id, a UI declaration, an icon and an image straight from a
+  dev machine — run with `--help`) and `scripts/companion_e2e_test.py` both
+  import it and carry no wire format of their own. Needs `bleak`; see
+  `scripts/requirements.txt`. A protocol change has exactly one Python site to
+  edit, which is deliberate: the two scripts used to carry a copy each, and one
+  of them silently froze at v6 for five protocol versions.
+- **On-target test harness**: `scripts/companion_e2e_test.py` drives BLE and
+  injected button presses together against a `[env:test]` build and asserts on
+  enrollment, reconnect, `ACQUIRE` gating, atomic content batches and their
+  `RENDER_STATUS`, both sequence-gap paths, tags, preemption between two apps on
+  one link, and a full-screen image push diffed pixel-for-pixel against
+  `CMD:SCREENSHOT`. See `docs/companion-test-console.md`. CompanionKit's framer
+  and handshake codec additionally have `swift test` unit tests; the rest of
+  what runs on-device is verified by the checklist below.
 
 ## Manual verification checklist (on hardware)
 

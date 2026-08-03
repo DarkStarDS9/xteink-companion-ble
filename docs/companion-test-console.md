@@ -18,12 +18,13 @@ user should be running:
 pio run -t upload --upload-port /dev/cu.usbmodem21201
 ```
 
-> **Status: the console itself is verified on hardware; the harness is not.**
-> Every command below has been exercised on a real X3 over USB serial. The
-> end-to-end harness that uses them alongside BLE has **never run**, because
-> macOS refuses Bluetooth to the automation process. Running it is the single
-> highest-value thing anyone can do to this repository right now — see "The
-> harness" at the end.
+> **Status: both the console and the harness are verified on hardware.**
+> Every command below has been exercised on a real X3 over USB serial, and as
+> of protocol v11 `scripts/companion_e2e_test.py` runs green against a
+> `[env:test]` build — 66 assertions, 0 failures — driving BLE and injected
+> button presses at the same time. The macOS Bluetooth-permission problem
+> described under "The harness" is still real and is still what decides whether
+> it can run at all; see "Run it from a real terminal, not tmux".
 
 ## Why it exists
 
@@ -133,9 +134,19 @@ actually drew something rather than trusting a state string.
 `scripts/companion_e2e_test.py` drives all of the above alongside BLE. See its
 `--help`; it needs `bleak` and `pyserial`, and covers first-contact enrollment
 with the on-device confirm, token-based silent reconnect, `ACQUIRE` denial for a
-peer with no UI declaration, a held-button round trip, tags (atomic, state-only,
-and undeclared-id rejection), preemption between two simulated apps on one link,
-and an image push.
+peer with no UI declaration, an atomic content batch and the
+`RENDER_STATUS(Displayed, pushId)` that answers it (including that `pushId` 0 is
+answered with silence), both sequence-gap paths — a text batch that loses a
+field must be discarded whole, not half-applied — a held-button round trip, tags
+(atomic, state-only, and undeclared-id rejection), preemption between two
+simulated apps on one link, and an image push checked pixel-for-pixel against
+`CMD:SCREENSHOT`.
+
+It carries no wire format of its own: that lives in
+`scripts/companion_protocol.py`, shared with `scripts/push_companion_content.py`.
+Keep it that way. The duplicate copy this harness used to carry froze at v6
+while the pusher was kept current, and the harness then refused to start for
+five consecutive protocol versions without anyone noticing.
 
 ```bash
 pio run -e test -t upload --upload-port /dev/cu.usbmodem21201
@@ -154,5 +165,19 @@ Open Terminal.app or iTerm directly and run it there, where macOS will prompt.
 An Apple-signed interpreter (`/usr/bin/python3`) prompts more reliably than a
 Homebrew build. The script runs on Python 3.9 upward.
 
-This is why the harness has never been executed: everything in it is written and
-build-verified, and none of it has run.
+This is what kept the harness from being executed for so long. It has since run
+green on hardware from a shell with Bluetooth access; if yours is refused, that
+is this permission problem and not the harness.
+
+### One process, one serial port
+
+The harness holds `--port` for its whole run. Leave a serial monitor (or a
+second copy of the harness) attached and it will fail at `CMD:CPING` and tell
+you to reflash a build it is already talking to.
+
+`CMD:SCREENSHOT`'s dump is not exclusive against the device's own logging:
+anything that logs while the framebuffer is streaming lands *inside* the dump
+and shifts every byte after it. The harness detects that (the bytes between the
+header and the footer no longer match the declared size) and retries rather
+than diffing a shifted framebuffer, but a device logging heavily can make the
+screenshot checks fail for reasons that have nothing to do with what was drawn.

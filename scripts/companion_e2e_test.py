@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
-End-to-end test harness for Companion Display Protocol v6, on real hardware.
+End-to-end test harness for Companion Display Protocol v11, on real hardware.
 
 Drives both halves of the device at once: BLE over the host's own radio, and
 physical buttons over USB serial. That combination is what makes v6's most
 important path testable at all — enrollment needs a CONFIRM press on the device,
 which a BLE script cannot produce on its own.
+
+The wire format lives in scripts/companion_protocol.py, shared with
+scripts/push_companion_content.py. It used to be duplicated here, and the copy
+froze at v6 while the pusher was kept current — this harness then refused to
+start for five consecutive protocol versions ("Device speaks protocol v11, this
+harness speaks v6") without anyone noticing, because it failed fast and quietly.
+Do not reintroduce a local copy of any opcode, field id or frame layout.
 
 Requires a firmware built with the serial test console:
 
@@ -26,25 +33,43 @@ Covered:
   enrollment   first contact, on-device confirm, token issued
   reconnect    stored token, silent reconnect, asset digests reported
   buttonmap    ACQUIRE denied with no declaration; accepted after pushing one
-  content      atomic title+body+content-id, then a held button round trip
+  content      atomic title+body+content-id, v11 RENDER_STATUS, held button round trip
+  seqgap       v10/v11: a batch that loses a field is discarded whole and answered
   preemption   two sessions on one link, last-requester-wins, in-flight discard
-  image        raw packed 2bpp full-screen push and the device's decode verdict
+  image        raw packed 2bpp full-screen push, chunk acks, and the decode verdict
   tags         app-declared tags: atomic with content, and state-only writes
+
+A note on write types. v9/v10 moved image and title/body CHUNKs to Write
+Without Response for throughput, and the sequence numbers this harness sends
+exist because of that. This harness splits the difference: title/body go over
+Write Without Response, the image does not.
+
+That is not fence-sitting, it is what the device's own 3 s batch-commit
+timeout forces. Measured here, a title+body+content-id batch pushed entirely
+with response took 11 s on the wire — the device gave up waiting for the
+final-flagged field, applied what it had, and logged
+"content batch commit flag missed after 3000 ms". Write Without Response is
+what makes a text batch fit inside its own commit window, which is precisely
+the problem v10 existed to fix. The image stays on Write because bleak has no
+cross-platform equivalent of CoreBluetooth's canSendWriteWithoutResponse flow
+control: a couple of hundred unthrottled WWR writes would drop some of their
+own chunks and turn the image scenario into a coin flip, while a handful for
+text does not. The device parses the sequence number regardless of which ATT
+write type carried the CHUNK (the protocol calls WWR "recommended, not
+enforced at the GATT level"), so the image's wire format is exercised either
+way — and both sequence-gap paths are provoked deliberately below rather than
+being waited for.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
-import os
 import queue
-import struct
 import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
 
 try:
     import serial
@@ -53,60 +78,42 @@ except ImportError:
 
 from bleak import BleakClient, BleakScanner
 
-SERVICE_UUID = "7c9c0000-3e4a-4b1a-9c1e-6d8a1f2b0001"
-CONTENT_CHAR_UUID = "7c9c0001-3e4a-4b1a-9c1e-6d8a1f2b0001"
-BUTTON_CHAR_UUID = "7c9c0002-3e4a-4b1a-9c1e-6d8a1f2b0001"
-CAPABILITY_CHAR_UUID = "7c9c0003-3e4a-4b1a-9c1e-6d8a1f2b0001"
-STATUS_CHAR_UUID = "7c9c0004-3e4a-4b1a-9c1e-6d8a1f2b0001"
-SESSION_CHAR_UUID = "7c9c0005-3e4a-4b1a-9c1e-6d8a1f2b0001"
-
-OP_START, OP_CHUNK, OP_END = 0x01, 0x02, 0x03
-FIELD_TITLE, FIELD_BODY, FIELD_CONTENT_ID = 0x01, 0x02, 0x03
-FIELD_IMAGE, FIELD_UI_DECL, FIELD_ICON, FIELD_TAG_STATE = 0x04, 0x05, 0x06, 0x07
-FINAL_FLAG = 0x80
-
-SESS_HELLO, SESS_BYE, SESS_ACQUIRE, SESS_RELEASE = 0x01, 0x02, 0x03, 0x04
-SESS_HELLO_OK, SESS_HELLO_PENDING, SESS_HELLO_DENIED = 0x81, 0x82, 0x83
-SESS_FOREGROUND, SESS_BACKGROUND, SESS_ACQUIRE_DENIED = 0x84, 0x85, 0x86
-SESS_ASSET_ACK, SESS_IMAGE_STATUS = 0x87, 0x88
-
-BTN_BACK, BTN_CONFIRM, BTN_LEFT, BTN_RIGHT, BTN_UP, BTN_DOWN = range(6)
-ROUTING_NONE, ROUTING_REMOTE, ROUTING_PAGE_PREV, ROUTING_PAGE_NEXT, ROUTING_SLEEP = range(5)
-
-CHUNK_PAYLOAD = 176
+from companion_protocol import (
+    BTN_BACK,
+    BTN_CONFIRM,
+    BTN_LEFT,
+    BTN_RIGHT,
+    CAPABILITY_CHAR_UUID,
+    FIELD_BODY,
+    FIELD_CONTENT_ID,
+    FIELD_IMAGE,
+    FIELD_TAG_STATE,
+    FIELD_TITLE,
+    FIELD_UI_DECL,
+    PROTOCOL_VERSION,
+    RENDER_DISPLAYED,
+    RENDER_SEQUENCE_GAP,
+    RENDER_RESULTS,
+    ROUTING_PAGE_NEXT,
+    ROUTING_PAGE_PREV,
+    ROUTING_REMOTE,
+    SERVICE_UUID,
+    SESS_RENDER_STATUS,
+    Link,
+    Session,
+    encode_tag_state,
+    encode_ui_declaration,
+    pack_2bpp,
+    parse_capabilities,
+    raw_image_length,
+)
 
 # Two distinct simulated apps, so the preemption test exercises the case that
 # actually motivated v6: two apps sharing one phone's single BLE link.
 APP_A = uuid.UUID("2f1d7b64-9c3e-4a55-8f21-0c7b5e9a3d10").bytes
 APP_B = uuid.UUID("7ac41e08-5d62-4f1b-9e33-1b8c4d2f60a5").bytes
 
-
-def asset_tag(body: bytes) -> bytes:
-    tag = hashlib.sha256(body).digest()[:4]
-    return b"\x00\x00\x00\x01" if tag == b"\x00\x00\x00\x00" else tag
-
-
-def encode_ui_declaration(entries, tags=()) -> bytes:
-    body = bytes([len(entries)])
-    for button, routing, label in entries:
-        encoded = label.encode("utf-8")
-        body += bytes([button, routing, len(encoded)]) + encoded
-    body += bytes([len(tags)])
-    for tag_id, label in tags:
-        encoded = label.encode("utf-8")[:12]
-        body += bytes([tag_id, len(encoded)]) + encoded
-    return asset_tag(body) + body
-
-
-def encode_tag_state(states) -> bytes:
-    out = bytes([len(states)])
-    for tag_id, state in states:
-        out += bytes([tag_id, state])
-    return out
-
-
 DEFAULT_TAGS = [(0, "Saved"), (1, "New")]
-
 
 DEFAULT_MAP = [
     (BTN_LEFT, ROUTING_PAGE_PREV, "<"),
@@ -242,6 +249,25 @@ class Console:
                 peers.append(entry)
         return peers
 
+    def await_peers(self, minimum: int = 1, timeout: float = 12.0) -> list[dict]:
+        """Polls CPEERS until at least `minimum` peers are reported.
+
+        Same reason await_screen() polls: the console answers on the device's
+        main loop, which an in-flight full-screen e-ink refresh (exactly what
+        confirming a pairing prompt kicks off) can hold for several seconds.
+        A single CPEERS right after HELLO_OK sometimes times out waiting for a
+        reply that was only ever late, which reads as "the peer was never
+        enrolled".
+        """
+        deadline = time.time() + timeout
+        peers: list[dict] = []
+        while time.time() < deadline:
+            peers = self.peers()
+            if len(peers) >= minimum:
+                return peers
+            time.sleep(0.5)
+        return peers
+
     def tags(self) -> dict:
         """Live tag state, keyed by id. The only way to confirm a write-without-response landed."""
         out = {}
@@ -265,7 +291,29 @@ class Console:
         self.send("CRESET", expect="reset")
         time.sleep(0.5)
 
-    def screenshot(self, timeout: float = 35.0) -> bytes:
+    def screenshot(self, timeout: float = 35.0, attempts: int = 3) -> bytes:
+        """CMD:SCREENSHOT, retried if the dump came back polluted.
+
+        The dump is not exclusive against the device's own logging: anything
+        that logs while main.cpp is streaming the framebuffer (a BLE task, the
+        render path) writes into the same serial stream and lands *inside* the
+        payload, shifting every byte after it. That is detectable — the bytes
+        between the header and the footer no longer match the declared size —
+        but not repairable from this side, so retry and hope for a quiet
+        moment. If every attempt is polluted, the last error stands and the
+        caller reports a failure: a silently-shifted framebuffer would fail the
+        pixel diff anyway, with a far more confusing message.
+        """
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                return self._screenshot_once(timeout)
+            except ValueError as exc:
+                last_error = exc
+                time.sleep(1.0)
+        raise last_error  # type: ignore[misc]
+
+    def _screenshot_once(self, timeout: float = 35.0) -> bytes:
         """Issues CMD:SCREENSHOT and returns the raw framebuffer bytes.
 
         The device's response isn't a CT:-prefixed line like every other
@@ -308,190 +356,36 @@ class Console:
                 raise ValueError(f"expected SCREENSHOT_START:<size>, got {header_line!r}")
             size = int(header_line.split(":", 1)[1])
 
+            # Read to the footer rather than to a byte count. The count is what
+            # the device *meant* to send; the footer is the only thing that
+            # says it finished, and the difference between the two is exactly
+            # how a log line that interleaved into the dump shows up.
+            marker = b"SCREENSHOT_END"
             data = bytearray()
-            while len(data) < size and time.time() < deadline:
-                chunk = self.serial.read(size - len(data))
+            while time.time() < deadline:
+                chunk = self.serial.read(4096)
                 if chunk:
                     data.extend(chunk)
-            if len(data) < size:
-                raise TimeoutError(f"screenshot truncated: got {len(data)} of {size} bytes before timeout")
-
-            # Confirm the trailing marker actually arrived rather than assuming
-            # the byte count alone means the dump completed cleanly -- a host that
-            # falls behind mid-dump is exactly the case the firmware's own 30s
-            # send-side timeout guards against, and a truncated/garbled footer is
-            # the tell for it.
-            footer_line = ""
-            while time.time() < deadline:
-                raw = self.serial.readline()
-                if raw:
-                    footer_line = raw.decode("ascii", "replace").strip()
-                    if footer_line:
+                    if marker in data:
                         break
-            if footer_line != "SCREENSHOT_END":
-                raise ValueError(f"expected SCREENSHOT_END after {len(data)} bytes, got {footer_line!r}")
+            if marker not in data:
+                raise TimeoutError(
+                    f"screenshot truncated: {len(data)} bytes and no SCREENSHOT_END before timeout "
+                    f"(device declared {size})"
+                )
 
-            return bytes(data)
+            # Searched for, not required to be the last thing on the wire: the
+            # device keeps logging, so a DBG line lands after the footer as
+            # readily as inside the dump.
+            payload = bytes(data[: data.index(marker)])
+            if len(payload) != size:
+                raise ValueError(
+                    f"screenshot polluted: {len(payload)} bytes between header and footer, device "
+                    f"declared {size} — something logged into the serial stream mid-dump"
+                )
+            return payload
         finally:
             self._reader_paused.clear()
-
-
-# --------------------------------------------------------------------------- #
-# BLE side: one simulated app
-# --------------------------------------------------------------------------- #
-
-
-@dataclass
-class Peer:
-    """One simulated phone app sharing the link."""
-
-    name: str
-    app_id: bytes
-    install_id: bytes = field(default_factory=lambda: os.urandom(16))
-    token: bytes | None = None
-    session_id: int = 0
-    asset_tags: dict = field(default_factory=dict)
-
-
-class Link:
-    """One BLE connection, carrying one or more simulated apps."""
-
-    def __init__(self, client: BleakClient, caps: dict):
-        self.client = client
-        self.caps = caps
-        self.loop = asyncio.get_running_loop()
-        self.pending: dict[str, asyncio.Future] = {}
-        self.hello_tags: dict[int, str] = {}
-        self.button_events: list[tuple] = []
-        self.notifications: list[tuple] = []
-
-    # -- notification routing ---------------------------------------------- #
-
-    def on_session(self, _sender, data: bytearray) -> None:
-        opcode = data[0]
-        self.notifications.append((opcode, bytes(data)))
-
-        if opcode in (SESS_HELLO_OK, SESS_HELLO_PENDING, SESS_HELLO_DENIED):
-            tag = struct.unpack_from("<H", data, 1)[0]
-            key = self.hello_tags.get(tag)
-            if key is None:
-                return  # another app's handshake
-            if opcode == SESS_HELLO_PENDING:
-                self._resolve(f"pending:{key}", True)
-            else:
-                self._resolve(f"hello:{key}", bytes(data))
-            return
-
-        if opcode == SESS_FOREGROUND:
-            self._resolve(f"acquire:{data[1]}", ("foreground", data[1]))
-        elif opcode == SESS_ACQUIRE_DENIED:
-            self._resolve(f"acquire:{data[1]}", ("denied", data[2]))
-        elif opcode == SESS_BACKGROUND:
-            self._resolve(f"background:{data[1]}", data[2])
-        elif opcode == SESS_ASSET_ACK:
-            self._resolve(f"asset:{data[1]}:{data[2]}", (data[3], bytes(data[4:8])))
-        elif opcode == SESS_IMAGE_STATUS:
-            # data[3] is the pushId the device echoes back (v11; briefly a
-            # `field` byte before that, replaced the same day it landed).
-            # Ignored here: this harness never has two image pushes
-            # outstanding on the same session at once, so keying the future
-            # on session id alone (as this already does) cannot misroute one
-            # push's answer to another's waiter.
-            self._resolve(f"image:{data[1]}", data[2])
-
-    def on_button(self, _sender, data: bytearray) -> None:
-        if len(data) < 4:
-            return
-        self.button_events.append(
-            (data[0], data[1] & 0x0F, bool(data[1] & 0x80), struct.unpack_from("<H", data, 2)[0], bytes(data[4:]))
-        )
-
-    def _resolve(self, key: str, value) -> None:
-        future = self.pending.get(key)
-        if future and not future.done():
-            self.loop.call_soon_threadsafe(future.set_result, value)
-
-    def expect(self, key: str) -> asyncio.Future:
-        future = self.loop.create_future()
-        self.pending[key] = future
-        return future
-
-    # -- operations --------------------------------------------------------- #
-
-    async def hello(self, peer: Peer, timeout: float = 40.0):
-        tag = int.from_bytes(os.urandom(2), "little") or 1
-        self.hello_tags[tag] = peer.name
-        hello_future = self.expect(f"hello:{peer.name}")
-        pending_future = self.expect(f"pending:{peer.name}")
-
-        payload = bytes([SESS_HELLO]) + struct.pack("<H", tag) + peer.app_id + peer.install_id
-        payload += bytes([len(peer.token) if peer.token else 0]) + (peer.token or b"")
-        encoded = peer.name.encode("utf-8")[:24]
-        payload += bytes([len(encoded)]) + encoded
-        await self.client.write_gatt_char(SESSION_CHAR_UUID, payload, response=True)
-        return hello_future, pending_future
-
-    @staticmethod
-    def parse_hello_ok(data: bytes):
-        session_id = data[3]
-        token = data[4:20]
-        tags = {}
-        for i in range(data[20]):
-            offset = 21 + i * 5
-            tags[data[offset]] = data[offset + 1 : offset + 5]
-        return session_id, token, tags
-
-    async def acquire(self, peer: Peer, timeout: float = 10.0):
-        future = self.expect(f"acquire:{peer.session_id}")
-        await self.client.write_gatt_char(
-            SESSION_CHAR_UUID, bytes([SESS_ACQUIRE, peer.session_id]), response=True
-        )
-        return await asyncio.wait_for(future, timeout=timeout)
-
-    async def push_field(
-        self, peer: Peer, field_id: int, data: bytes, final: bool = False, push_id: int = 0
-    ) -> None:
-        start = bytes([OP_START, field_id | (FINAL_FLAG if final else 0), peer.session_id])
-        start += struct.pack("<I", len(data))
-        await self.client.write_gatt_char(CONTENT_CHAR_UUID, start, response=True)
-        for offset in range(0, len(data), CHUNK_PAYLOAD):
-            await self.client.write_gatt_char(
-                CONTENT_CHAR_UUID,
-                bytes([OP_CHUNK, peer.session_id]) + data[offset : offset + CHUNK_PAYLOAD],
-                response=True,
-            )
-        # v11: END grew a required third byte, pushId, echoed back on the
-        # eventual RENDER_STATUS -- see docs/companion-display-protocol.md's
-        # END framing. 0 ("don't answer") is right for every push_field() call
-        # in this harness except push_image()'s: none of the title/body/
-        # content-id/tag-state/asset pushes above ever await a render (the
-        # "content" and "tags" sections below assert on serial state instead),
-        # so there is nothing here that would ever look at a RENDER_STATUS for
-        # them.
-        await self.client.write_gatt_char(
-            CONTENT_CHAR_UUID, bytes([OP_END, peer.session_id, push_id & 0xFF]), response=True
-        )
-
-    async def push_asset(self, peer: Peer, field_id: int, payload: bytes, timeout: float = 15.0):
-        future = self.expect(f"asset:{peer.session_id}:{field_id}")
-        await self.push_field(peer, field_id, payload)
-        return await asyncio.wait_for(future, timeout=timeout)
-
-    async def push_image(self, peer: Peer, raw: bytes, timeout: float = 180.0):
-        future = self.expect(f"image:{peer.session_id}")
-        # push_id=1: the only push_field() call in this file that actually
-        # awaits a RENDER_STATUS (see on_session's SESS_IMAGE_STATUS branch),
-        # so it needs a non-zero id or the device would never notify and this
-        # would just burn its full timeout. Any non-zero constant would do --
-        # this harness never has two image pushes outstanding on the same
-        # session at once, so there is no second id to collide with.
-        await self.push_field(peer, FIELD_IMAGE, raw, final=True, push_id=1)
-        return await asyncio.wait_for(future, timeout=timeout)
-
-    async def set_tag(self, peer: Peer, tag_id: int, state: int) -> None:
-        await self.client.write_gatt_char(
-            STATUS_CHAR_UUID, bytes([peer.session_id, tag_id, state]), response=True
-        )
 
 
 # --------------------------------------------------------------------------- #
@@ -502,24 +396,22 @@ class Link:
 def make_test_raw_image(width: int, height: int) -> bytes:
     """A raw packed 2bpp ordered-dither gradient, in field 0x04's wire format.
 
-    No header, no compression: bytesPerRow = ceil(width/4) bytes, 4 samples per
-    byte, MSB-first (sample 0 in bits 7-6), rows top to bottom. Value 0..3 is
-    the final display level directly -- 0 black, 3 white -- with no further
-    gray-level math on the device side. See docs/companion-display-protocol.md
-    "Image field (0x04)" for the authoritative spec.
+    The packing itself is companion_protocol.pack_2bpp() -- no header, no
+    compression, bytesPerRow = ceil(width/4), 4 samples per byte, MSB-first.
+    Value 0..3 is the final display level directly (0 black, 3 white) with no
+    further gray-level math on the device side. See
+    docs/companion-display-protocol.md "Image field (0x04)" for the spec.
     """
     bayer = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]]
-    row_bytes = (width + 3) // 4
-    out = bytearray(row_bytes * height)
+    levels = bytearray(width * height)
     for y in range(height):
-        row = memoryview(out)[y * row_bytes : (y + 1) * row_bytes]
+        row = bayer[y % 4]
+        base = y * width
         for x in range(width):
             intensity = (x * 255) // max(1, width - 1)
-            threshold = (bayer[y % 4][x % 4] * 255) // 16
-            level = min(3, (intensity * 4 + threshold // 4) // 256)
-            shift = 6 - (x % 4) * 2
-            row[x // 4] |= level << shift
-    return bytes(out)
+            threshold = (row[x % 4] * 255) // 16
+            levels[base + x] = min(3, (intensity * 4 + threshold // 4) // 256)
+    return pack_2bpp(levels, width, height)
 
 
 # --------------------------------------------------------------------------- #
@@ -626,27 +518,41 @@ def verify_screenshot_matches(raw2bpp: bytes, width: int, height: int, actual_fr
 # Tests
 # --------------------------------------------------------------------------- #
 
-# [ERR]-level log lines (lib/Logging/Logging.h's LOG_ERR) expected during
-# normal operation, if a scenario is ever added that deliberately drives the
-# device into an error path (e.g. exhausting session slots). Empty for now --
-# nothing any current scenario does is expected to log an ERR line, so any
-# that appear are a real bug, not test noise. Add a substring here (matched
-# with `in`, not exact-match) alongside the scenario that expects it, with a
-# comment explaining why it's expected.
-ALLOWED_ERR_SUBSTRINGS: tuple[str, ...] = ()
+# [ERR]-level log lines (lib/Logging/Logging.h's LOG_ERR) that are expected
+# during a normal run of *this* harness against *this* host. Keep this list
+# short and justified: its whole purpose is that everything not on it fails the
+# run. A scenario that deliberately drives the device into an error path passes
+# its own substrings to check_no_errors(allowed=...) instead of widening this,
+# so that exemption stays scoped to the one section that earned it.
+ALLOWED_ERR_SUBSTRINGS: tuple[str, ...] = (
+    # The peripheral asks for a 15 ms connection interval and logs it at ERR
+    # when the central grants something else. macOS/CoreBluetooth always grants
+    # something else (and re-negotiates as the link goes busy/idle), so this
+    # fires several times in every run on this host. It reports the central's
+    # decision, not a device-side failure: nothing on the device fell back and
+    # nothing was dropped. (Whether it should be LOG_ERR at all is a firmware
+    # question, not this harness's to answer.)
+    "conn params DIVERGED from request",
+    # The harness's own clean disconnect between the first and second BLE
+    # links. Deliberately matched with the trailing field-in-flight=0x00: a
+    # disconnect that interrupted a transfer reports a non-zero field id there
+    # and is *not* exempt, since that one is worth failing on.
+    "remote user terminated), field-in-flight=0x00",
+)
 
 
-def check_no_errors(console: "Console", results: "Results", section: str) -> None:
+def check_no_errors(console: "Console", results: "Results", section: str, allowed: tuple[str, ...] = ()) -> None:
     """Fails if the device logged an unexpected [ERR] line during `section`.
 
-    Self-reported status codes (IMAGE_STATUS, screen state, etc.) only prove
+    Self-reported status codes (RENDER_STATUS, screen state, etc.) only prove
     the device *thinks* it succeeded. A failure path that logs an error and
     then silently falls back -- e.g. the grayscale settle's storeBwBuffer()
     OOM fallback, which leaves the prior BW frame on screen and returns
     without ever setting an error status -- is invisible to every other check
     in this script. This is the check that catches that shape of bug.
     """
-    unexpected = [e for e in console.pop_errors() if not any(a in e for a in ALLOWED_ERR_SUBSTRINGS)]
+    permitted = ALLOWED_ERR_SUBSTRINGS + allowed
+    unexpected = [e for e in console.pop_errors() if not any(a in e for a in permitted)]
     results.check(f"no unexpected [ERR] log lines during [{section}]", not unexpected, "; ".join(unexpected))
 
 
@@ -672,24 +578,15 @@ class Results:
         return 1 if self.failed else 0
 
 
-def parse_capabilities(raw: bytes) -> dict:
-    if len(raw) < 23:
-        sys.exit(f"Capability block is {len(raw)} bytes, expected 23 — is this a v6 build?")
-    if raw[0] != 6:
-        sys.exit(f"Device speaks protocol v{raw[0]}, this harness speaks v6.")
-    return {
-        "version": raw[0],
-        "max_text": struct.unpack_from("<H", raw, 3)[0],
-        "flags": raw[5],
-        "max_image": struct.unpack_from("<I", raw, 6)[0],
-        "max_sessions": raw[10],
-        "icon_w": raw[11],
-        "icon_h": raw[12],
-        "device_id": raw[13:17].hex(),
-        "px_wide": struct.unpack_from("<H", raw, 17)[0],
-        "px_high": struct.unpack_from("<H", raw, 19)[0],
-        "raw": raw,
-    }
+async def no_render_status_arrives(link: Link, marker: int, window: float) -> list:
+    """Waits `window` seconds and returns any RENDER_STATUS seen since `marker`.
+
+    `marker` is a len(link.notifications) snapshot taken before the push. The
+    window has to outlast the panel's own settle (~2.2s measured) or "no answer
+    arrived" would just mean "the answer had not arrived yet".
+    """
+    await asyncio.sleep(window)
+    return [n for n in link.notifications[marker:] if n.opcode == SESS_RENDER_STATUS]
 
 
 async def run_tests(args, console: Console, results: Results) -> None:
@@ -708,11 +605,36 @@ async def run_tests(args, console: Console, results: Results) -> None:
     device = devices[0]
     print(f"Found {device.name} ({device.address})")
 
+    # Two long-lived identities. A Session outlives any one connection — the
+    # reconnect scenario re-attaches session_a to a fresh link with the token
+    # it was issued, which is exactly what a phone app does after a dropout.
+    session_a = Session(APP_A, "Harness A")
+    session_b = Session(APP_B, "Harness B")
+    # See "A note on write types" in this file's docstring: text over WWR so a
+    # batch fits the device's 3 s commit window, the image left on Write so a
+    # couple of hundred unflow-controlled writes can't drop their own chunks.
+    session_a.wwr_fields = session_b.wwr_fields = (FIELD_TITLE, FIELD_BODY)
+
     async with BleakClient(device.address) as client:
-        caps = parse_capabilities(bytes(await client.read_gatt_char(CAPABILITY_CHAR_UUID)))
+        caps = parse_capabilities(
+            bytes(await client.read_gatt_char(CAPABILITY_CHAR_UUID)),
+            minimum_version=PROTOCOL_VERSION,
+            who="this harness",
+        )
+        if caps["version"] > PROTOCOL_VERSION:
+            # Loud, but not fatal: a newer device is worth running against to
+            # see what still holds, and refusing outright is precisely how this
+            # harness went five versions without being run.
+            print(
+                f"WARNING: device speaks v{caps['version']}, this harness was written for "
+                f"v{PROTOCOL_VERSION}. Assertions below may test the wrong shape — read the "
+                "version history in docs/companion-display-protocol.md and update this file."
+            )
         link = Link(client, caps)
-        await client.start_notify(SESSION_CHAR_UUID, link.on_session)
-        await client.start_notify(BUTTON_CHAR_UUID, link.on_button)
+        await link.start_notify()
+        link.attach(session_a)
+        link.attach(session_b)
+        print(f"  ATT MTU {client.mtu_size}, chunk payload {link.chunk_payload_size(FIELD_BODY)}B (seq-checked field)")
 
         # The capability block must match what the device reports over serial —
         # if those two disagree, one of the paths is lying.
@@ -723,16 +645,22 @@ async def run_tests(args, console: Console, results: Results) -> None:
             f"serial said {console_cap!r}",
         )
 
-        peer_a = Peer("Harness A", APP_A)
-        peer_b = Peer("Harness B", APP_B)
+        # Second drain of CRESET's fallout (main() does the first). The device
+        # only discovers its staged image is gone when it next re-renders,
+        # which in practice is when a central connects — i.e. right here,
+        # several seconds after the reset that caused it. Everything before the
+        # first HELLO is pre-run state; the run starts below.
+        console.pop_errors()
 
         # --- enrollment ---------------------------------------------------- #
         if enabled("enrollment"):
             print("\n[enrollment] first contact with an on-device confirm")
-            hello_future, pending_future = await link.hello(peer_a)
+            await session_a.send_hello()
             got_pending = False
             try:
-                got_pending = await asyncio.wait_for(pending_future, timeout=5.0)
+                got_pending = await asyncio.wait_for(
+                    asyncio.shield(session_a.pending_future()), timeout=5.0
+                )
             except asyncio.TimeoutError:
                 pass
             results.check("unknown peer raises HELLO_PENDING", bool(got_pending))
@@ -742,24 +670,24 @@ async def run_tests(args, console: Console, results: Results) -> None:
                           "has no idea what they are confirming")
 
             console.press(BTN_CONFIRM)  # the press a BLE-only script cannot make
-            data = await asyncio.wait_for(hello_future, timeout=10.0)
-            results.check("confirm yields HELLO_OK", data[0] == SESS_HELLO_OK, f"got {data[0]:#04x}")
-            if data[0] == SESS_HELLO_OK:
-                peer_a.session_id, peer_a.token, peer_a.asset_tags = link.parse_hello_ok(data)
-                results.check("a session id was assigned", peer_a.session_id != 0)
-                results.check("a 16-byte token was issued", len(peer_a.token) == 16)
+            reply = await session_a.wait_hello(timeout=10.0)
+            results.check("confirm yields HELLO_OK", reply.ok, "" if reply.ok else reply.reason_text)
+            if reply.ok:
+                results.check("a session id was assigned", session_a.session_id != 0)
+                results.check("a 16-byte token was issued", len(session_a.token) == 16)
                 results.check(
                     "asset digests report nothing stored",
-                    peer_a.asset_tags.get(FIELD_UI_DECL) == b"\x00\x00\x00\x00",
-                    str(peer_a.asset_tags),
+                    session_a.asset_tags.get(FIELD_UI_DECL) == b"\x00\x00\x00\x00",
+                    str(session_a.asset_tags),
                 )
-                results.check("peer appears in the device's index", len(console.peers()) >= 1)
+                peers = console.await_peers(1)
+                results.check("peer appears in the device's index", len(peers) >= 1, str(peers))
             check_no_errors(console, results, "enrollment")
 
         # --- ACQUIRE gating ------------------------------------------------ #
-        if enabled("buttonmap") and peer_a.session_id:
+        if enabled("buttonmap") and session_a.session_id:
             print("\n[buttonmap] ACQUIRE is refused until a button map is stored")
-            outcome = await link.acquire(peer_a)
+            outcome = await session_a.acquire()
             results.check(
                 "ACQUIRE denied with NO_UI_DECLARATION",
                 outcome == ("denied", 0),
@@ -771,12 +699,12 @@ async def run_tests(args, console: Console, results: Results) -> None:
             # declaration exists. A build that requires foreground for asset
             # pushes deadlocks here and this times out.
             button_map = encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS)
-            result, tag = await link.push_asset(peer_a, FIELD_UI_DECL, button_map)
+            result, tag = await session_a.push_asset(FIELD_UI_DECL, button_map)
             results.check("UI declaration accepted without holding the screen",
                           result == 0, f"result {result}")
             results.check("stored tag is the one pushed", tag == button_map[:4])
 
-            outcome = await link.acquire(peer_a)
+            outcome = await session_a.acquire()
             results.check("ACQUIRE now granted", outcome[0] == "foreground", f"got {outcome}")
             results.check("device reports the foreground peer", console.state().get("foreground") != "0")
 
@@ -794,14 +722,56 @@ async def run_tests(args, console: Console, results: Results) -> None:
             check_no_errors(console, results, "buttonmap")
 
         # --- content + button round trip ------------------------------------ #
-        if enabled("content") and peer_a.session_id:
-            print("\n[content] atomic push, then a held button round trip")
+        if enabled("content") and session_a.session_id:
+            print("\n[content] atomic push, v11 render status, then a held button round trip")
             body = "\n".join(f"Line {i} of the harness body text." for i in range(60))
-            await link.push_field(peer_a, FIELD_TITLE, b"Harness Title")
-            await link.push_field(peer_a, FIELD_BODY, body.encode())
-            await link.push_field(peer_a, FIELD_CONTENT_ID, b"harness-1", final=True)
-            await asyncio.sleep(2.0)
+            # v11: every field of the batch carries the same pushId, but only
+            # the final-flagged one's is retained and echoed. 0x2A is arbitrary
+            # and non-zero — 0 would tell the device not to answer at all.
+            push_id = 0x2A
+            render = session_a.expect_render(push_id)
+            started = time.time()
+            await session_a.push_field(FIELD_TITLE, b"Harness Title", push_id=push_id)
+            await session_a.push_field(FIELD_BODY, body.encode(), push_id=push_id)
+            await session_a.push_field(FIELD_CONTENT_ID, b"harness-1", final=True, push_id=push_id)
+            wire_done = time.time()
+            try:
+                result = await asyncio.wait_for(render, timeout=15.0)
+            except asyncio.TimeoutError:
+                results.check(
+                    "a content batch is answered with RENDER_STATUS(Displayed, pushId)", False,
+                    f"no RENDER_STATUS for pushId {push_id:#04x} within 15s; "
+                    f"saw {session_a.render_statuses}",
+                )
+            else:
+                results.check(
+                    "a content batch is answered with RENDER_STATUS(Displayed, pushId)",
+                    result == RENDER_DISPLAYED,
+                    f"result {RENDER_RESULTS.get(result, result)}",
+                )
+                # The answer must come from the panel, not the wire: pre-v11 a
+                # client could only guess with a fixed delay, and the whole
+                # point of the notification is that those two differ by ~2s.
+                settle = time.time() - wire_done
+                print(f"  wire {wire_done - started:.2f}s, then {settle:.2f}s to the panel")
+                results.check(
+                    "the answer arrived after the panel settle, not at END",
+                    settle > 0.5,
+                    f"RENDER_STATUS came {settle:.2f}s after the last END — suspiciously immediate",
+                )
             results.check("device is showing text", console.state().get("screen") == "text")
+
+            # pushId 0 is "I am not awaiting an answer", and the device must
+            # stay silent rather than notify into the void. This is the half of
+            # v11 that costs nothing to get wrong until an app starts counting
+            # notifications.
+            print("  pushing a second batch with pushId 0 (no answer wanted)")
+            marker = len(link.notifications)
+            await session_a.push_field(FIELD_TITLE, b"Harness Title (quiet)", push_id=0)
+            await session_a.push_field(FIELD_CONTENT_ID, b"harness-1", final=True, push_id=0)
+            stray = await no_render_status_arrives(link, marker, window=6.0)
+            results.check("pushId 0 produces no RENDER_STATUS at all", not stray,
+                          str([(n.result, n.push_id) for n in stray]))
 
             link.button_events.clear()
             console.press(BTN_CONFIRM, hold_ms=1200)
@@ -810,14 +780,14 @@ async def run_tests(args, console: Console, results: Results) -> None:
             results.check("a held button produced repeat events", len(events) >= 5, f"{len(events)} events")
             results.check(
                 "events carry this session and the pushed content-id",
-                all(e[0] == peer_a.session_id and e[4] == b"harness-1" for e in events),
+                all(e.session_id == session_a.session_id and e.content_id == b"harness-1" for e in events),
                 str(events[:2]),
             )
-            results.check("the last event is marked final", bool(events and events[-1][2]), str(events[-1:]))
+            results.check("the last event is marked final", bool(events and events[-1].is_final), str(events[-1:]))
             results.check(
                 "hold duration rose across the sequence",
-                bool(events) and events[-1][3] > events[0][3],
-                str([e[3] for e in events]),
+                bool(events) and events[-1].ticks > events[0].ticks,
+                str([e.ticks for e in events]),
             )
 
             # LEFT is mapped to local paging, so it must NOT reach the wire.
@@ -825,16 +795,105 @@ async def run_tests(args, console: Console, results: Results) -> None:
             console.press(BTN_LEFT)
             await asyncio.sleep(0.5)
             results.check("a locally-routed button sends no BLE event", not link.button_events)
+
+            # A local page turn is not a push, so it must not be answered — the
+            # device owes exactly one RENDER_STATUS per push, never a broadcast
+            # about what happens to be on screen.
+            results.check(
+                "a local page turn produced no RENDER_STATUS",
+                not [n for n in link.notifications[marker:] if n.opcode == SESS_RENDER_STATUS],
+                "a redraw the client did not cause was answered",
+            )
             check_no_errors(console, results, "content")
 
+        # --- v10/v11 sequence gap ------------------------------------------- #
+        if enabled("seqgap") and session_a.session_id:
+            print("\n[seqgap] a batch that loses a field is discarded whole and answered")
+            # The panel is holding the previous article. Snapshot it: the only
+            # honest test of "discarded, not half-applied" is that not one pixel
+            # moved -- the console can report *that* the screen is text, never
+            # which text.
+            try:
+                before = console.screenshot()
+            except (TimeoutError, ValueError) as exc:
+                results.check("framebuffer screenshot round-tripped over serial", False, str(exc))
+                before = None
+
+            push_id = 0x5B
+            render = session_a.expect_render(push_id)
+            session_a.field_seq_gaps.clear()
+            # A deliberate skip in the *title*, the case that was a real bug:
+            # committing the survivors would have put this batch's body under
+            # the previous batch's headline. The body and content-id are clean,
+            # so only the batch-level discard can save it.
+            # The gap is at chunk 0 (the field's very first CHUNK carries seq 1,
+            # as if seq 0 had been lost on the way). Deliberately not a later
+            # index: the negotiated MTU decides how many chunks a title of any
+            # given length becomes, and a gap at index 1 silently stops
+            # happening at all on a link that fits the whole field in one chunk.
+            long_title = ("Gap Test " * 40).encode()
+            await session_a.push_field(FIELD_TITLE, long_title, push_id=push_id, seq_gap_at=0)
+            await session_a.push_field(FIELD_BODY, b"Body that must never reach the panel.", push_id=push_id)
+            await session_a.push_field(FIELD_CONTENT_ID, b"harness-gap", final=True, push_id=push_id)
+
+            try:
+                result = await asyncio.wait_for(render, timeout=10.0)
+            except asyncio.TimeoutError:
+                results.check("a poisoned batch is answered RENDER_STATUS(SequenceGap)", False,
+                              f"nothing for pushId {push_id:#04x}; saw {session_a.render_statuses}")
+            else:
+                results.check(
+                    "a poisoned batch is answered RENDER_STATUS(SequenceGap)",
+                    result == RENDER_SEQUENCE_GAP,
+                    f"result {RENDER_RESULTS.get(result, result)}",
+                )
+            results.check(
+                "FIELD_SEQ_GAP named the field that was actually lost",
+                session_a.field_seq_gaps == [FIELD_TITLE],
+                str(session_a.field_seq_gaps),
+            )
+
+            if before is not None:
+                # Well past both the settle and the 3s batch timeout, so a
+                # late-applied batch would have shown up by now.
+                await asyncio.sleep(4.0)
+                try:
+                    after = console.screenshot()
+                except (TimeoutError, ValueError) as exc:
+                    results.check("framebuffer screenshot round-tripped over serial", False, str(exc))
+                else:
+                    results.check(
+                        "the discarded batch left the previous page untouched on the panel",
+                        before == after,
+                        "the framebuffer changed — the batch was applied, at least in part",
+                    )
+
+            # A standalone tag push is not part of any batch and must still
+            # apply: the discard rule is about batches, not about the device
+            # going deaf after one.
+            await session_a.push_field(FIELD_TAG_STATE, encode_tag_state([(1, 2)]), final=True)
+            await asyncio.sleep(2.0)
+            results.check("a standalone tag push still applies after a discarded batch",
+                          console.tags().get(1) == "filled", str(console.tags()))
+            await session_a.push_field(FIELD_TAG_STATE, encode_tag_state([(1, 0)]), final=True)
+            await asyncio.sleep(1.5)
+
+            # The device logs both halves of this deliberately: the dropped
+            # field, and the batch it poisoned. Anything else here is a real
+            # bug and still fails.
+            check_no_errors(console, results, "seqgap", allowed=(
+                "CHUNK sequence gap",
+                "content batch discarded",
+            ))
+
         # --- tags ------------------------------------------------------------ #
-        if enabled("tags") and peer_a.session_id:
+        if enabled("tags") and session_a.session_id:
             print("\n[tags] declared tags, atomic with content and state-only")
             # State-only write, then a content push that says nothing about tags:
             # the tag must survive, because when it clears is app meaning.
-            await link.set_tag(peer_a, 0, 2)
+            await session_a.set_tag(0, 2)
             await asyncio.sleep(1.5)
-            await link.push_field(peer_a, FIELD_BODY, b"A second body push.", final=True)
+            await session_a.push_field(FIELD_BODY, b"A second body push.", final=True)
             await asyncio.sleep(2.0)
             results.check("device still on text after a tag write plus a push",
                           console.state().get("screen") == "text")
@@ -849,15 +908,15 @@ async def run_tests(args, console: Console, results: Results) -> None:
                           "tags must not auto-clear on a body push")
 
             # An undeclared id must be ignored rather than create a tag.
-            await link.set_tag(peer_a, 99, 2)
+            await session_a.set_tag(99, 2)
             await asyncio.sleep(1.0)
             results.check("an undeclared tag id creates nothing",
                           len(console.tags()) == len(DEFAULT_TAGS), str(console.tags()))
 
             # Atomic: content and tag state in one batch, one redraw.
-            await link.push_field(peer_a, FIELD_TITLE, b"Tagged article")
-            await link.push_field(peer_a, FIELD_BODY, b"Body for the tagged article.")
-            await link.push_field(peer_a, FIELD_TAG_STATE, encode_tag_state([(0, 1), (1, 2)]), final=True)
+            await session_a.push_field(FIELD_TITLE, b"Tagged article")
+            await session_a.push_field(FIELD_BODY, b"Body for the tagged article.")
+            await session_a.push_field(FIELD_TAG_STATE, encode_tag_state([(0, 1), (1, 2)]), final=True)
             await asyncio.sleep(2.5)
             results.check("atomic content + tag push kept the device on text",
                           console.state().get("screen") == "text")
@@ -868,54 +927,51 @@ async def run_tests(args, console: Console, results: Results) -> None:
 
             # There is no read-back for tag rendering by design — it is pure
             # drawing. CMD:SCREENSHOT is the visual check.
-            await link.push_field(peer_a, FIELD_TAG_STATE, encode_tag_state([(0, 0), (1, 0)]), final=True)
+            await session_a.push_field(FIELD_TAG_STATE, encode_tag_state([(0, 0), (1, 0)]), final=True)
             await asyncio.sleep(1.5)
             check_no_errors(console, results, "tags")
 
-        # --- reconnect with the stored token -------------------------------- #
-        if enabled("reconnect") and peer_a.token:
-            print("\n[reconnect] stored token, no prompt")
-            stored_token = peer_a.token
-
-    if enabled("reconnect") and peer_a.token:
+    # --- reconnect with the stored token ------------------------------------ #
+    if enabled("reconnect") and session_a.token:
+        print("\n[reconnect] stored token, no prompt")
         await asyncio.sleep(2.0)
         async with BleakClient(device.address) as client:
             link = Link(client, caps)
-            await client.start_notify(SESSION_CHAR_UUID, link.on_session)
-            await client.start_notify(BUTTON_CHAR_UUID, link.on_button)
+            await link.start_notify()
+            link.attach(session_a)
+            link.attach(session_b)
 
-            hello_future, pending_future = await link.hello(peer_a)
-            data = await asyncio.wait_for(hello_future, timeout=10.0)
-            results.check("known peer gets HELLO_OK immediately", data[0] == SESS_HELLO_OK)
+            reply = await asyncio.wait_for(session_a.hello(), timeout=10.0)
+            results.check("known peer gets HELLO_OK immediately", reply.ok,
+                          "" if reply.ok else reply.reason_text)
             results.check("no pairing prompt on screen", console.state().get("screen") != "pairing")
-            if data[0] == SESS_HELLO_OK:
-                peer_a.session_id, _, tags = link.parse_hello_ok(data)
+            if reply.ok:
                 results.check(
                     "the stored button-map tag is reported back",
-                    tags.get(FIELD_UI_DECL) == encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS)[:4],
-                    str(tags),
+                    session_a.asset_tags.get(FIELD_UI_DECL) == encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS)[:4],
+                    str(session_a.asset_tags),
                 )
-                outcome = await link.acquire(peer_a)
+                outcome = await session_a.acquire()
                 results.check("ACQUIRE granted with no re-push", outcome[0] == "foreground", str(outcome))
             check_no_errors(console, results, "reconnect")
 
             # --- preemption between two apps on one link -------------------- #
             if enabled("preemption"):
                 print("\n[preemption] two apps, one link, last requester wins")
-                hello_future_b, pending_future_b = await link.hello(peer_b)
+                await session_b.send_hello()
                 try:
-                    await asyncio.wait_for(pending_future_b, timeout=5.0)
+                    await asyncio.wait_for(asyncio.shield(session_b.pending_future()), timeout=5.0)
                     console.press(BTN_CONFIRM)
                 except asyncio.TimeoutError:
                     pass
-                data_b = await asyncio.wait_for(hello_future_b, timeout=15.0)
-                results.check("second app enrolled on the same link", data_b[0] == SESS_HELLO_OK)
-                if data_b[0] == SESS_HELLO_OK:
-                    peer_b.session_id, peer_b.token, _ = link.parse_hello_ok(data_b)
+                reply_b = await session_b.wait_hello(timeout=15.0)
+                results.check("second app enrolled on the same link", reply_b.ok,
+                              "" if reply_b.ok else reply_b.reason_text)
+                if reply_b.ok:
                     results.check(
                         "the two apps got different session ids",
-                        peer_b.session_id != peer_a.session_id,
-                        f"{peer_a.session_id} vs {peer_b.session_id}",
+                        session_b.session_id != session_a.session_id,
+                        f"{session_a.session_id} vs {session_b.session_id}",
                     )
                     # The device's own serial-reportable session count settles on its next
                     # main-loop iteration, not the instant the BLE notify is sent -- checking
@@ -924,36 +980,36 @@ async def run_tests(args, console: Console, results: Results) -> None:
                     await asyncio.sleep(0.3)
                     results.check("device reports two live sessions", console.state().get("sessions") == "2")
 
-                    await link.push_asset(peer_b, FIELD_UI_DECL, encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS))
+                    await session_b.push_asset(FIELD_UI_DECL, encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS))
 
-                    background_future = link.expect(f"background:{peer_a.session_id}")
-                    outcome = await link.acquire(peer_b)
+                    background = session_a.expect_background()
+                    outcome = await session_b.acquire()
                     results.check("the second app took the screen", outcome[0] == "foreground", str(outcome))
                     try:
-                        reason = await asyncio.wait_for(background_future, timeout=5.0)
+                        reason = await asyncio.wait_for(background, timeout=5.0)
                         results.check("the first app was told it was preempted", reason == 0, f"reason {reason}")
                     except asyncio.TimeoutError:
                         results.check("the first app was told it was preempted", False, "no background notification arrived")
 
                     # A push from the now-background app must not change the screen.
-                    await link.push_field(peer_b, FIELD_TITLE, b"App B owns the screen", final=True)
+                    await session_b.push_field(FIELD_TITLE, b"App B owns the screen", final=True)
                     await asyncio.sleep(1.5)
-                    await link.push_field(peer_a, FIELD_TITLE, b"App A should be ignored", final=True)
+                    await session_a.push_field(FIELD_TITLE, b"App A should be ignored", final=True)
                     await asyncio.sleep(1.5)
                     results.check(
                         "the foreground peer is still app B",
-                        console.state().get("foreground") == str(peer_b.session_id),
+                        console.state().get("foreground") == str(session_b.session_id),
                         str(console.state()),
                     )
 
                     # Re-grant: FOREGROUND must fire again, not just the first
                     # time. If it does not, a preempted-then-restored app never
                     # learns to re-push and the reader stays blank.
-                    outcome = await link.acquire(peer_a)
+                    outcome = await session_a.acquire()
                     results.check("FOREGROUND fires again on a re-grant",
                                   outcome[0] == "foreground", str(outcome))
                     results.check("the screen went back to app A",
-                                  console.state().get("foreground") == str(peer_a.session_id),
+                                  console.state().get("foreground") == str(session_a.session_id),
                                   str(console.state()))
                     results.check("tags cleared on the handover",
                                   all(state == "hidden" for state in console.tags().values()),
@@ -965,38 +1021,55 @@ async def run_tests(args, console: Console, results: Results) -> None:
                 # Content/image pushes are silently dropped from a non-foreground
                 # session (CompanionBle.cpp only lets the foreground app push visible
                 # content; assets like UI declarations are the exception). The
-                # preemption block above ends with foreground handed back to peer_a,
-                # so picking "peer_b if it has a session" here would push from a
+                # preemption block above ends with foreground handed back to session_a,
+                # so picking "session_b if it has a session" here would push from a
                 # backgrounded peer -- silently dropped, hanging forever waiting for
-                # an IMAGE_STATUS that will never come. Use whichever peer the device
+                # a RENDER_STATUS that will never come. Use whichever peer the device
                 # actually reports as foreground right now.
                 current_foreground = console.state().get("foreground")
-                if peer_b.session_id and str(peer_b.session_id) == current_foreground:
-                    owner = peer_b
+                if session_b.session_id and str(session_b.session_id) == current_foreground:
+                    owner = session_b
                 else:
-                    owner = peer_a
+                    owner = session_a
                 if owner.session_id:
                     print("\n[image] raw packed 2bpp, full screen")
                     raw = make_test_raw_image(caps["px_wide"], caps["px_high"])
                     print(f"  {len(raw)} bytes of raw 2bpp for {caps['px_wide']}x{caps['px_high']}")
                     results.check(
+                        "the encoded print is exactly the byte count the device expects",
+                        len(raw) == raw_image_length(caps["px_wide"], caps["px_high"]),
+                        f"{len(raw)} != {raw_image_length(caps['px_wide'], caps['px_high'])}",
+                    )
+                    results.check(
                         "the encoded print fits the device's image cap",
                         len(raw) <= caps["max_image"],
                         f"{len(raw)} > {caps['max_image']}",
                     )
+                    owner.chunk_acks.clear()
+                    image_push_id = 0x77
                     started = time.time()
-                    verdict = await link.push_image(owner, raw)
-                    results.check("device reported the image displayed", verdict == 0, f"IMAGE_STATUS {verdict}")
+                    verdict = await owner.push_image(raw, push_id=image_push_id)
+                    results.check("device reported the image displayed", verdict == RENDER_DISPLAYED,
+                                  f"RENDER_STATUS {RENDER_RESULTS.get(verdict, verdict)}")
+                    results.check(
+                        "the image's RENDER_STATUS echoed the pushId it was sent with",
+                        (RENDER_DISPLAYED, image_push_id) in owner.render_statuses,
+                        str(owner.render_statuses),
+                    )
+                    # v9: a progress marker roughly every 32 CHUNKs. Diagnostic
+                    # only, but its absence during a couple of hundred chunks
+                    # means the device never saw them as sequenced chunks at all.
+                    results.check("IMAGE_CHUNK_ACK arrived during the transfer",
+                                  len(owner.chunk_acks) >= 1, str(owner.chunk_acks))
                     print(f"  transfer + develop took {time.time() - started:.1f}s")
                     results.check("device is showing an image", console.state().get("screen") == "image")
 
-                    # The two checks above are the device's own self-report
-                    # (an IMAGE_STATUS notification and a screen-state string)
-                    # -- a decode bug that produced garbage pixels but still
-                    # flipped those flags would still pass both. Pull the
-                    # actual framebuffer over CMD:SCREENSHOT and diff it
-                    # against ground truth computed from the exact bytes that
-                    # were pushed, for real pixel-level verification.
+                    # The checks above are the device's own self-report (a
+                    # notification and a screen-state string) -- a decode bug
+                    # that produced garbage pixels but still flipped those flags
+                    # would still pass. Pull the actual framebuffer over
+                    # CMD:SCREENSHOT and diff it against ground truth computed
+                    # from the exact bytes that were pushed.
                     try:
                         actual_fb = console.screenshot()
                     except (TimeoutError, ValueError) as exc:
@@ -1011,6 +1084,32 @@ async def run_tests(args, console: Console, results: Results) -> None:
                             diff or "",
                         )
                     check_no_errors(console, results, "image")
+
+                    # v9: a skipped CHUNK sequence number must be caught rather
+                    # than decoded into garbage. max_chunks stops the transfer
+                    # right after the gap -- the device has already latched it
+                    # and ignores the rest, so sending the other ~200 chunks
+                    # would only cost wall-clock time.
+                    print("  pushing an image with a deliberately skipped sequence number")
+                    gap_push_id = 0x78
+                    render = owner.expect_render(gap_push_id)
+                    await owner.push_field(
+                        FIELD_IMAGE, raw, final=True, push_id=gap_push_id, seq_gap_at=2, max_chunks=6
+                    )
+                    try:
+                        verdict = await asyncio.wait_for(render, timeout=30.0)
+                    except asyncio.TimeoutError:
+                        results.check("a gapped image push is answered RENDER_STATUS(SequenceGap)", False,
+                                      f"nothing for pushId {gap_push_id:#04x}; saw {owner.render_statuses}")
+                    else:
+                        results.check(
+                            "a gapped image push is answered RENDER_STATUS(SequenceGap)",
+                            verdict == RENDER_SEQUENCE_GAP,
+                            f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                        )
+                    results.check("the previous screen is retained after a gapped image",
+                                  console.state().get("screen") == "image", str(console.state()))
+                    check_no_errors(console, results, "image seqgap", allowed=("CHUNK sequence gap",))
 
 
 def main() -> None:
@@ -1032,6 +1131,16 @@ def main() -> None:
     if not args.keep_peers:
         print("Resetting the device to never-paired...")
         console.reset_peers()
+        # CRESET deletes the peer directories out from under whatever the
+        # activity is currently showing, so a device still displaying the
+        # previous run's image logs a failed reload ([RAW2BPP] cannot open
+        # .../images/img_N.raw). That is the reset doing its job, not this
+        # run's doing, and check_no_errors() would otherwise pin it on the
+        # first scenario to look. Anything logged before the run starts is not
+        # the run's.
+        stale = console.pop_errors()
+        if stale:
+            print(f"  (discarded {len(stale)} pre-run [ERR] line(s) from the reset)")
 
     results = Results()
     try:
