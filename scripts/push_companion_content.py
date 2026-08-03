@@ -2,11 +2,14 @@
 """
 Drive a Companion Mode device over BLE from a dev machine, without a phone app.
 
-Implements the client side of docs/companion-display-protocol.md v7: the HELLO
-handshake, token persistence, the button map, icons, text and image pushes. This
-is the fastest way to exercise the firmware — it does not depend on either iOS
-app being ready, and it can produce inputs (a full-panel raw image, a 10-page
-body, a deliberately malformed asset) that are awkward to trigger from an app.
+Implements the client side of docs/companion-display-protocol.md: the HELLO
+handshake, token persistence, the button map, icons, text and image pushes. The
+wire format itself lives in scripts/companion_protocol.py, shared with the e2e
+harness; this file is only the policy on top of it — which buttons and tags this
+"app" declares, what it pushes, and what it prints. This is the fastest way to
+exercise the firmware — it does not depend on either iOS app being ready, and it
+can produce inputs (a full-panel raw image, a 10-page body, a deliberately
+malformed asset) that are awkward to trigger from an app.
 
 Usage:
     python scripts/push_companion_content.py                        # push default text
@@ -27,10 +30,6 @@ terminal/Python process.
 
 import argparse
 import asyncio
-import hashlib
-import json
-import os
-import struct
 import sys
 import time
 import uuid
@@ -38,62 +37,40 @@ from pathlib import Path
 
 from bleak import BleakClient, BleakScanner
 
-SERVICE_UUID = "7c9c0000-3e4a-4b1a-9c1e-6d8a1f2b0001"
-CONTENT_CHAR_UUID = "7c9c0001-3e4a-4b1a-9c1e-6d8a1f2b0001"
-BUTTON_CHAR_UUID = "7c9c0002-3e4a-4b1a-9c1e-6d8a1f2b0001"
-CAPABILITY_CHAR_UUID = "7c9c0003-3e4a-4b1a-9c1e-6d8a1f2b0001"
-STATUS_CHAR_UUID = "7c9c0004-3e4a-4b1a-9c1e-6d8a1f2b0001"
-SESSION_CHAR_UUID = "7c9c0005-3e4a-4b1a-9c1e-6d8a1f2b0001"
-
-OP_START, OP_CHUNK, OP_END = 0x01, 0x02, 0x03
-FIELD_TITLE, FIELD_BODY, FIELD_CONTENT_ID = 0x01, 0x02, 0x03
-FIELD_IMAGE, FIELD_UI_DECL, FIELD_ICON, FIELD_TAG_STATE = 0x04, 0x05, 0x06, 0x07
-FINAL_FLAG = 0x80
-
-SESS_HELLO, SESS_BYE, SESS_ACQUIRE, SESS_RELEASE = 0x01, 0x02, 0x03, 0x04
-(
-    SESS_HELLO_OK,
-    SESS_HELLO_PENDING,
-    SESS_HELLO_DENIED,
-    SESS_FOREGROUND,
-    SESS_BACKGROUND,
-    SESS_ACQUIRE_DENIED,
-    SESS_ASSET_ACK,
-    SESS_IMAGE_STATUS,
-    SESS_IMAGE_CHUNK_ACK,
-    SESS_FIELD_SEQ_GAP,
-) = (0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A)
-
-# v9: image; v10: title/body too — see push_field()'s has_seq.
-SEQ_CHUNK_FIELDS = (FIELD_IMAGE, FIELD_TITLE, FIELD_BODY)
-
-DENIED_REASONS = {
-    0x00: "user rejected",
-    0x01: "timed out",
-    0x02: "no session slots",
-    0x03: "malformed HELLO",
-    0x04: "storage failure",
-    0x05: "another pairing prompt is up",
-}
-ACQUIRE_DENIED_REASONS = {0x00: "no UI declaration stored", 0x01: "unknown session"}
-ASSET_RESULTS = {0x00: "stored", 0x01: "rejected: size", 0x02: "rejected: format", 0x03: "rejected: storage"}
-IMAGE_RESULTS = {
-    0x00: "displayed",
-    0x01: "decode failed",
-    0x02: "rejected: size",
-    0x03: "storage failed",
-    0x04: "sequence gap (dropped/reordered chunk)",
-}
-BUTTON_NAMES = {0: "BACK", 1: "CONFIRM", 2: "LEFT", 3: "RIGHT", 4: "UP", 5: "DOWN", 6: "POWER"}
-
-ROUTING_NONE, ROUTING_REMOTE, ROUTING_PAGE_PREV, ROUTING_PAGE_NEXT, ROUTING_SLEEP = range(5)
+from companion_protocol import (
+    ACQUIRE_DENIED_REASONS,
+    ASSET_RESULTS,
+    CAPABILITY_CHAR_UUID,
+    FIELD_BODY,
+    FIELD_CONTENT_ID,
+    FIELD_ICON,
+    FIELD_IMAGE,
+    FIELD_TAG_STATE,
+    FIELD_TITLE,
+    FIELD_UI_DECL,
+    RENDER_RESULTS,
+    ROUTING_PAGE_NEXT,
+    ROUTING_PAGE_PREV,
+    ROUTING_REMOTE,
+    SERVICE_UUID,
+    BACKGROUND_REASONS,
+    Link,
+    Session,
+    encode_icon_bits,
+    encode_tag_state,
+    encode_ui_declaration,
+    install_id,
+    pack_2bpp,
+    parse_capabilities,
+    raw_image_length,
+    remember_token,
+    stored_token,
+)
 
 # A stable appId for this script. It is a real app identity as far as the device
 # is concerned — its own peer directory, its own icon tile.
 SCRIPT_APP_ID = uuid.UUID("2f1d7b64-9c3e-4a55-8f21-0c7b5e9a3d10").bytes
 DISPLAY_NAME = "Dev Pusher"
-
-TOKEN_STORE = Path.home() / ".crosspoint_companion_tokens.json"
 
 DEFAULT_TITLE = "Test Article: BLE Push"
 DEFAULT_BODY = (
@@ -115,325 +92,29 @@ BUTTON_MAP = [
     (0, ROUTING_REMOTE, "Back"),
 ]
 
-
-# --------------------------------------------------------------------------- #
-# Local token / identity storage
-# --------------------------------------------------------------------------- #
-
-
-def load_store() -> dict:
-    if TOKEN_STORE.exists():
-        try:
-            return json.loads(TOKEN_STORE.read_text())
-        except (OSError, ValueError):
-            pass
-    return {}
-
-
-def save_store(store: dict) -> None:
-    TOKEN_STORE.write_text(json.dumps(store, indent=2))
-    os.chmod(TOKEN_STORE, 0o600)
-
-
-def install_id() -> bytes:
-    """Persisted like a real app would: regenerating it makes a brand new peer."""
-    store = load_store()
-    if "install_id" not in store:
-        store["install_id"] = os.urandom(16).hex()
-        save_store(store)
-    return bytes.fromhex(store["install_id"])
-
-
-def stored_token(device_id: str) -> bytes | None:
-    token = load_store().get("tokens", {}).get(device_id)
-    return bytes.fromhex(token) if token else None
-
-
-def remember_token(device_id: str, token: bytes) -> None:
-    store = load_store()
-    store.setdefault("tokens", {})[device_id] = token.hex()
-    save_store(store)
-
-
-def asset_tag(body: bytes) -> bytes:
-    """First 4 bytes of SHA-256 — a content hash, so downgrades re-push correctly."""
-    tag = hashlib.sha256(body).digest()[:4]
-    return b"\x00\x00\x00\x01" if tag == b"\x00\x00\x00\x00" else tag
-
-
 TAGS = [(0, "Saved"), (1, "New")]
 
 
-def encode_ui_declaration() -> bytes:
-    body = bytes([len(BUTTON_MAP)])
-    for button, routing, label in BUTTON_MAP:
-        encoded = label.encode("utf-8")
-        body += bytes([button, routing, len(encoded)]) + encoded
-    body += bytes([len(TAGS)])
-    for tag_id, label in TAGS:
-        encoded = label.encode("utf-8")[:12]
-        body += bytes([tag_id, len(encoded)]) + encoded
-    return asset_tag(body) + body
-
-
-def encode_tag_state(states) -> bytes:
-    """states: list of (tagId, state). state 0 hidden / 1 outline / 2 filled."""
-    out = bytes([len(states)])
-    for tag_id, state in states:
-        out += bytes([tag_id, state])
-    return out
+def declaration() -> bytes:
+    return encode_ui_declaration(BUTTON_MAP, TAGS)
 
 
 # --------------------------------------------------------------------------- #
-# Wire helpers
+# Version gates
+#
+# This script only exercises the stable-since-v6 subset of the protocol for
+# most of what it sends, so it accepts any v6+ device — but two fields moved to
+# a sequence-numbered CHUNK since then (image in v9, title/body in v10) and the
+# framer in companion_protocol always sends that sequence number. To a pre-v9/
+# pre-v10 device those two bytes are not a header, they are the first two bytes
+# of the payload, so the push would not fail, it would silently corrupt. Refuse
+# with a real message instead.
 # --------------------------------------------------------------------------- #
 
 
-def parse_capabilities(raw: bytes) -> dict:
-    if len(raw) < 23:
-        raise SystemExit(
-            f"Capability characteristic is {len(raw)} bytes, expected 23. "
-            "This device is running pre-v6 firmware; flash a v6 build first."
-        )
-    caps = {
-        "version": raw[0],
-        "chars_wide": raw[1],
-        "chars_high": raw[2],
-        "max_text": struct.unpack_from("<H", raw, 3)[0],
-        "flags": raw[5],
-        "max_image": struct.unpack_from("<I", raw, 6)[0],
-        "max_sessions": raw[10],
-        "icon_w": raw[11],
-        "icon_h": raw[12],
-        "device_id": raw[13:17].hex(),
-        "px_wide": struct.unpack_from("<H", raw, 17)[0],
-        "px_high": struct.unpack_from("<H", raw, 19)[0],
-        "max_content_id": raw[21],
-        "gray_levels": raw[22],
-    }
-    # Capability/content/session wire layout has been stable since v6 (v7/v8
-    # only added new fields elsewhere, e.g. the gallery picker); this script
-    # only exercises the v6 subset, so accept anything >= 6.
-    if caps["version"] < 6:
-        raise SystemExit(f"Device speaks protocol v{caps['version']}, this script needs v6+.")
-    return caps
-
-
-class Session:
-    """The handshake and everything that needs a sessionId."""
-
-    def __init__(self, client: BleakClient, caps: dict):
-        self.client = client
-        self.caps = caps
-        # bleak's mtu_size mirrors what CoreBluetooth actually negotiated for
-        # this link (client.mtu_size == ATT MTU, same value CompanionKit's
-        # maximumWriteValueLength(for:.withResponse) is derived from on a real
-        # iPhone) — not the 185 firmware merely requests. 2 bytes off for v6
-        # CHUNK framing (opcode + sessionId), same as CompanionKit's
-        # ContentFramer.chunkPayloadSize.
-        self.chunk_payload = max(1, client.mtu_size - 3 - 2)
-        self.session_id = 0
-        self.asset_tags: dict[int, bytes] = {}
-        self.hello_tag = int.from_bytes(os.urandom(2), "little") or 1
-        self.loop = asyncio.get_running_loop()
-        self.hello_future: asyncio.Future | None = None
-        self.acquire_future: asyncio.Future | None = None
-        self.asset_futures: dict[int, asyncio.Future] = {}
-        self.image_future: asyncio.Future | None = None
-
-    # -- notifications ------------------------------------------------------ #
-
-    def on_session_notify(self, _sender, data: bytearray) -> None:
-        opcode = data[0]
-
-        if opcode in (SESS_HELLO_OK, SESS_HELLO_PENDING, SESS_HELLO_DENIED):
-            tag = struct.unpack_from("<H", data, 1)[0]
-            if tag != self.hello_tag:
-                return  # somebody else's handshake on this shared link
-            if opcode == SESS_HELLO_PENDING:
-                print("  Device is asking the user to confirm. Press CONFIRM on the device.")
-                return
-            if opcode == SESS_HELLO_DENIED:
-                reason = DENIED_REASONS.get(data[3], f"unknown ({data[3]:#04x})")
-                self._resolve("hello_future", ("denied", reason))
-                return
-            session_id = data[3]
-            token = bytes(data[4:20])
-            count = data[20]
-            tags = {}
-            for i in range(count):
-                offset = 21 + i * 5
-                tags[data[offset]] = bytes(data[offset + 1 : offset + 5])
-            self._resolve("hello_future", ("ok", session_id, token, tags))
-            return
-
-        if opcode == SESS_FOREGROUND:
-            self._resolve("acquire_future", True)
-        elif opcode == SESS_BACKGROUND:
-            reasons = {0: "preempted", 1: "released", 2: "link lost"}
-            print(f"  BACKGROUND ({reasons.get(data[2], data[2])})")
-        elif opcode == SESS_ACQUIRE_DENIED:
-            reason = ACQUIRE_DENIED_REASONS.get(data[2], f"unknown ({data[2]:#04x})")
-            self._resolve("acquire_future", reason)
-        elif opcode == SESS_ASSET_ACK:
-            future = self.asset_futures.pop(data[2], None)
-            if future and not future.done():
-                self.loop.call_soon_threadsafe(future.set_result, (data[3], bytes(data[4:8])))
-        elif opcode == SESS_IMAGE_STATUS:
-            # data[3] is the pushId the device is echoing (v11; a `field` byte
-            # for one day before that) -- ignored here since this script only
-            # ever has one push outstanding at a time (see push_image()), so
-            # there is nothing to correlate against.
-            self._resolve("image_future", data[2])
-        elif opcode == SESS_IMAGE_CHUNK_ACK:
-            # Diagnostic only -- progress marker during an in-flight image
-            # push, well before the final SESS_IMAGE_STATUS. Nothing here
-            # awaits it.
-            seq = struct.unpack_from("<H", data, 2)[0]
-            print(f"  chunk ack: seq={seq}")
-        elif opcode == SESS_FIELD_SEQ_GAP:
-            # v10: a title/body CHUNK sequence number skipped ahead of what
-            # the device expected -- the field was dropped, not rendered.
-            # push_field() has no future to resolve for content fields (only
-            # push_asset/push_image await a device-side result), so this is
-            # print-only, same as SESS_IMAGE_CHUNK_ACK.
-            print(f"  FIELD_SEQ_GAP: field {data[2]:#04x} dropped (CHUNK sequence gap)")
-
-    def _resolve(self, attr: str, value) -> None:
-        future = getattr(self, attr, None)
-        if future and not future.done():
-            self.loop.call_soon_threadsafe(future.set_result, value)
-
-    @staticmethod
-    def on_button_notify(_sender, data: bytearray) -> None:
-        if len(data) < 4:
-            return
-        session_id, header = data[0], data[1]
-        duration = struct.unpack_from("<H", data, 2)[0]
-        content_id = bytes(data[4:])
-        name = BUTTON_NAMES.get(header & 0x0F, "?")
-        final = " FINAL" if header & 0x80 else ""
-        suffix = f" content-id={content_id!r}" if content_id else ""
-        print(f"  [session {session_id}] {name} held {duration * 0.1:.1f}s{final}{suffix}")
-
-    # -- handshake ---------------------------------------------------------- #
-
-    async def hello(self, token: bytes | None) -> tuple:
-        self.hello_future = self.loop.create_future()
-        payload = bytes([SESS_HELLO]) + struct.pack("<H", self.hello_tag) + SCRIPT_APP_ID + install_id()
-        payload += bytes([len(token) if token else 0]) + (token or b"")
-        name = DISPLAY_NAME.encode("utf-8")[:24]
-        payload += bytes([len(name)]) + name
-        # v8 HELLO appends userNameLen/userName after name; this script has no
-        # per-install label, so send it empty (still needs the length byte).
-        payload += bytes([0])
-        await self.client.write_gatt_char(SESSION_CHAR_UUID, payload, response=True)
-        return await asyncio.wait_for(self.hello_future, timeout=40)
-
-    async def acquire(self) -> None:
-        self.acquire_future = self.loop.create_future()
-        await self.client.write_gatt_char(SESSION_CHAR_UUID, bytes([SESS_ACQUIRE, self.session_id]), response=True)
-        result = await asyncio.wait_for(self.acquire_future, timeout=10)
-        if result is not True:
-            raise SystemExit(f"ACQUIRE denied: {result}")
-        print("  Screen acquired.")
-
-    async def release(self) -> None:
-        await self.client.write_gatt_char(SESSION_CHAR_UUID, bytes([SESS_RELEASE, self.session_id]), response=True)
-
-    # -- content ------------------------------------------------------------ #
-
-    async def push_field(
-        self, field: int, data: bytes, final: bool = False, progress: bool = False, push_id: int = 0
-    ) -> None:
-        field_byte = field | (FINAL_FLAG if final else 0)
-        start = bytes([OP_START, field_byte, self.session_id]) + struct.pack("<I", len(data))
-        await self.client.write_gatt_char(CONTENT_CHAR_UUID, start, response=True)
-
-        # v9: the image field's CHUNK carries a 2-byte little-endian sequence
-        # number right after sessionId (see "Image field" in
-        # docs/companion-display-protocol.md); v10 adds title/body to that set
-        # (see "Title/body fields") -- every other field's CHUNK is unchanged.
-        # This script still writes with response (bleak has no cross-platform
-        # equivalent of CoreBluetooth's canSendWriteWithoutResponse flow
-        # control), so the seq number is belt-and-suspenders here rather than
-        # load-bearing -- but the device requires it unconditionally for these
-        # fields, regardless of which ATT write type carried it. Sending it to
-        # a pre-v10 device would instead be silently corrupting: those two
-        # bytes would land as the first two bytes of the title/body payload,
-        # which is why title/body are gated on caps["version"] the same way
-        # push_image() already gates the image field.
-        has_seq = field in SEQ_CHUNK_FIELDS
-        if field in (FIELD_TITLE, FIELD_BODY) and self.caps["version"] < 10:
-            raise SystemExit(f"Device speaks protocol v{self.caps['version']}, title/body push needs v10+.")
-        chunk_payload = max(1, self.chunk_payload - 2) if has_seq else self.chunk_payload
-        total = max(1, (len(data) + chunk_payload - 1) // chunk_payload)
-        for index, offset in enumerate(range(0, len(data), chunk_payload)):
-            chunk = data[offset : offset + chunk_payload]
-            header = bytes([OP_CHUNK, self.session_id])
-            if has_seq:
-                header += struct.pack("<H", index)
-            await self.client.write_gatt_char(CONTENT_CHAR_UUID, header + chunk, response=True)
-            if progress and (index % 25 == 0 or index == total - 1):
-                print(f"\r  sending {index + 1}/{total} chunks", end="", flush=True)
-        if progress:
-            print()
-
-        # v11: END grew a required third byte, pushId, echoed back verbatim on
-        # the eventual RENDER_STATUS (see docs/companion-display-protocol.md's
-        # END framing). 0 means "don't bother answering" and is the right
-        # default for most of what this script pushes -- it has no future to
-        # resolve for a text/asset field (see the SESS_FIELD_SEQ_GAP handler's
-        # comment above) -- but push_image() overrides it: that call *does*
-        # await a RENDER_STATUS via image_future, so it must pass a non-zero
-        # id or the device will never notify and that wait_for() would just
-        # burn its full 180s timeout for nothing.
-        await self.client.write_gatt_char(
-            CONTENT_CHAR_UUID, bytes([OP_END, self.session_id, push_id & 0xFF]), response=True
-        )
-
-    async def push_asset(self, field: int, payload: bytes) -> int:
-        future = self.loop.create_future()
-        self.asset_futures[field] = future
-        await self.push_field(field, payload)
-        result, tag = await asyncio.wait_for(future, timeout=15)
-        print(f"  asset {field:#04x}: {ASSET_RESULTS.get(result, result)} (tag {tag.hex()})")
-        return result
-
-    async def push_image(self, raw_bitmap: bytes) -> int:
-        # Unlike the rest of this script (which only exercises the stable-
-        # since-v6 subset), image CHUNKs now carry a v9 sequence number this
-        # script always sends -- a pre-v9 device has no idea to expect those 2
-        # extra bytes and would mis-parse every chunk.
-        if self.caps["version"] < 9:
-            raise SystemExit(f"Device speaks protocol v{self.caps['version']}, image push needs v9+.")
-        expected = ((self.caps["px_wide"] + 3) // 4) * self.caps["px_high"]
-        if len(raw_bitmap) != expected:
-            raise SystemExit(
-                f"Raw bitmap is {len(raw_bitmap)} bytes, device expects exactly {expected} "
-                f"({self.caps['px_wide']}x{self.caps['px_high']}, packed 2bpp)."
-            )
-        if len(raw_bitmap) > self.caps["max_image"]:
-            raise SystemExit(f"Image is {len(raw_bitmap)} bytes, device cap is {self.caps['max_image']}.")
-        self.image_future = self.loop.create_future()
-        transfer_start = time.perf_counter()
-        # push_id=1: this script only ever has one push in flight at a time
-        # (everything here is a single sequential `await`, never overlapped),
-        # so there is no correlation to get wrong -- any non-zero constant
-        # would do. 1 just reads as "the id", not as anything meaningful.
-        await self.push_field(FIELD_IMAGE, raw_bitmap, final=True, progress=True, push_id=1)
-        transfer_s = time.perf_counter() - transfer_start
-        print(f"  BLE transfer: {transfer_s:.2f}s ({len(raw_bitmap) / transfer_s:.0f} B/s)")
-        print("  Waiting for the device to develop it (decode + grayscale settle)...")
-        result = await asyncio.wait_for(self.image_future, timeout=180)
-        print(f"  image: {IMAGE_RESULTS.get(result, result)}")
-        return result
-
-    async def set_tag(self, tag_id: int, state: int) -> None:
-        """State-only change to one declared tag, without re-pushing content."""
-        await self.client.write_gatt_char(
-            STATUS_CHAR_UUID, bytes([self.session_id, tag_id, state]), response=True
-        )
+def require_version(caps: dict, minimum: int, what: str) -> None:
+    if caps["version"] < minimum:
+        raise SystemExit(f"Device speaks protocol v{caps['version']}, {what} needs v{minimum}+.")
 
 
 # --------------------------------------------------------------------------- #
@@ -469,15 +150,7 @@ def dither_to_raw_bitmap(path: str, width: int, height: int) -> bytes:
     palette.putpalette([0, 0, 0, 85, 85, 85, 170, 170, 170, 255, 255, 255] + [0] * (768 - 12))
     quantized = cropped.convert("RGB").quantize(palette=palette, dither=Image.FLOYDSTEINBERG)
     levels = list(quantized.getdata())  # already palette indices 0-3
-
-    row_bytes = (width + 3) // 4
-    out = bytearray(row_bytes * height)
-    for y in range(height):
-        base = y * row_bytes
-        for x in range(width):
-            shift = 6 - (x % 4) * 2  # MSB-first: sample 0 at bits 7-6
-            out[base + x // 4] |= levels[y * width + x] << shift
-    return bytes(out)
+    return pack_2bpp(levels, width, height)
 
 
 def encode_icon(path: str, width: int, height: int) -> bytes:
@@ -492,7 +165,110 @@ def encode_icon(path: str, width: int, height: int) -> bytes:
         for x in range(width):
             if image.getpixel((x, y)) < 128:  # dark pixel = ink
                 bits[y * (width // 8) + (x // 8)] |= 0x80 >> (x % 8)
-    return asset_tag(bytes(bits)) + bytes(bits)
+    return encode_icon_bits(bytes(bits))
+
+
+# --------------------------------------------------------------------------- #
+# Reporting hooks
+#
+# companion_protocol never prints — a client decides what is worth saying. These
+# are the notifications this script surfaces as they arrive rather than awaiting.
+# --------------------------------------------------------------------------- #
+
+
+def report_pending() -> None:
+    print("  Device is asking the user to confirm. Press CONFIRM on the device.")
+
+
+def report_background(reason: int) -> None:
+    print(f"  BACKGROUND ({BACKGROUND_REASONS.get(reason, reason)})")
+
+
+def report_chunk_ack(seq: int) -> None:
+    # Diagnostic only -- progress marker during an in-flight image push, well
+    # before the final RENDER_STATUS. Nothing here awaits it.
+    print(f"  chunk ack: seq={seq}")
+
+
+def report_field_seq_gap(field_id: int) -> None:
+    # v10: a title/body CHUNK sequence number skipped ahead of what the device
+    # expected -- the field was dropped, not rendered, and if it was part of an
+    # atomic batch the whole batch went with it. Print-only: this script pushes
+    # text with pushId 0 (see push_content()), so there is no render future to
+    # fail either.
+    print(f"  FIELD_SEQ_GAP: field {field_id:#04x} dropped (CHUNK sequence gap)")
+
+
+def report_button(event) -> None:
+    suffix = f" content-id={event.content_id!r}" if event.content_id else ""
+    final = " FINAL" if event.is_final else ""
+    print(f"  [session {event.session_id}] {event.name} held {event.seconds:.1f}s{final}{suffix}")
+
+
+# --------------------------------------------------------------------------- #
+# Pushes
+# --------------------------------------------------------------------------- #
+
+
+async def push_asset(session: Session, field_id: int, payload: bytes) -> int:
+    result, tag = await session.push_asset(field_id, payload)
+    print(f"  asset {field_id:#04x}: {ASSET_RESULTS.get(result, result)} (tag {tag.hex()})")
+    return result
+
+
+async def push_image(session: Session, caps: dict, raw_bitmap: bytes) -> int:
+    require_version(caps, 9, "image push")
+    expected = raw_image_length(caps["px_wide"], caps["px_high"])
+    if len(raw_bitmap) != expected:
+        raise SystemExit(
+            f"Raw bitmap is {len(raw_bitmap)} bytes, device expects exactly {expected} "
+            f"({caps['px_wide']}x{caps['px_high']}, packed 2bpp)."
+        )
+    if len(raw_bitmap) > caps["max_image"]:
+        raise SystemExit(f"Image is {len(raw_bitmap)} bytes, device cap is {caps['max_image']}.")
+
+    def progress(index: int, total: int) -> None:
+        if index % 25 == 0 or index == total - 1:
+            print(f"\r  sending {index + 1}/{total} chunks", end="", flush=True)
+
+    # push_id=1: this script only ever has one push in flight at a time
+    # (everything here is a single sequential `await`, never overlapped), so
+    # there is no correlation to get wrong -- any non-zero constant would do. 1
+    # just reads as "the id", not as anything meaningful. It has to be non-zero
+    # though: pushId 0 tells the device not to answer at all, and the wait
+    # below would then burn its full timeout for nothing.
+    render = session.expect_render(1)
+    transfer_start = time.perf_counter()
+    await session.push_field(FIELD_IMAGE, raw_bitmap, final=True, push_id=1, progress=progress)
+    print()
+    transfer_s = time.perf_counter() - transfer_start
+    print(f"  BLE transfer: {transfer_s:.2f}s ({len(raw_bitmap) / transfer_s:.0f} B/s)")
+    print("  Waiting for the device to develop it (decode + grayscale settle)...")
+    result = await asyncio.wait_for(render, timeout=180)
+    print(f"  image: {RENDER_RESULTS.get(result, result)}")
+    return result
+
+
+async def push_content(session: Session, caps: dict, args) -> None:
+    require_version(caps, 10, "title/body push")
+    body = Path(args.body_file).read_text(encoding="utf-8") if args.body_file else (args.body or DEFAULT_BODY)
+    print("Pushing title + body + content-id as one atomic batch...")
+    # pushId 0 throughout: this script does not await a RENDER_STATUS for text
+    # (it has nothing to do with the answer), and 0 tells the device not to
+    # send one rather than notifying into the void.
+    await session.push_field(FIELD_TITLE, args.title.encode("utf-8"))
+    await session.push_field(FIELD_BODY, body.encode("utf-8"))
+    # content-id carries the final flag: the device only commits and redraws
+    # once this last field's END arrives, so title+body land together instead
+    # of the headline updating first.
+    if args.tag is not None:
+        # Tags last, carrying the final flag: content and tag state then commit
+        # in one redraw rather than the tag flipping separately.
+        await session.push_field(FIELD_CONTENT_ID, args.content_id.encode("utf-8")[:32])
+        await session.push_field(FIELD_TAG_STATE, encode_tag_state([tuple(args.tag)]), final=True)
+    else:
+        await session.push_field(FIELD_CONTENT_ID, args.content_id.encode("utf-8")[:32], final=True)
+    print("  Pushed.")
 
 
 # --------------------------------------------------------------------------- #
@@ -512,45 +288,57 @@ async def run(args) -> None:
     print(f"Found: {device.name} ({device.address})")
 
     async with BleakClient(device.address) as client:
-        caps = parse_capabilities(bytes(await client.read_gatt_char(CAPABILITY_CHAR_UUID)))
+        caps = parse_capabilities(
+            bytes(await client.read_gatt_char(CAPABILITY_CHAR_UUID)), minimum_version=6, who="this script"
+        )
         print(
             f"  v{caps['version']} device {caps['device_id']}: {caps['px_wide']}x{caps['px_high']}px, "
             f"{caps['chars_wide']}x{caps['chars_high']} chars, icons {caps['icon_w']}x{caps['icon_h']}, "
             f"max image {caps['max_image']}B, {caps['max_sessions']} sessions"
         )
 
-        session = Session(client, caps)
-        print(f"  ATT MTU {client.mtu_size}, chunk payload {session.chunk_payload}B")
-        await client.start_notify(SESSION_CHAR_UUID, session.on_session_notify)
-        await client.start_notify(BUTTON_CHAR_UUID, Session.on_button_notify)
+        link = Link(client, caps)
+        link.on_button = report_button
+        print(f"  ATT MTU {client.mtu_size}, chunk payload {link.chunk_payload_size(FIELD_CONTENT_ID)}B")
+        await link.start_notify()
+
+        session = Session(SCRIPT_APP_ID, DISPLAY_NAME, install_id_bytes=install_id())
+        session.on_pending = report_pending
+        session.on_background = report_background
+        session.on_chunk_ack = report_chunk_ack
+        session.on_field_seq_gap = report_field_seq_gap
+        link.attach(session)
 
         token = None if args.forget else stored_token(caps["device_id"])
         if args.forget:
             print("  --forget: presenting no token, expect a pairing prompt.")
         reply = await session.hello(token)
-        if reply[0] == "denied":
-            raise SystemExit(f"HELLO denied: {reply[1]}")
-        _, session.session_id, new_token, session.asset_tags = reply
-        remember_token(caps["device_id"], new_token)
+        if not reply.ok:
+            raise SystemExit(f"HELLO denied: {reply.reason_text}")
+        remember_token(caps["device_id"], session.token)
         print(f"  Paired. sessionId={session.session_id}, asset tags="
               f"{ {k: v.hex() for k, v in session.asset_tags.items()} }")
 
         # Push only what the device does not already have — the device compares
         # nothing, so staleness is this side's conclusion.
-        declaration = encode_ui_declaration()
-        if session.asset_tags.get(FIELD_UI_DECL) != declaration[:4]:
-            await session.push_asset(FIELD_UI_DECL, declaration)
+        ui = declaration()
+        if session.asset_tags.get(FIELD_UI_DECL) != ui[:4]:
+            await push_asset(session, FIELD_UI_DECL, ui)
         else:
             print("  UI declaration already current.")
 
         if args.icon:
             icon = encode_icon(args.icon, caps["icon_w"], caps["icon_h"])
             if session.asset_tags.get(FIELD_ICON) != icon[:4]:
-                await session.push_asset(FIELD_ICON, icon)
+                await push_asset(session, FIELD_ICON, icon)
             else:
                 print("  icon already current.")
 
-        await session.acquire()
+        outcome = await session.acquire()
+        if outcome[0] != "foreground":
+            reason = ACQUIRE_DENIED_REASONS.get(outcome[1], f"unknown ({outcome[1]:#04x})")
+            raise SystemExit(f"ACQUIRE denied: {reason}")
+        print("  Screen acquired.")
 
         if args.image or args.image_from:
             if args.image:
@@ -558,23 +346,9 @@ async def run(args) -> None:
             else:
                 raw_bitmap = dither_to_raw_bitmap(args.image_from, caps["px_wide"], caps["px_high"])
                 print(f"  dithered to {len(raw_bitmap)} bytes of raw packed-2bpp")
-            await session.push_image(raw_bitmap)
+            await push_image(session, caps, raw_bitmap)
         elif not args.no_text:
-            body = Path(args.body_file).read_text(encoding="utf-8") if args.body_file else (args.body or DEFAULT_BODY)
-            print("Pushing title + body + content-id as one atomic batch...")
-            await session.push_field(FIELD_TITLE, args.title.encode("utf-8"))
-            await session.push_field(FIELD_BODY, body.encode("utf-8"))
-            # content-id carries the final flag: the device only commits and
-            # redraws once this last field's END arrives, so title+body land
-            # together instead of the headline updating first.
-            if args.tag is not None:
-                # Tags last, carrying the final flag: content and tag state then
-                # commit in one redraw rather than the tag flipping separately.
-                await session.push_field(FIELD_CONTENT_ID, args.content_id.encode("utf-8")[:32])
-                await session.push_field(FIELD_TAG_STATE, encode_tag_state([tuple(args.tag)]), final=True)
-            else:
-                await session.push_field(FIELD_CONTENT_ID, args.content_id.encode("utf-8")[:32], final=True)
-            print("  Pushed.")
+            await push_content(session, caps, args)
 
         if args.set_tag is not None:
             tag_id, state = args.set_tag
