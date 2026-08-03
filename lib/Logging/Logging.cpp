@@ -8,7 +8,13 @@
 #include <string>
 
 #define MAX_ENTRY_LEN 256
-#define MAX_LOG_LINES 16
+// RTC_NOINIT_ATTR shares the ESP32-C3's single ~8KB RTC memory region with a handful of other
+// RTC-persisted globals (HalSystem crash-context fields, main.cpp's wakeup markers). At 16 lines
+// this buffer was 4096 bytes, leaving ~2.6KB free in that region as of the 2026-08-03 build (see
+// firmware.map's rtc_iram_seg). 24 lines (6144 bytes) leaves ~550 bytes of headroom for those other
+// globals -- checked against the linker's own "RTC_SLOW segment data does not fit" assert, which is
+// the authoritative bound if this budget ever needs revisiting.
+#define MAX_LOG_LINES 24
 
 // Simple ring buffer log, useful for error reporting when we encounter a crash
 RTC_NOINIT_ATTR char logMessages[MAX_LOG_LINES][MAX_ENTRY_LEN];
