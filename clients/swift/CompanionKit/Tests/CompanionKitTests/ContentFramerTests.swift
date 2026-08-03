@@ -50,8 +50,16 @@ final class ContentFramerTests: XCTestCase {
     }
 
     func testEndPacket() {
+        // v11: END grew a required third byte, pushId. 0 (the default here)
+        // means "not awaiting a RENDER_STATUS for this push" — see the type's
+        // doc comment.
         let framer = ContentFramer(field: .title, sessionId: 4, payload: Data([1, 2, 3]), maxChunkPayload: 16)
-        XCTAssertEqual(Array(Array(framer).last!), [0x03, 4])
+        XCTAssertEqual(Array(Array(framer).last!), [0x03, 4, 0])
+    }
+
+    func testEndPacketCarriesTheChosenPushId() {
+        let framer = ContentFramer(field: .title, sessionId: 4, payload: Data([1, 2, 3]), pushId: 42, maxChunkPayload: 16)
+        XCTAssertEqual(Array(Array(framer).last!), [0x03, 4, 42])
     }
 
     func testEmptyPayloadStillProducesStartAndEnd() {

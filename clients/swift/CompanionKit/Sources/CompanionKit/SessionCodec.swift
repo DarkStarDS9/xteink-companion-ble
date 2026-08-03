@@ -9,13 +9,18 @@ public enum SessionMessage: Equatable, Sendable {
     case background(sessionId: UInt8, reason: BackgroundReason)
     case acquireDenied(sessionId: UInt8, reason: AcquireDeniedReason)
     case assetAck(sessionId: UInt8, assetId: UInt8, result: AssetResult, tag: AssetTag)
-    /// A push (image, `field == CompanionField.image.rawValue`, or a
-    /// title/body/content-id/tag content batch, `field ==
-    /// CompanionField.body.rawValue`) has been answered — see
-    /// ``SessionNotification/renderStatus`` and `RENDER_STATUS` in
-    /// `docs/companion-display-protocol.md`. Named `imageStatus` (3 bytes, no
-    /// `field`) through v10.
-    case renderStatus(sessionId: UInt8, result: RenderResult, field: UInt8)
+    /// A push has been answered — see ``SessionNotification/renderStatus`` and
+    /// `RENDER_STATUS` in `docs/companion-display-protocol.md`. Named
+    /// `imageStatus` (3 bytes, no trailing byte at all) through v10.
+    ///
+    /// `pushId` is whatever the pushing client sent on the final-flagged
+    /// field's END (see ``ContentFramer``'s END layout and
+    /// `CompanionModeActivity.cpp`'s `g_pendingBatchPushId`) — the device
+    /// never interprets it, only echoes it, so correlating a `RENDER_STATUS`
+    /// to the push that earned it no longer depends on a fixed set of field
+    /// ids (`CompanionField.image`/`.body`) the way the field byte this
+    /// replaced did. See ``CompanionClient/pendingRenders``.
+    case renderStatus(sessionId: UInt8, result: RenderResult, pushId: UInt8)
     /// v9: progress marker during an in-flight image push — see
     /// ``SessionNotification/imageChunkAck``. `seq` is the highest
     /// contiguous CHUNK sequence number the device has processed.
@@ -132,8 +137,8 @@ public enum SessionCodec {
                              tag: AssetTag(tag))
 
         case .renderStatus:
-            guard let sessionId = data.byte(1), let result = data.byte(2), let field = data.byte(3) else { return nil }
-            return .renderStatus(sessionId: sessionId, result: RenderResult(wire: result), field: field)
+            guard let sessionId = data.byte(1), let result = data.byte(2), let pushId = data.byte(3) else { return nil }
+            return .renderStatus(sessionId: sessionId, result: RenderResult(wire: result), pushId: pushId)
 
         case .imageChunkAck:
             guard let sessionId = data.byte(1), let seq = data.uint16LE(at: 2) else { return nil }

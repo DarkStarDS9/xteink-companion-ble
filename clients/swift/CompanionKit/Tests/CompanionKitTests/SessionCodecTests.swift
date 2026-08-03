@@ -143,15 +143,19 @@ final class SessionCodecTests: XCTestCase {
                                  assetId: 0x05,
                                  result: .stored,
                                  tag: AssetTag(Data([0xDE, 0xAD, 0xBE, 0xEF]))))
-        // v11: RENDER_STATUS gained a trailing `field` byte over the v10 3-byte
+        // v11: RENDER_STATUS gained a trailing byte over the v10 3-byte
         // IMAGE_STATUS payload — see "Session characteristic" in
-        // docs/companion-display-protocol.md.
+        // docs/companion-display-protocol.md. That byte is the pushing
+        // client's own chosen `pushId`, echoed verbatim (not a `field` id —
+        // an earlier shape of this same day's v11 landing used one, but no
+        // consumer app had adopted it yet, so it was replaced before ever
+        // shipping).
         XCTAssertEqual(SessionCodec.decode(Data([0x88, 0x01, 0x01, 0x04])),
-                       .renderStatus(sessionId: 1, result: .decodeFailed, field: 0x04))
+                       .renderStatus(sessionId: 1, result: .decodeFailed, pushId: 0x04))
         XCTAssertEqual(SessionCodec.decode(Data([0x88, 0x01, 0x00, 0x02])),
-                       .renderStatus(sessionId: 1, result: .displayed, field: 0x02))
-        // A pre-v11 3-byte payload (no `field`) is now malformed and decodes to
-        // nil rather than being silently misparsed.
+                       .renderStatus(sessionId: 1, result: .displayed, pushId: 0x02))
+        // A pre-v11 3-byte payload (no trailing byte) is now malformed and
+        // decodes to nil rather than being silently misparsed.
         XCTAssertNil(SessionCodec.decode(Data([0x88, 0x01, 0x01])))
     }
 

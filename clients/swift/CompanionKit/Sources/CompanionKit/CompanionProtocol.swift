@@ -70,10 +70,13 @@ enum SessionNotification: UInt8 {
     case acquireDenied = 0x86
     case assetAck = 0x87
     /// Named `imageStatus` through v10, when it only ever answered an image
-    /// push. v11 widens the payload with a trailing `field` byte so the same
-    /// opcode also answers a title/body/content-id/tag content batch — see
+    /// push. v11 widens the payload with a trailing byte so the same opcode
+    /// also answers a title/body/content-id/tag content batch — see
     /// ``RenderResult`` and `docs/companion-display-protocol.md`'s
-    /// `RENDER_STATUS` section.
+    /// `RENDER_STATUS` section. That trailing byte was a `field` id
+    /// (``CompanionField/image``/``CompanionField/body``) for exactly one day
+    /// before landing here as a client-chosen `pushId` instead — see
+    /// ``SessionMessage/renderStatus``.
     case renderStatus = 0x88
     /// v9: progress marker sent every ``ContentFramer/imageChunkAckInterval``
     /// chunks during an image push over Write Without Response, well before
@@ -132,7 +135,7 @@ public enum AssetResult: UInt8, Sendable {
 /// Outcome of a push, as reported by `RENDER_STATUS`. Named `ImageResult`
 /// through v10, when it only ever answered an image push; renamed in the v11
 /// generalization to a title/body/content-id/tag content batch too — see
-/// ``CompanionEvent/renderStatus(field:result:)``. The cases needed no change:
+/// ``CompanionEvent/renderStatus(result:)``. The cases needed no change:
 /// ``sequenceGap`` and ``storageFailed`` are just as meaningful for a
 /// discarded/failed text batch as for an image.
 public enum RenderResult: UInt8, Sendable {

@@ -56,18 +56,30 @@ public enum CompanionEvent: Sendable {
     case lostScreen(BackgroundReason)
     case acquireDenied(AcquireDeniedReason)
     case buttonEvent(CompanionButtonEvent)
-    /// A push has actually reached the panel (or failed to). `field` is
-    /// ``CompanionField/image`` for `pushImage` or ``CompanionField/body`` for
-    /// a `push(title:body:contentId:tags:)` content batch — see
+    /// A push has actually reached the panel (or failed to) — see
     /// ``RenderResult`` and `docs/companion-display-protocol.md`'s
     /// `RENDER_STATUS` section. Named `imageStatus(ImageResult)` through v10,
     /// when it only ever fired for an image; `pushImage`/`push(...,
-    /// awaitRender:)` already resolve from the matching one of these, so most
-    /// callers only need this for diagnostics/logging.
-    case renderStatus(field: CompanionField, result: RenderResult)
+    /// awaitRender:)` already resolve from the matching one of these (each
+    /// correlates on its own internally-generated push id — see
+    /// ``CompanionClient/pendingRenders``), so most callers only need this
+    /// case for diagnostics/logging.
+    ///
+    /// Carries only `result`, not the wire's `pushId`: that id is this
+    /// package's own bookkeeping detail (a monotonic counter `push`/
+    /// `pushImage` allocate internally — see ``CompanionClient/allocatePushId()``),
+    /// never handed to the caller in the first place, so surfacing it here
+    /// would just be a number the app never chose and cannot correlate to
+    /// anything on its side. A `field` (this case's v11-launch-day shape, live
+    /// for one day before this replaced it) would have been more familiar but
+    /// wrong for the same reason the device's own field byte was replaced —
+    /// see ``RenderResult`` and the END-framing change this shipped with: it
+    /// doesn't generalize past "image" and "the one text batch field", while a
+    /// bare result generalizes to any future push type for free.
+    case renderStatus(result: RenderResult)
     /// v9: progress marker during an in-flight image push, roughly every 32
     /// chunks — see ``SessionNotification/imageChunkAck``. Diagnostic only;
-    /// `pushImage` still resolves from the final ``renderStatus(field:result:)``.
+    /// `pushImage` still resolves from the final ``renderStatus(result:)``.
     case imageChunkAck(seq: UInt16)
     /// v10: a title/body push's CHUNK sequence number skipped ahead of what
     /// the device expected, under Write Without Response — see
@@ -164,16 +176,28 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     private var pendingHello: Pending<SessionMessage>?
     private var pendingAcquire: Pending<Void>?
     private var pendingAssetAcks: [UInt8: Pending<AssetResult>] = [:]
-    /// Resolved by a `RENDER_STATUS` naming ``CompanionField/image``.
-    private var pendingImageStatus: Pending<RenderResult>?
-    /// Resolved by a `RENDER_STATUS` naming ``CompanionField/body`` (standing
-    /// in for a whole title/body/content-id/tag batch — see
-    /// `docs/companion-display-protocol.md`). Kept as a separate `Pending`
-    /// from ``pendingImageStatus`` rather than one shared slot: without a
-    /// field-keyed split, a content push racing an image push could resolve
-    /// the wrong one's waiter (see ``push(title:body:contentId:tags:awaitRender:)``'s
-    /// doc comment for the exact race this prevents).
-    private var pendingContentRenderStatus: Pending<RenderResult>?
+    /// Renders currently awaiting a `RENDER_STATUS` answer, keyed by the push
+    /// id this client chose for each — see ``allocatePushId()`` and
+    /// ``ContentFramer``'s doc comment on the wire's `pushId`.
+    ///
+    /// Replaces the v11-launch-day pair of fixed slots (`pendingImageStatus`
+    /// for an image push, `pendingContentRenderStatus` for a text batch,
+    /// split because a `RENDER_STATUS` only ever carried a `field` byte that
+    /// could tell those two apart). Correlation is now exact — an image push
+    /// and a text push in flight together resolve from their own dictionary
+    /// entries and can never resolve each other's waiter — so there is no
+    /// longer a reason to size this to "the two kinds of push that exist
+    /// today"; a future push type needs no new slot here.
+    ///
+    /// Entries are removed the moment they resolve, fail, or time out (see
+    /// ``withPendingRender(pushId:timeout:_:)``), so this cannot grow without
+    /// bound even though `pushId` only has 255 non-zero values to cycle
+    /// through.
+    private var pendingRenders: [UInt8: Pending<RenderResult>] = [:]
+    /// Next id ``allocatePushId()`` hands out. Starts at 1 because 0 is
+    /// reserved on the wire for "no answer wanted" — see
+    /// ``ContentFramer``'s doc comment.
+    private var nextPushId: UInt8 = 1
 
     private var eventContinuation: AsyncStream<CompanionEvent>.Continuation?
     /// Events from the device. A single consumer; iterate it in a `Task`.
@@ -388,8 +412,12 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         guard !fields.isEmpty else { return nil }
 
         // See the doc comment above: only a batch that changes title or body
-        // ever reaches the render path that answers RENDER_STATUS(field=body).
+        // ever reaches the render path that answers RENDER_STATUS.
         let shouldAwaitRender = awaitRender && (title != nil || body != nil)
+        // pushId 0 ("no answer wanted") when nothing will be waiting for one —
+        // allocating a real id nobody will ever look up would just occupy a
+        // ``pendingRenders`` slot the device has no reason to answer.
+        let pushId = shouldAwaitRender ? allocatePushId() : 0
 
         return try await serialized { [self] in
             let session = try requireSession()
@@ -399,7 +427,8 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
                 for (index, field) in fields.enumerated() {
                     try await sendField(field.0, payload: field.1,
                                         sessionId: session,
-                                        isFinal: index == fields.count - 1)
+                                        isFinal: index == fields.count - 1,
+                                        pushId: pushId)
                 }
             }
 
@@ -407,7 +436,7 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
                 try await sendAllFields()
                 return nil
             }
-            return try await withPendingContentRenderStatus(sendAllFields)
+            return try await withPendingRender(pushId: pushId, timeout: Self.contentRenderStatusTimeout, sendAllFields)
         }
     }
 
@@ -475,8 +504,12 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         if let limit = deviceCapabilities?.maxImageFieldLength, png.count > limit {
             throw CompanionError.payloadTooLarge(field: .image, bytes: png.count, limit: limit)
         }
-        return try await withPendingImageStatus {
-            try await self.sendField(.image, payload: png, sessionId: session, isFinal: true, progress: progress)
+        // pushImage always awaits its RENDER_STATUS (there is no fire-and-forget
+        // variant), so it always allocates a real id.
+        let pushId = allocatePushId()
+        return try await withPendingRender(pushId: pushId, timeout: 120) {
+            try await self.sendField(.image, payload: png, sessionId: session, isFinal: true, pushId: pushId,
+                                     progress: progress)
         }
     }
 
@@ -684,6 +717,7 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
                            payload: Data,
                            sessionId: UInt8,
                            isFinal: Bool,
+                           pushId: UInt8 = 0,
                            progress: (@Sendable (Double) -> Void)? = nil) async throws {
         lock.lock()
         let characteristic = contentChar
@@ -713,6 +747,7 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
                                    sessionId: sessionId,
                                    payload: payload,
                                    isFinal: isFinal,
+                                   pushId: pushId,
                                    maxChunkPayload: ContentFramer.chunkPayloadSize(forATTPayload: attPayload, field: field))
         let total = framer.packetCount
         var sent = 0
@@ -889,14 +924,6 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         return try await awaitReply(pending, timeout: 15, body: body)
     }
 
-    private func withPendingImageStatus(_ body: @escaping () async throws -> Void) async throws -> RenderResult {
-        // Generous: the device stages to SD and then runs a two-pass grayscale
-        // settle after the last byte arrives.
-        let pending = Pending<RenderResult>()
-        lock.lock(); pendingImageStatus = pending; lock.unlock()
-        return try await awaitReply(pending, timeout: 120, body: body)
-    }
-
     /// Timeout for ``push(title:body:contentId:tags:awaitRender:)``. Measured
     /// on hardware: a full-page text push completes on the wire in ~0.24s, and
     /// the panel's own layout + refresh-cycle settle takes a further ~2.2s —
@@ -905,15 +932,52 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     /// a busy connection interval renegotiation) while staying "seconds, not
     /// tens of seconds" — this is meant to bound a caller holding the
     /// ``CommandGate`` (see ``push``'s doc comment), not to be a generous
-    /// fallback like ``withPendingImageStatus``'s 120s, which covers an
-    /// entirely different order of transfer (a ~104 KB image over many
-    /// seconds, not a few CHUNKs).
+    /// fallback like `pushImage`'s 120s, which covers an entirely different
+    /// order of transfer (a ~104 KB image over many seconds, not a few
+    /// CHUNKs).
     private static let contentRenderStatusTimeout: TimeInterval = 8
 
-    private func withPendingContentRenderStatus(_ body: @escaping () async throws -> Void) async throws -> RenderResult {
+    /// Allocates the next id for a push that wants a `RENDER_STATUS` answer.
+    /// Monotonic and wrapping, guarded by ``lock`` like every other piece of
+    /// this class's mutable state; skips 0, which the wire reserves for "no
+    /// answer wanted" (see ``ContentFramer``'s doc comment). Collisions are
+    /// avoided in practice, not by construction: 255 in-flight pushes sharing
+    /// one ``CommandGate``-serialized connection at once is not a real
+    /// scenario, so wraparound landing on a still-outstanding id is
+    /// vanishingly unlikely rather than impossible — the same tradeoff the
+    /// device's own firmware makes for the identical wire value.
+    private func allocatePushId() -> UInt8 {
+        lock.lock(); defer { lock.unlock() }
+        let id = nextPushId
+        nextPushId = (nextPushId == UInt8.max) ? 1 : nextPushId + 1
+        return id
+    }
+
+    /// Runs `body` (which sends the push) and waits for the `RENDER_STATUS`
+    /// carrying `pushId` — see ``pendingRenders``. `pushId` must be non-zero;
+    /// callers that do not want an answer (``push(title:body:contentId:tags:awaitRender:)``
+    /// with `awaitRender: false`) skip this entirely rather than calling it
+    /// with 0, since there is nothing here to wait for in that case.
+    private func withPendingRender(pushId: UInt8,
+                                   timeout: TimeInterval,
+                                   _ body: @escaping () async throws -> Void) async throws -> RenderResult {
         let pending = Pending<RenderResult>()
-        lock.lock(); pendingContentRenderStatus = pending; lock.unlock()
-        return try await awaitReply(pending, timeout: Self.contentRenderStatusTimeout, body: body)
+        lock.lock(); pendingRenders[pushId] = pending; lock.unlock()
+        // Removed here rather than left for the resolving notification alone:
+        // a RENDER_STATUS that never arrives (dropped notification, or the
+        // link died without a background/disconnect handler running yet) must
+        // not leave this id permanently occupied — `pushId` only has 255
+        // non-zero values, and a stuck entry would eventually collide with a
+        // later, legitimate push using the same wrapped id. Identity-checked
+        // (`===`) rather than unconditional removal, so this cannot delete a
+        // *different* Pending that a later call already installed at the same
+        // key after this one settled.
+        defer {
+            lock.lock()
+            if pendingRenders[pushId] === pending { pendingRenders.removeValue(forKey: pushId) }
+            lock.unlock()
+        }
+        return try await awaitReply(pending, timeout: timeout, body: body)
     }
 
     /// Runs `body` (which sends something) and waits for the matching
@@ -947,15 +1011,13 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         let hello = pendingHello; pendingHello = nil
         let acquire = pendingAcquire; pendingAcquire = nil
         let acks = pendingAssetAcks; pendingAssetAcks = [:]
-        let image = pendingImageStatus; pendingImageStatus = nil
-        let contentRender = pendingContentRenderStatus; pendingContentRenderStatus = nil
+        let renders = pendingRenders; pendingRenders = [:]
         lock.unlock()
 
         hello?.fail(error)
         acquire?.fail(error)
         acks.values.forEach { $0.fail(error) }
-        image?.fail(error)
-        contentRender?.fail(error)
+        renders.values.forEach { $0.fail(error) }
     }
 
     private func emit(_ event: CompanionEvent) {
@@ -1026,27 +1088,25 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
             lock.lock(); let pending = pendingAssetAcks.removeValue(forKey: assetId); lock.unlock()
             pending?.resume(result)
 
-        case let .renderStatus(session, result, fieldByte):
+        case let .renderStatus(session, result, pushId):
             guard session == currentSession else { return }
-            // Route by field so an image push's waiter and a content push's
+            // Route by pushId so an image push's waiter and a content push's
             // waiter can never resolve each other's notification. This is the
-            // exact race the v11 field byte exists to prevent: a text push
+            // exact race the v11 field byte was originally introduced to
+            // prevent, and pushId prevents it more precisely: a text push
             // returns on the wire in ~0.24s, the app immediately starts an
             // image push, and ~2.2s later the *earlier* text render completes
-            // and emits RENDER_STATUS — pre-v11 (or without this field check)
-            // that resolves the image's ``pendingImageStatus`` early, so
-            // ``pushImage`` reports success before the image is actually on
-            // screen. See ``pendingContentRenderStatus``'s doc comment.
-            if fieldByte == CompanionField.image.rawValue {
-                lock.lock(); let pending = pendingImageStatus; pendingImageStatus = nil; lock.unlock()
-                pending?.resume(result)
-            } else if fieldByte == CompanionField.body.rawValue {
-                lock.lock(); let pending = pendingContentRenderStatus; pendingContentRenderStatus = nil; lock.unlock()
-                pending?.resume(result)
-            }
-            if let field = CompanionField(rawValue: fieldByte) {
-                emit(.renderStatus(field: field, result: result))
-            }
+            // and emits RENDER_STATUS — without per-push correlation that
+            // resolves the image's waiter early, so `pushImage` would report
+            // success before the image is actually on screen. Looking the id
+            // up rather than trusting it: a notification whose pushId matches
+            // nothing pending (nothing was waiting, or it already timed out
+            // and was removed — see `withPendingRender`) is ignored rather
+            // than resolving some unrelated push, which a field-keyed scheme
+            // could not even express as a failure mode.
+            lock.lock(); let pending = pendingRenders.removeValue(forKey: pushId); lock.unlock()
+            pending?.resume(result)
+            emit(.renderStatus(result: result))
 
         case let .imageChunkAck(session, seq):
             guard session == currentSession else { return }

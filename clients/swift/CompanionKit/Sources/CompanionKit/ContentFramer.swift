@@ -11,8 +11,18 @@ import Foundation
 /// START:  0x01 | field|final | sessionId | length uint32 LE      (7 bytes)
 /// CHUNK:  0x02 | sessionId   | payload...                          (content-id, UI decl, icon, tag state)
 /// CHUNK:  0x02 | sessionId   | seq uint16 LE | payload...           (image v9+, title/body v10+)
-/// END:    0x03 | sessionId
+/// END:    0x03 | sessionId | pushId
 /// ```
+///
+/// v11: END grew a required third byte, `pushId` (no shorter, 2-byte form is
+/// legal any more). It is this framer's `pushId`, verbatim. The device only
+/// *retains* the id from the final-flagged field of a batch — see
+/// `CompanionModeActivity.cpp`'s `g_pendingBatchPushId` — but every field's
+/// END still carries one, so every `ContentFramer` for a given push (whether
+/// or not it is the final-flagged field) is given the same id. `pushId` 0
+/// means "I am not awaiting a `RENDER_STATUS` for this push", which the
+/// device honors by not notifying at all rather than sending one nobody
+/// asked for.
 ///
 /// The image, title and body fields' CHUNKs carry an extra 2-byte sequence
 /// number because they are pushed over Write Without Response (see
@@ -28,6 +38,9 @@ public struct ContentFramer: Sequence {
     /// everything it has buffered when this field's END arrives. Use it on the
     /// last field of a title+body+content-id batch so they land together.
     public let isFinal: Bool
+    /// Carried on this field's END — see the type's doc comment above for why
+    /// every field of a batch gets the same value, and what 0 means.
+    public let pushId: UInt8
     /// Payload bytes per CHUNK, already netted against this field's CHUNK
     /// framing overhead — see ``ContentFramer/chunkPayloadSize(forATTPayload:field:)``.
     public let maxChunkPayload: Int
@@ -41,12 +54,14 @@ public struct ContentFramer: Sequence {
                 sessionId: UInt8,
                 payload: Data,
                 isFinal: Bool = false,
+                pushId: UInt8 = 0,
                 maxChunkPayload: Int) {
         precondition(maxChunkPayload > 0, "chunk payload must be positive")
         self.field = field
         self.sessionId = sessionId
         self.payload = payload
         self.isFinal = isFinal
+        self.pushId = pushId
         self.maxChunkPayload = maxChunkPayload
     }
 
@@ -111,7 +126,7 @@ public struct ContentFramer: Sequence {
 
             case .end:
                 stage = .done
-                return Data([CompanionProtocol.opEnd, framer.sessionId])
+                return Data([CompanionProtocol.opEnd, framer.sessionId, framer.pushId])
 
             case .done:
                 return nil
