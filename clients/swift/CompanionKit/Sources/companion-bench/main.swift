@@ -298,8 +298,8 @@ let listener = Task {
             // still commits, so the surviving field lands and the dropped one
             // keeps whatever the previous article left on screen.
             say("!! device dropped field \(field) (CHUNK sequence gap)")
-        case .imageStatus(let result):
-            say("image status: \(result)")
+        case .renderStatus(let field, let result):
+            say("render status: field=\(field) result=\(result)")
         case .imageChunkAck(let seq):
             say("chunk ack: seq=\(seq)")
         case .lostScreen(let reason):

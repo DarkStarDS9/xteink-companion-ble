@@ -56,10 +56,18 @@ public enum CompanionEvent: Sendable {
     case lostScreen(BackgroundReason)
     case acquireDenied(AcquireDeniedReason)
     case buttonEvent(CompanionButtonEvent)
-    case imageStatus(ImageResult)
+    /// A push has actually reached the panel (or failed to). `field` is
+    /// ``CompanionField/image`` for `pushImage` or ``CompanionField/body`` for
+    /// a `push(title:body:contentId:tags:)` content batch — see
+    /// ``RenderResult`` and `docs/companion-display-protocol.md`'s
+    /// `RENDER_STATUS` section. Named `imageStatus(ImageResult)` through v10,
+    /// when it only ever fired for an image; `pushImage`/`push(...,
+    /// awaitRender:)` already resolve from the matching one of these, so most
+    /// callers only need this for diagnostics/logging.
+    case renderStatus(field: CompanionField, result: RenderResult)
     /// v9: progress marker during an in-flight image push, roughly every 32
     /// chunks — see ``SessionNotification/imageChunkAck``. Diagnostic only;
-    /// `pushImage` still resolves from the final `imageStatus`.
+    /// `pushImage` still resolves from the final ``renderStatus(field:result:)``.
     case imageChunkAck(seq: UInt16)
     /// v10: a title/body push's CHUNK sequence number skipped ahead of what
     /// the device expected, under Write Without Response — see
@@ -156,7 +164,16 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     private var pendingHello: Pending<SessionMessage>?
     private var pendingAcquire: Pending<Void>?
     private var pendingAssetAcks: [UInt8: Pending<AssetResult>] = [:]
-    private var pendingImageStatus: Pending<ImageResult>?
+    /// Resolved by a `RENDER_STATUS` naming ``CompanionField/image``.
+    private var pendingImageStatus: Pending<RenderResult>?
+    /// Resolved by a `RENDER_STATUS` naming ``CompanionField/body`` (standing
+    /// in for a whole title/body/content-id/tag batch — see
+    /// `docs/companion-display-protocol.md`). Kept as a separate `Pending`
+    /// from ``pendingImageStatus`` rather than one shared slot: without a
+    /// field-keyed split, a content push racing an image push could resolve
+    /// the wrong one's waiter (see ``push(title:body:contentId:tags:awaitRender:)``'s
+    /// doc comment for the exact race this prevents).
+    private var pendingContentRenderStatus: Pending<RenderResult>?
 
     private var eventContinuation: AsyncStream<CompanionEvent>.Continuation?
     /// Events from the device. A single consumer; iterate it in a `Task`.
@@ -331,10 +348,34 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     /// device; content-id over 32 bytes likewise. Pass a fresh `contentId` with
     /// every update if you care about correlating button events to what was on
     /// screen when they were pressed.
+    ///
+    /// - Parameter awaitRender: when `true`, does not return until the device
+    ///   reports the batch is actually on the panel (`RENDER_STATUS`,
+    ///   ``CompanionField/body``) — not merely that the BLE transfer finished.
+    ///   **Default `false`, so existing callers are unaffected and never
+    ///   block.** Opt in for exactly the case this exists for: SpokenFeeds
+    ///   wants to hold audio playback until the article text it just pushed is
+    ///   visible, and measured on hardware, the wire transfer for a full-page
+    ///   text push completes in ~0.24s while the panel's own settle takes a
+    ///   further ~2.2s — a caller that only awaited the transfer would start
+    ///   playback ~2s before the text is actually there. A second method
+    ///   (`pushAndAwaitRender`, say) was considered and rejected: it would
+    ///   duplicate this method's field-building and batching logic for a
+    ///   change that is entirely "wait a bit longer before returning", which
+    ///   is exactly what an opt-in parameter is for.
+    ///
+    ///   No-ops (sends normally, returns `nil` immediately) if the batch has no
+    ///   title or body — a batch of content-id and/or tags alone commits
+    ///   without ever taking the render path that answers this, so awaiting it
+    ///   would just consume the full timeout for nothing.
+    /// - Returns: the render result if `awaitRender` was `true` and something
+    ///   was actually awaited; `nil` otherwise.
+    @discardableResult
     public func push(title: String? = nil,
                      body: String? = nil,
                      contentId: Data? = nil,
-                     tags: TagStateUpdate? = nil) async throws {
+                     tags: TagStateUpdate? = nil,
+                     awaitRender: Bool = false) async throws -> RenderResult? {
         var fields: [(CompanionField, Data)] = []
         if let title { fields.append((.title, Data(title.utf8))) }
         if let body { fields.append((.body, Data(body.utf8))) }
@@ -344,25 +385,41 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         // wears the previous content's tags. Tags are not reset by a push, so
         // passing them here is the only way to change both atomically.
         if let tags { fields.append((.tagState, tags.encoded())) }
-        guard !fields.isEmpty else { return }
+        guard !fields.isEmpty else { return nil }
 
-        try await serialized { [self] in
+        // See the doc comment above: only a batch that changes title or body
+        // ever reaches the render path that answers RENDER_STATUS(field=body).
+        let shouldAwaitRender = awaitRender && (title != nil || body != nil)
+
+        return try await serialized { [self] in
             let session = try requireSession()
             self.lock.lock(); self.lastContentId = contentId; self.lock.unlock()
-            for (index, field) in fields.enumerated() {
-                try await sendField(field.0, payload: field.1,
-                                    sessionId: session,
-                                    isFinal: index == fields.count - 1)
+
+            func sendAllFields() async throws {
+                for (index, field) in fields.enumerated() {
+                    try await sendField(field.0, payload: field.1,
+                                        sessionId: session,
+                                        isFinal: index == fields.count - 1)
+                }
             }
+
+            guard shouldAwaitRender else {
+                try await sendAllFields()
+                return nil
+            }
+            return try await withPendingContentRenderStatus(sendAllFields)
         }
     }
 
-    /// Convenience over ``push(title:body:contentId:tags:)`` for a string content-id.
+    /// Convenience over ``push(title:body:contentId:tags:awaitRender:)`` for a
+    /// string content-id.
+    @discardableResult
     public func push(title: String? = nil,
                      body: String? = nil,
                      contentId: String,
-                     tags: TagStateUpdate? = nil) async throws {
-        try await push(title: title, body: body, contentId: Data(contentId.utf8), tags: tags)
+                     tags: TagStateUpdate? = nil,
+                     awaitRender: Bool = false) async throws -> RenderResult? {
+        try await push(title: title, body: body, contentId: Data(contentId.utf8), tags: tags, awaitRender: awaitRender)
     }
 
     /// Pushes an already-dithered, already-encoded PNG and waits for the device
@@ -386,7 +443,7 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     /// exactly what is happening on the wire. A caller that wants to say so in
     /// its UI can watch for the progress value decreasing.
     @discardableResult
-    public func pushImage(_ png: Data, progress: (@Sendable (Double) -> Void)? = nil) async throws -> ImageResult {
+    public func pushImage(_ png: Data, progress: (@Sendable (Double) -> Void)? = nil) async throws -> RenderResult {
         try await serialized { [self] in
             // Note the retry lives *inside* `serialized`: the gate is acquired
             // once for both attempts. Retrying by re-calling `pushImage` would
@@ -413,7 +470,7 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
 
     /// One transfer attempt. Assumes the command gate is already held.
     private func attemptImagePush(_ png: Data,
-                                  progress: (@Sendable (Double) -> Void)?) async throws -> ImageResult {
+                                  progress: (@Sendable (Double) -> Void)?) async throws -> RenderResult {
         let session = try requireSession()
         if let limit = deviceCapabilities?.maxImageFieldLength, png.count > limit {
             throw CompanionError.payloadTooLarge(field: .image, bytes: png.count, limit: limit)
@@ -430,28 +487,28 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
     /// and never where a second attempt would just buy the same failure at
     /// double the wait. Case by case:
     ///
-    /// - ``ImageResult/sequenceGap``: **retry.** A CHUNK went missing under
+    /// - ``RenderResult/sequenceGap``: **retry.** A CHUNK went missing under
     ///   Write Without Response, which has no delivery guarantee and no
     ///   retransmission anywhere in this protocol — one dropped packet
     ///   currently kills the entire transfer. That is precisely the failure a
     ///   retry exists for, and it is per-packet luck rather than anything about
     ///   the image.
-    /// - ``ImageResult/storageFailed``: **retry.** The device stages the image
+    /// - ``RenderResult/storageFailed``: **retry.** The device stages the image
     ///   to an SD scratch file; a failed write is a card/filesystem hiccup, not
     ///   a property of the payload. If the card is genuinely gone the retry
     ///   fails the same way and the caller sees the error one attempt later.
-    /// - ``ImageResult/rejectedSize``: **no.** Deterministic, and computable
+    /// - ``RenderResult/rejectedSize``: **no.** Deterministic, and computable
     ///   from the capability characteristic — the same bytes are the same size
     ///   next time.
-    /// - ``ImageResult/decodeFailed``: **no.** Also deterministic in the payload:
+    /// - ``RenderResult/decodeFailed``: **no.** Also deterministic in the payload:
     ///   a complete transfer that the device could not make sense of will not
     ///   make more sense on a second reading. (A *truncated* transfer is not
     ///   this case — the device reports that as a sequence gap.)
-    /// - ``ImageResult/unknown``: **no.** A result byte this package does not
+    /// - ``RenderResult/unknown``: **no.** A result byte this package does not
     ///   recognise carries no claim that it is transient, and blind retrying on
     ///   "don't know" is how a future permanent rejection turns into a doubled
     ///   wait for every caller.
-    private static func isTransientImageFailure(_ result: ImageResult) -> Bool {
+    private static func isTransientImageFailure(_ result: RenderResult) -> Bool {
         switch result {
         case .sequenceGap, .storageFailed:
             return true
@@ -827,12 +884,31 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         return try await awaitReply(pending, timeout: 15, body: body)
     }
 
-    private func withPendingImageStatus(_ body: @escaping () async throws -> Void) async throws -> ImageResult {
+    private func withPendingImageStatus(_ body: @escaping () async throws -> Void) async throws -> RenderResult {
         // Generous: the device stages to SD and then runs a two-pass grayscale
         // settle after the last byte arrives.
-        let pending = Pending<ImageResult>()
+        let pending = Pending<RenderResult>()
         lock.lock(); pendingImageStatus = pending; lock.unlock()
         return try await awaitReply(pending, timeout: 120, body: body)
+    }
+
+    /// Timeout for ``push(title:body:contentId:tags:awaitRender:)``. Measured
+    /// on hardware: a full-page text push completes on the wire in ~0.24s, and
+    /// the panel's own layout + refresh-cycle settle takes a further ~2.2s —
+    /// so the true answer normally lands well under 3s. 8s leaves roughly 3x
+    /// headroom over that measured worst case (a slower settle, a bigger page,
+    /// a busy connection interval renegotiation) while staying "seconds, not
+    /// tens of seconds" — this is meant to bound a caller holding the
+    /// ``CommandGate`` (see ``push``'s doc comment), not to be a generous
+    /// fallback like ``withPendingImageStatus``'s 120s, which covers an
+    /// entirely different order of transfer (a ~104 KB image over many
+    /// seconds, not a few CHUNKs).
+    private static let contentRenderStatusTimeout: TimeInterval = 8
+
+    private func withPendingContentRenderStatus(_ body: @escaping () async throws -> Void) async throws -> RenderResult {
+        let pending = Pending<RenderResult>()
+        lock.lock(); pendingContentRenderStatus = pending; lock.unlock()
+        return try await awaitReply(pending, timeout: Self.contentRenderStatusTimeout, body: body)
     }
 
     /// Runs `body` (which sends something) and waits for the matching
@@ -867,12 +943,14 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
         let acquire = pendingAcquire; pendingAcquire = nil
         let acks = pendingAssetAcks; pendingAssetAcks = [:]
         let image = pendingImageStatus; pendingImageStatus = nil
+        let contentRender = pendingContentRenderStatus; pendingContentRenderStatus = nil
         lock.unlock()
 
         hello?.fail(error)
         acquire?.fail(error)
         acks.values.forEach { $0.fail(error) }
         image?.fail(error)
+        contentRender?.fail(error)
     }
 
     private func emit(_ event: CompanionEvent) {
@@ -943,11 +1021,27 @@ public final class CompanionClient: NSObject, @unchecked Sendable {
             lock.lock(); let pending = pendingAssetAcks.removeValue(forKey: assetId); lock.unlock()
             pending?.resume(result)
 
-        case let .imageStatus(session, result):
+        case let .renderStatus(session, result, fieldByte):
             guard session == currentSession else { return }
-            lock.lock(); let pending = pendingImageStatus; pendingImageStatus = nil; lock.unlock()
-            pending?.resume(result)
-            emit(.imageStatus(result))
+            // Route by field so an image push's waiter and a content push's
+            // waiter can never resolve each other's notification. This is the
+            // exact race the v11 field byte exists to prevent: a text push
+            // returns on the wire in ~0.24s, the app immediately starts an
+            // image push, and ~2.2s later the *earlier* text render completes
+            // and emits RENDER_STATUS — pre-v11 (or without this field check)
+            // that resolves the image's ``pendingImageStatus`` early, so
+            // ``pushImage`` reports success before the image is actually on
+            // screen. See ``pendingContentRenderStatus``'s doc comment.
+            if fieldByte == CompanionField.image.rawValue {
+                lock.lock(); let pending = pendingImageStatus; pendingImageStatus = nil; lock.unlock()
+                pending?.resume(result)
+            } else if fieldByte == CompanionField.body.rawValue {
+                lock.lock(); let pending = pendingContentRenderStatus; pendingContentRenderStatus = nil; lock.unlock()
+                pending?.resume(result)
+            }
+            if let field = CompanionField(rawValue: fieldByte) {
+                emit(.renderStatus(field: field, result: result))
+            }
 
         case let .imageChunkAck(session, seq):
             guard session == currentSession else { return }

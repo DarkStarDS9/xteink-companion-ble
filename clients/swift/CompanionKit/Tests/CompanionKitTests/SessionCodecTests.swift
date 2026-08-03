@@ -137,14 +137,22 @@ final class SessionCodecTests: XCTestCase {
                        .acquireDenied(sessionId: 1, reason: .noUiDeclaration))
     }
 
-    func testDecodeAssetAckAndImageStatus() {
+    func testDecodeAssetAckAndRenderStatus() {
         XCTAssertEqual(SessionCodec.decode(Data([0x87, 0x01, 0x05, 0x00, 0xDE, 0xAD, 0xBE, 0xEF])),
                        .assetAck(sessionId: 1,
                                  assetId: 0x05,
                                  result: .stored,
                                  tag: AssetTag(Data([0xDE, 0xAD, 0xBE, 0xEF]))))
-        XCTAssertEqual(SessionCodec.decode(Data([0x88, 0x01, 0x01])),
-                       .imageStatus(sessionId: 1, result: .decodeFailed))
+        // v11: RENDER_STATUS gained a trailing `field` byte over the v10 3-byte
+        // IMAGE_STATUS payload — see "Session characteristic" in
+        // docs/companion-display-protocol.md.
+        XCTAssertEqual(SessionCodec.decode(Data([0x88, 0x01, 0x01, 0x04])),
+                       .renderStatus(sessionId: 1, result: .decodeFailed, field: 0x04))
+        XCTAssertEqual(SessionCodec.decode(Data([0x88, 0x01, 0x00, 0x02])),
+                       .renderStatus(sessionId: 1, result: .displayed, field: 0x02))
+        // A pre-v11 3-byte payload (no `field`) is now malformed and decodes to
+        // nil rather than being silently misparsed.
+        XCTAssertNil(SessionCodec.decode(Data([0x88, 0x01, 0x01])))
     }
 
     func testDecodeFieldSeqGap() {
