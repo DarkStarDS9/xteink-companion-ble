@@ -14,13 +14,16 @@ Home/reader entry path in normal operation.
 
 ## Status
 
-**v10 — the current contract.** v6 was a **clean break**: the session handshake
+**v11 — the current contract.** v6 was a **clean break**: the session handshake
 is mandatory, and a client that pushes content without a valid session is
-ignored. A v5 client will connect, push, and see nothing happen. v10 keeps that
-shape unchanged and makes one further breaking change on top of it: the
+ignored. A v5 client will connect, push, and see nothing happen. v10 kept that
+shape unchanged and made one further breaking change on top of it: the
 title/body fields' `CHUNK`s gain a sequence number and are now pushed over
 Write Without Response, the same treatment the image field got in v9 — see
-"v10 changes from v9" below.
+"v10 changes from v9" below. v11 widens `IMAGE_STATUS` (renamed
+`RENDER_STATUS`) to also answer a text push, appending a `field` byte to the
+existing 3-byte payload — see "Session characteristic" below and "Version
+history" for why this, too, is a breaking change rather than an addition.
 
 This document is **authoritative** and is written first on purpose: consumer
 apps are built against it while the firmware side lands. Where the firmware and
@@ -314,7 +317,7 @@ when one app on a shared link is done but the other is still using the device.
 0x85 BACKGROUND     sessionId  reason:1
 0x86 ACQUIRE_DENIED sessionId  reason:1
 0x87 ASSET_ACK      sessionId  assetId:1  result:1  tag[4]
-0x88 IMAGE_STATUS   sessionId  result:1
+0x88 RENDER_STATUS  sessionId  result:1  field:1               -- widened in v11
 0x89 IMAGE_CHUNK_ACK sessionId seq:2                          -- new in v9
 0x8A FIELD_SEQ_GAP  sessionId  field:1                        -- new in v10
 ```
@@ -339,12 +342,21 @@ ASSET_ACK result         0x00 STORED
                          0x02 REJECTED_FORMAT   unparseable for that asset id
                          0x03 REJECTED_STORAGE  SD write failed
 
-IMAGE_STATUS result      0x00 DISPLAYED
+RENDER_STATUS result     0x00 DISPLAYED
                          0x01 DECODE_FAILED     wrong byte count for a raw 2bpp full-screen image
                          0x02 REJECTED_SIZE     exceeded max image length
                          0x03 STORAGE_FAILED    could not stage to SD
                          0x04 SEQUENCE_GAP      a CHUNK's sequence number skipped ahead of what
-                                                was expected -- new in v9, see "Image field"
+                                                was expected (image), or a title/body/tag batch
+                                                was discarded because one of its fields hit that
+                                                -- see "Image field" and "Atomic multi-field pushes"
+
+RENDER_STATUS field      0x04 the image field (0x04) -- an image push
+                         0x02 the body field (0x02), standing in for a whole
+                              title/body/content-id/tag content batch -- there
+                              is no separate field id for "the batch", and body
+                              is the field a client awaiting render completion
+                              is actually waiting to see
 ```
 
 `IMAGE_CHUNK_ACK` is a progress marker only, sent roughly every 32 CHUNKs
@@ -365,18 +377,34 @@ part of an atomic batch, the **whole batch** is discarded — see "Atomic
 multi-field pushes" below — so the correct recovery is to re-push the entire
 batch, not just the field named here.
 
-`ASSET_ACK`, `IMAGE_STATUS` and `FIELD_SEQ_GAP` are the things a client
+`ASSET_ACK`, `RENDER_STATUS` and `FIELD_SEQ_GAP` are the things a client
 genuinely cannot work out for itself: whether the device stored the asset,
-whether the image decoded, and whether a title/body push survived the trip
-intact. Everything else about rendering is deterministic from what was
-pushed.
+whether a push actually reached the panel, and whether a title/body push
+survived the trip intact. Everything else about rendering is deterministic
+from what was pushed.
 
-`IMAGE_STATUS` is **strictly a response to an image push**, never a broadcast
-about what is on screen. Exactly one arrives per pushed field `0x04`, and none
-at all for a redraw the client did not cause — connecting while an older image
-is still displayed, a foreground handover, or the user paging the device's
-local gallery all repaint the panel silently. A client may therefore treat the
-first `IMAGE_STATUS` after starting a push as that push's answer.
+`RENDER_STATUS` — named `IMAGE_STATUS` through v10, when it only ever answered
+an image push; widened in v11 to also answer a title/body/content-id/tag
+content batch, on the same opcode (`0x88`) with one appended `field` byte
+rather than a second opcode. Motivation: a v10 client had no way to know when
+pushed text was actually visible on the panel — the wire transfer for a text
+push completes in ~0.24s, but the panel's own multi-pass grayscale/refresh
+settle takes a further ~2.2s measured on hardware, and only an image push got
+an answer once that settle finished. `RENDER_STATUS` is **strictly a response
+to a push**, never a broadcast about what is on screen. Exactly one arrives
+per pushed field `0x04`, or per committed title/body/content-id/tag batch
+(`field` 0x02), and none at all for a redraw the client did not cause —
+connecting while older content is still displayed, a foreground handover, a
+tag-only redraw, or the user paging the device's local gallery all repaint the
+panel silently. A client may therefore treat the first `RENDER_STATUS` naming
+the field it pushed as that push's answer.
+
+**v10 and earlier clients must not be fed a v11 `RENDER_STATUS`.** A v10
+parser reads this notification as a fixed 3 bytes (`{opcode, sessionId,
+result}`); a text push now also emitting it, plus the appended `field` byte,
+both change what a v10 client would observe on the wire for an opcode it
+already knew — which is exactly why this is a protocol version bump (10 → 11),
+not a silent behavior change. See "Version history" below.
 
 ### Pairing and tokens
 
@@ -539,7 +567,7 @@ discarded on disconnect and on a foreground handover.
 Next free: `0x08`.
 
 Content past a field's cap is truncated (title/body/content-id) or rejected
-outright with `ASSET_ACK`/`IMAGE_STATUS` (image, UI declaration, icon) — a
+outright with `ASSET_ACK`/`RENDER_STATUS` (image, UI declaration, icon) — a
 truncated asset is worse than no asset.
 
 ### Atomic multi-field pushes (`0x80` final-field flag)
@@ -598,7 +626,7 @@ since the whole push has to land before the next one starts. Write Without
 Response has no such round trip, but drops CoreBluetooth/BlueZ's own delivery
 guarantee, which is why these fields' CHUNKs carry the sequence number
 described above: a dropped or reordered chunk is now something the device
-*detects* — `IMAGE_STATUS(SEQUENCE_GAP)` for the image field,
+*detects* — `RENDER_STATUS(SEQUENCE_GAP)` for the image field,
 `FIELD_SEQ_GAP` for title/body — instead of something that silently corrupts
 the reassembled payload. Keep `START` and `END` on Write, so the phone still
 gets a reliable begin/end ack. Every other field is unaffected — small enough
@@ -642,6 +670,21 @@ signal. A client that needs to know a push landed clean before moving on
 should wait for `END`'s round trip (still Write, hence acked) and watch for
 `FIELD_SEQ_GAP` in that window.
 
+**As of v11, a title/body/content-id/tag batch also gets a completion signal:
+`RENDER_STATUS(Displayed, field=0x02)`, once the batch actually reaches the
+panel** — not merely once the wire transfer finishes. This is the answer to
+"is my last push actually showing yet", not "did my last push land intact"
+(that's still `FIELD_SEQ_GAP`/`END`'s round trip, above). The gap between the
+two matters: the wire transfer for a full-page text push completes in ~0.24s,
+but the panel's own settle (page layout + e-ink refresh cycle) measured a
+further ~2.2s on hardware. A client that only watched for the wire transfer to
+finish — the only option before v11 — could not tell those apart, and had to
+guess with a fixed delay. If the batch is discarded whole (see "A batch that
+loses a field is discarded whole" above), `RENDER_STATUS(SequenceGap,
+field=0x02)` is sent immediately instead, since no render is ever coming for
+it — see `FIELD_SEQ_GAP` above for the field-level version of the same
+signal.
+
 ### Content-id field (`0x03`) — opaque correlation token
 
 Title and body are what's shown on screen; content-id is neither — it is an
@@ -669,7 +712,7 @@ pushes it as field `0x04`. The device streams the bytes straight to
 holds the image in RAM — and on `END` unpacks it directly to the framebuffer
 (no decompression, no gray-level math: each 2-bit sample already *is* the
 final display level 0–3), then runs the two-pass grayscale settle.
-`IMAGE_STATUS` reports the outcome.
+`RENDER_STATUS` reports the outcome.
 
 **The device keeps more than the last push.** Once a transfer completes,
 `incoming.raw` is moved into a bounded per-peer gallery (`images/`, up to
@@ -705,7 +748,7 @@ the e-ink refresh, not decoding.
   multi-field pushes" above for why (bulk image CHUNKs go out over Write
   Without Response) and "Framing" for the exact byte layout. The device
   tracks the next expected value and fails the transfer with
-  `IMAGE_STATUS(SEQUENCE_GAP)` the instant a CHUNK arrives out of order — a
+  `RENDER_STATUS(SEQUENCE_GAP)` the instant a CHUNK arrives out of order — a
   lost or reordered packet is detected rather than silently corrupting the
   reassembled payload the way it would with no sequence number. There is no
   partial-resume protocol: recovering from `SEQUENCE_GAP` means re-pushing
@@ -738,7 +781,7 @@ the e-ink refresh, not decoding.
 (bytes 17..20) — **do not assume a panel size**; a measured X3 in Companion
 Mode reports **528 x 792**, not the 800 x 480 that older notes in this repo
 assume. Unlike the old PNG path, there is **no scaling and no centering**: a
-payload of the wrong byte count is rejected outright (`IMAGE_STATUS`
+payload of the wrong byte count is rejected outright (`RENDER_STATUS`
 `DECODE_FAILED`) rather than resampled or cropped. Cropping, scaling and
 rotation are entirely the phone's job; the device never does any of the
 three for an image push.
@@ -772,7 +815,7 @@ seconds for a mark that moved.
 **On timing, if you want a "finished developing" mark.** A tag pushed *with* the
 image is drawn when the image is drawn, which is the *start* of the grayscale
 settle, not the end. If you want a mark that means "this print has finished
-resolving", set it with a standalone Status write after `IMAGE_STATUS(DISPLAYED)`
+resolving", set it with a standalone Status write after `RENDER_STATUS(DISPLAYED)`
 arrives — that notification is sent after the settle completes, and the redraw it
 triggers is the cheap chips-only one described above. The device will not infer
 this for you: when a tag means "done" is your semantics, and a firmware that
@@ -1095,7 +1138,7 @@ respectively; see "v7 changes from v6", "v8 changes from v7", "v9 changes
 from v8" and "v10 changes from v9":
 
 ```
-byte 0        protocol version = 10
+byte 0        protocol version = 11
 byte 1        screen width in characters, at the font Companion Mode uses
 byte 2        screen height in characters (lines per page)
 bytes 3..4    max text field length, uint16 LE — title/body only
@@ -1243,6 +1286,40 @@ growth would make `peers.json` unbounded, and it is parsed into RAM.
 
 ## Version history
 
+### v11 changes from v10 — **breaking**
+
+1. **`IMAGE_STATUS` (`0x88`) is renamed `RENDER_STATUS` and gains a 4th byte,
+   `field`.** Payload goes from `{opcode, sessionId, result}` to `{opcode,
+   sessionId, result, field}`. `field` is `0x04` (image) for an image push or
+   `0x02` (body) for a title/body/content-id/tag content batch — see "Session
+   characteristic" above.
+2. **A title/body/content-id/tag content batch now emits `RENDER_STATUS`
+   (`Displayed`, field `0x02`) once it actually reaches the panel.** Before
+   v11 a text push got no completion signal at all; a client could only guess
+   with a fixed delay. Motivated by SpokenFeeds wanting to hold audio playback
+   until an article's text is visible: measured on hardware, a text push
+   completes on the wire in ~0.24s but the panel's own settle takes a further
+   ~2.2s.
+3. **A content batch discarded whole because one of its fields hit
+   `FIELD_SEQ_GAP` now also emits `RENDER_STATUS(SEQUENCE_GAP, field=0x02)`,**
+   immediately rather than leaving the client to wait out its own timeout for
+   a render that was never going to happen — see "Atomic multi-field pushes".
+4. **Capability byte 0 bumped from 10 to 11.** No other capability bytes
+   moved.
+
+Why breaking, not additive: a v10 client parses `IMAGE_STATUS` as a fixed
+3-byte payload and only expects it in response to an image push. Under v11 a
+text push also triggers this opcode, and every occurrence — image or text —
+now carries an extra trailing byte. A v10 client fed either change would
+misparse the notification (reading a byte of the next notification as this
+one's `field`) or misattribute a text push's answer to an image push it never
+made (see `CompanionClient.swift`'s `pendingImageStatus`/`pendingRenderStatus`
+routing, which is exactly the race this field byte exists to prevent). Reusing
+`0x88` rather than adding a second opcode was a deliberate choice: the
+receiver's job — "was this thing on screen" — is identical for both, and a
+second opcode would have meant a second, near-duplicate implementation on both
+sides for no behavioural gain.
+
 ### v10 changes from v9 — **breaking**
 
 1. **The title (`0x01`) and body (`0x02`) fields' `CHUNK`s gain a 2-byte
@@ -1383,7 +1460,7 @@ Migration checklist for a v5 client:
 
 Design decisions made during implementation, beyond
 `docs/companion-multi-app-design.md` §9: the `helloTag` correlation field, the
-`ACQUIRE_DENIED` / `ASSET_ACK` / `IMAGE_STATUS` notifications, `sessionId` on
+`ACQUIRE_DENIED` / `ASSET_ACK` / `RENDER_STATUS` notifications, `sessionId` on
 button events and Status writes, the uint32 START length, the capability block's
 screen-pixel and content-id-cap entries, and the replacement of the named
 `READ_LATER_SAVED` status byte with app-declared tags. Each is recorded in place
@@ -1502,7 +1579,7 @@ Images:
 24. Push an exactly-sized raw packed 2bpp image (see "Image field (`0x04`)"
     for the byte layout) using only sample values `{0, 1, 2, 3}`: confirm it
     renders full-screen, the grayscale settle runs, and
-    `IMAGE_STATUS(DISPLAYED)` arrives.
+    `RENDER_STATUS(DISPLAYED, field=0x04)` arrives.
 23b. **Bisect the image path with two encoders.** Snap2Ink ships a calibration
     target (eight bands answering "count the distinct greys", "is this band
     striped or flat", "is the border one pixel or two") that bypasses its own
@@ -1515,20 +1592,21 @@ Images:
 24. Confirm the staged file lands under `peers/<peerKey>/data/` and that free
     heap during the transfer stays near its idle value (nothing image-sized was
     allocated).
-25. Push garbage bytes as field `0x04`: `IMAGE_STATUS(DECODE_FAILED)` and the
-    previous screen is retained.
+25. Push garbage bytes as field `0x04`: `RENDER_STATUS(DECODE_FAILED, field=0x04)`
+    and the previous screen is retained.
 26. Disconnect mid-image: confirm the partial staged file is discarded and the
     device does not try to decode it.
-27. Push an image larger than the advertised max: `IMAGE_STATUS(REJECTED_SIZE)`.
+27. Push an image larger than the advertised max:
+    `RENDER_STATUS(REJECTED_SIZE, field=0x04)`.
 28. Push a body after an image and confirm the screen returns to text.
 28b. With a tag visible, push an image and confirm the chip is drawn over the
     print; hide every tag, re-push, and confirm the print is untouched.
 28c. **(v9)** Push an image over Write Without Response with correctly
     incrementing CHUNK sequence numbers: confirm `IMAGE_CHUNK_ACK` notifies
     roughly every 32 chunks and the transfer still ends in
-    `IMAGE_STATUS(DISPLAYED)`. Then push one with a deliberately skipped
-    sequence number: confirm `IMAGE_STATUS(SEQUENCE_GAP)` and that the
-    previous screen is retained, the same as a decode failure.
+    `RENDER_STATUS(DISPLAYED, field=0x04)`. Then push one with a deliberately
+    skipped sequence number: confirm `RENDER_STATUS(SEQUENCE_GAP, field=0x04)`
+    and that the previous screen is retained, the same as a decode failure.
 28d. **(v10)** Push title+body over Write Without Response with correctly
     incrementing CHUNK sequence numbers: confirm the page renders normally
     and no `FIELD_SEQ_GAP` arrives. Then push one with a deliberately skipped
@@ -1549,6 +1627,15 @@ Images:
     must keep its own tags, not inherit the new one's. Then toggle a single
     tag on its own (a standalone `0x07` push, no title/body) and confirm it
     still applies immediately.
+28g. **(v11)** Push title+body (final-flagged body) and time the gap between
+    `END`'s write completing and `RENDER_STATUS(Displayed, field=0x02)`
+    arriving: expect roughly the ~2.2s settle measured on hardware, not an
+    immediate reply. While a page is on screen, turn a page locally (a button
+    press, no new push) and confirm no `RENDER_STATUS` fires — only a push
+    gets an answer. Then repeat the sequence-gap test from 28d/28e and confirm
+    `RENDER_STATUS(SequenceGap, field=0x02)` arrives immediately (not after the
+    settle) alongside the existing `FIELD_SEQ_GAP`, since the batch never
+    renders at all.
 
 Icons and sleep screen:
 

@@ -30,6 +30,8 @@ final class ElapsedBox: @unchecked Sendable {
 //                                  Isolates "image 2 starts on the relaxed
 //                                  connection profile" -- image 1 is the only
 //                                  transfer that begins on an already-busy link.
+//   text-burst-render [n] [gapS]   same, but each push waits for the v11 RENDER_STATUS
+//                                  before the next -- the pacing SpokenFeeds wants.
 //   text-burst    [n] [gapS]       T2: n full-page title+body pushes gapS seconds apart.
 //                                  Reproduces SpokenFeeds' burst pattern; watch for
 //                                  the device dropping a title on a sequence gap while
@@ -179,8 +181,8 @@ func runImageOnce(label: String, imageData: Data) async {
 /// wedged command gate shows up as "push N never returned" rather than the
 /// harness silently hanging. The watch only reports -- it cannot cancel the
 /// underlying await, which is precisely the condition being measured.
-func runTextBurst(count: Int, gapSeconds: Double) async {
-    say("text-burst: \(count) pushes, \(gapSeconds)s apart")
+func runTextBurst(count: Int, gapSeconds: Double, awaitRender: Bool) async {
+    say("text-burst: \(count) pushes, \(gapSeconds)s apart, awaitRender=\(awaitRender)")
     for index in 1...count {
         let title = syntheticTitle(index: index)
         let body = syntheticBody(index: index)
@@ -195,9 +197,16 @@ func runTextBurst(count: Int, gapSeconds: Double) async {
             }
         }
         do {
-            try await client.push(title: title, body: body, contentId: "bench-\(index)")
+            // v11: awaitRender makes this return only once the panel actually
+            // shows the batch, not merely once the bytes are on the wire. The
+            // gap between those two is the whole reason the signal exists --
+            // ~0.24s transfer versus a ~2.2s settle, measured on hardware -- so
+            // the burst scenario reports both numbers to make it visible.
+            let result = try await client.push(title: title, body: body, contentId: "bench-\(index)",
+                                               awaitRender: awaitRender)
             finished.setIfUnset(Date().timeIntervalSince(started))
-            say("push \(index) ok in \(String(format: "%.2f", Date().timeIntervalSince(started)))s")
+            say("push \(index) ok in \(String(format: "%.2f", Date().timeIntervalSince(started)))s"
+                + (awaitRender ? " (render: \(result.map { "\($0)" } ?? "no answer"))" : ""))
         } catch {
             finished.setIfUnset(Date().timeIntervalSince(started))
             say("push \(index) FAILED after \(String(format: "%.2f", Date().timeIntervalSince(started)))s: \(error)")
@@ -282,9 +291,10 @@ let listener = Task {
                 await runImageRepeat(count: positionalInt(0, default: 3),
                                      gapSeconds: positionalDouble(1, default: 10),
                                      imageData: imageData)
-            case "text-burst":
+            case "text-burst", "text-burst-render":
                 await runTextBurst(count: positionalInt(0, default: 12),
-                                   gapSeconds: positionalDouble(1, default: 3))
+                                   gapSeconds: positionalDouble(1, default: 3),
+                                   awaitRender: scenario == "text-burst-render")
             case "idle-hold":
                 await runIdleHold(holdSeconds: positionalDouble(0, default: 300))
             default:
@@ -298,8 +308,8 @@ let listener = Task {
             // still commits, so the surviving field lands and the dropped one
             // keeps whatever the previous article left on screen.
             say("!! device dropped field \(field) (CHUNK sequence gap)")
-        case .imageStatus(let result):
-            say("image status: \(result)")
+        case .renderStatus(let field, let result):
+            say("render status: field=\(field) result=\(result)")
         case .imageChunkAck(let seq):
             say("chunk ack: seq=\(seq)")
         case .lostScreen(let reason):

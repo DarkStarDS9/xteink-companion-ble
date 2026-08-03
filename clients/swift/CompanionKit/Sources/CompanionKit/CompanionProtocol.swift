@@ -13,7 +13,7 @@ public enum CompanionProtocol {
     /// on an older number than a connected device's firmware is just as broken
     /// as the reverse, and looks confusingly like the *device* needs an update
     /// when it's actually this package that's behind.
-    public static let version: UInt8 = 10
+    public static let version: UInt8 = 11
 
     public static let serviceUUID = "7C9C0000-3E4A-4B1A-9C1E-6D8A1F2B0001"
     public static let contentCharacteristicUUID = "7C9C0001-3E4A-4B1A-9C1E-6D8A1F2B0001"
@@ -69,10 +69,15 @@ enum SessionNotification: UInt8 {
     case background = 0x85
     case acquireDenied = 0x86
     case assetAck = 0x87
-    case imageStatus = 0x88
+    /// Named `imageStatus` through v10, when it only ever answered an image
+    /// push. v11 widens the payload with a trailing `field` byte so the same
+    /// opcode also answers a title/body/content-id/tag content batch — see
+    /// ``RenderResult`` and `docs/companion-display-protocol.md`'s
+    /// `RENDER_STATUS` section.
+    case renderStatus = 0x88
     /// v9: progress marker sent every ``ContentFramer/imageChunkAckInterval``
     /// chunks during an image push over Write Without Response, well before
-    /// the final `imageStatus` — lets a client detect a stalled/diverged
+    /// the final `renderStatus` — lets a client detect a stalled/diverged
     /// transfer early. Not flow control (CoreBluetooth's own
     /// `canSendWriteWithoutResponse` already handles that).
     case imageChunkAck = 0x89
@@ -124,7 +129,13 @@ public enum AssetResult: UInt8, Sendable {
     init(wire: UInt8) { self = AssetResult(rawValue: wire) ?? .unknown }
 }
 
-public enum ImageResult: UInt8, Sendable {
+/// Outcome of a push, as reported by `RENDER_STATUS`. Named `ImageResult`
+/// through v10, when it only ever answered an image push; renamed in the v11
+/// generalization to a title/body/content-id/tag content batch too — see
+/// ``CompanionEvent/renderStatus(field:result:)``. The cases needed no change:
+/// ``sequenceGap`` and ``storageFailed`` are just as meaningful for a
+/// discarded/failed text batch as for an image.
+public enum RenderResult: UInt8, Sendable {
     case displayed = 0x00
     case decodeFailed = 0x01
     case rejectedSize = 0x02
@@ -134,10 +145,17 @@ public enum ImageResult: UInt8, Sendable {
     /// Response. Retrying the whole push (not just the missing chunk — there
     /// is no partial-resume protocol yet) is the right response, unlike
     /// ``storageFailed`` which points at the SD card instead.
+    ///
+    /// v11: also reported when a title/body/tag batch is discarded whole
+    /// because one of its fields hit exactly this condition on the Content
+    /// characteristic (see `FIELD_SEQ_GAP`) — the batch never renders, so the
+    /// device answers immediately rather than leaving a caller waiting on
+    /// ``CompanionClient/push(title:body:contentId:tags:awaitRender:)`` to
+    /// time out.
     case sequenceGap = 0x04
     case unknown = 0xFF
 
-    init(wire: UInt8) { self = ImageResult(rawValue: wire) ?? .unknown }
+    init(wire: UInt8) { self = RenderResult(rawValue: wire) ?? .unknown }
 }
 
 /// How a declared tag is drawn. Visual, not semantic — what "on" means is your
@@ -238,7 +256,7 @@ public enum CompanionError: Error, Sendable {
     case pairingDenied(HelloDeniedReason)
     case acquireDenied(AcquireDeniedReason)
     case assetRejected(field: CompanionField, result: AssetResult)
-    case imageRejected(ImageResult)
+    case imageRejected(RenderResult)
     case payloadTooLarge(field: CompanionField, bytes: Int, limit: Int)
     case timedOut
     case disconnected

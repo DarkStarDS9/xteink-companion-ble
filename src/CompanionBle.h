@@ -218,10 +218,19 @@ inline constexpr uint8_t kFieldTagState = 0x07;
 inline constexpr uint8_t kFinalFieldFlag = 0x80;
 inline constexpr uint8_t kFieldMask = 0x7F;
 
-// Outcome of an image push, reported to the pushing app as IMAGE_STATUS.
-// Whether a staged PNG decoded is the one thing about a push the phone cannot
-// work out for itself.
-enum class ImageResult : uint8_t {
+// Outcome of a push, reported to the pushing app as RENDER_STATUS (opcode
+// 0x88). Whether a push actually reached the panel is the one thing about a
+// push the phone cannot work out for itself -- and, since protocol v11, that
+// includes text: a title/body push returns on the wire in ~0.24s (a handful
+// of CHUNKs), but the panel's own multi-pass grayscale settle takes a further
+// ~2.2s measured on hardware, during which the phone has no way to tell
+// whether the previous page is still showing.
+//
+// Named ImageResult through v10, when RENDER_STATUS only ever answered an
+// image push; renamed RenderResult in the v11 generalization. The cases
+// themselves needed no change -- SequenceGap and StorageFailed are just as
+// meaningful for a dropped/discarded text batch as for an image.
+enum class RenderResult : uint8_t {
   Displayed = 0x00,
   DecodeFailed = 0x01,
   RejectedSize = 0x02,
@@ -231,6 +240,11 @@ enum class ImageResult : uint8_t {
   // under Write Without Response. Distinct from StorageFailed so the app can
   // tell "the link dropped a packet" (retry the whole push) from "the SD
   // card failed" (a device-local problem retrying won't fix).
+  //
+  // v11: also used when a title/body/tag batch is discarded whole because one
+  // of its fields hit exactly this condition -- see
+  // CompanionModeActivity.cpp's g_pendingBatchPoisoned and
+  // docs/companion-display-protocol.md's "Atomic multi-field pushes".
   SequenceGap = 0x04,
 };
 
@@ -302,9 +316,23 @@ const char* foregroundPeerKey();
 // every app sharing the link receives every notification.
 bool notifyButtonEvent(ButtonId button, uint16_t durationTicks, bool isFinal);
 
-// Reports the outcome of an image push to the app that made it. Called from the
-// main loop once the staged PNG has been decoded and displayed (or failed).
-void notifyImageStatus(ImageResult result);
+// Reports the outcome of a push to the app that made it, as RENDER_STATUS:
+// {kSessRenderStatus, sessionId, result, field}. `field` says WHAT rendered --
+// kFieldImage for an image push, kFieldBody standing in for a title/body/
+// content-id/tag content batch (there is no single field id for "the batch";
+// body is the field a text-awaiting client is actually waiting to see, and is
+// present in the overwhelming majority of content pushes). Called from the
+// main loop once the pushed content has actually been decoded/laid out and
+// flipped to the panel (or failed, or -- v11 -- discarded whole; see
+// RenderResult::SequenceGap).
+//
+// v10 and earlier clients only ever received this 3 bytes long (no `field`),
+// and only for an image push -- text pushes were silent. A v10 client fed a
+// 4-byte notification triggered by a text push would misparse it, which is
+// exactly why generalizing this past images is a protocol version bump
+// (10 -> 11), not a silent behavior change. See
+// docs/companion-display-protocol.md's RENDER_STATUS section.
+void notifyRenderStatus(RenderResult result, uint8_t field);
 
 // Answers a pending pairing prompt. Called from the main loop when the user
 // presses CONFIRM/BACK, or when the prompt times out. Writing the peer record
@@ -369,7 +397,7 @@ void setForegroundChangeCallback(ForegroundChangeCallback cb);
 // for the activity to hand to CompanionPeerStore::commitImage() so the
 // gallery's sidecar index can record it. The activity decodes on the main loop
 // (never on the host task — decoding touches the framebuffer) and then calls
-// notifyImageStatus().
+// notifyRenderStatus().
 using ImageStagedCallback = void (*)(const char* peerKey, const char* path, const uint8_t* contentId,
                                      size_t contentIdLen);
 void setImageStagedCallback(ImageStagedCallback cb);

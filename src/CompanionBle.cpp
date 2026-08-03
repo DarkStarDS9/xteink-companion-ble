@@ -47,10 +47,17 @@ constexpr uint8_t kSessForeground = 0x84;
 constexpr uint8_t kSessBackground = 0x85;
 constexpr uint8_t kSessAcquireDenied = 0x86;
 constexpr uint8_t kSessAssetAck = 0x87;
-constexpr uint8_t kSessImageStatus = 0x88;
+// v9-v10: IMAGE_STATUS, a 3-byte {opcode, sessionId, result} answer to an
+// image push only. v11 widens this to RENDER_STATUS -- a 4th `field` byte so
+// the same opcode can also answer a text push (see notifyRenderStatus()'s doc
+// comment in CompanionBle.h) -- without a second opcode, per this feature's
+// commit message. The opcode value is unchanged; only clients that parse a
+// fixed 3-byte payload need to know about the new byte, which is exactly why
+// this is a version bump.
+constexpr uint8_t kSessRenderStatus = 0x88;
 // v9: progress marker for an in-flight image push sent over Write Without
 // Response, so the phone can detect a stalled/diverged transfer well before
-// the final IMAGE_STATUS -- see kOpChunk's image branch below.
+// the final RENDER_STATUS -- see kOpChunk's image branch below.
 constexpr uint8_t kSessImageChunkAck = 0x89;
 // v10: the title/body CHUNK sequence number (see kOpChunk's seq-checked
 // branch below) skipped ahead of what was expected -- a packet was lost or
@@ -64,7 +71,7 @@ constexpr uint8_t kSessFieldSeqGap = 0x8A;
 // flow control -- iOS's own canSendWriteWithoutResponse/
 // peripheralIsReadyToSendWriteWithoutResponse already throttles the sender at
 // the OS level -- this is purely so the phone learns the device is still
-// alive and in sync well before the ~25s transfer's final IMAGE_STATUS,
+// alive and in sync well before the ~25s transfer's final RENDER_STATUS,
 // letting it abort early instead of always waiting for the whole push to
 // finish before finding out it was corrupt.
 constexpr uint16_t kImageChunkAckInterval = 32;
@@ -518,8 +525,10 @@ bool g_activeImageFailed = false;
 // being reassembled at a time (see g_activeField). g_activeSeq is the next
 // expected value, reset to 0 at START (via resetReassembly()); g_activeSeqGap
 // latches once a mismatch is seen. Image reports this distinctly from
-// StorageFailed via IMAGE_STATUS; title/body report it via
-// kSessFieldSeqGap and drop the field instead of displaying garbage.
+// StorageFailed via RENDER_STATUS; title/body report it via
+// kSessFieldSeqGap and drop the field instead of displaying garbage (and, if
+// the field was part of an atomic batch, also via RENDER_STATUS/SequenceGap
+// once the whole batch is discarded -- see CompanionModeActivity.cpp).
 uint16_t g_activeSeq = 0;
 bool g_activeSeqGap = false;
 // Wall-clock span of the image CHUNK sequence only -- set at START, read at
@@ -759,14 +768,14 @@ void imageWriteTaskLoop(void* /*param*/) {
                   static_cast<unsigned>(spanMs > 0 ? (g_writerWriteBusyMs * 100UL / spanMs) : 0));
         }
         if (!g_activeImageFile.isOpen()) {
-          notifyImageStatus(ImageResult::StorageFailed);
+          notifyRenderStatus(RenderResult::StorageFailed, kFieldImage);
         } else {
           const uint32_t flushStartMs = millis();
           g_activeImageFile.flush();
           g_activeImageFile.close();
           LOG_DBG("CBLE", "writer: flush()+close() took %u ms", static_cast<unsigned>(millis() - flushStartMs));
           // Decoding touches the framebuffer, so it happens on the main loop
-          // task, not here. The activity answers with notifyImageStatus().
+          // task, not here. The activity answers with notifyRenderStatus().
           // onImageStaged() (CompanionModeActivity.cpp) only copies
           // fixed-size buffers under its own critical section, so calling it
           // from this task rather than the host task is safe.
@@ -907,7 +916,7 @@ void computeCapabilityValue(const GfxRenderer& renderer, int fontId) {
   const uint64_t mac = ESP.getEfuseMac();
 
   size_t offset = 0;
-  g_capabilityValue[offset++] = 10;  // protocol version
+  g_capabilityValue[offset++] = 11;  // protocol version
   g_capabilityValue[offset++] = static_cast<uint8_t>(screenWidthChars > 255 ? 255 : screenWidthChars);
   g_capabilityValue[offset++] = static_cast<uint8_t>(screenHeightChars > 255 ? 255 : screenHeightChars);
   g_capabilityValue[offset++] = static_cast<uint8_t>(kMaxFieldLen & 0xFF);
@@ -1199,7 +1208,7 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
 
         if (field == kFieldImage) {
           // Oversize images are rejected at END rather than here so the app gets
-          // one clear IMAGE_STATUS either way; the bytes are simply not stored.
+          // one clear RENDER_STATUS either way; the bytes are simply not stored.
           g_activeImageOverflow = totalLen > cap;
           g_activeTotalLen = totalLen;
           g_imageTransferStartMs = millis();
@@ -1366,19 +1375,19 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
             logChunkTiming();
             logLastConnParams();
             if (g_activeImageOverflow) {
-              notifyImageStatus(ImageResult::RejectedSize);
+              notifyRenderStatus(RenderResult::RejectedSize, kFieldImage);
             } else if (g_activeSeqGap) {
               // Distinct from StorageFailed: the SD path never ran into
               // trouble here, a CHUNK's sequence number skipped ahead of
               // what was expected -- the signature of a dropped Write
               // Without Response packet, not a card write failure.
-              notifyImageStatus(ImageResult::SequenceGap);
+              notifyRenderStatus(RenderResult::SequenceGap, kFieldImage);
             } else if (g_activeImageFailed) {
               // The writer task already knows (or will shortly, via the
               // Abort enqueued when the failure happened) that this transfer
               // is dead -- report it here rather than waiting on an End
               // message it may process very late, if ever.
-              notifyImageStatus(ImageResult::StorageFailed);
+              notifyRenderStatus(RenderResult::StorageFailed, kFieldImage);
             } else {
               // flush()/close() (and, on an open/write failure the writer
               // task hit earlier, StorageFailed) now happen on the writer
@@ -1389,7 +1398,7 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
               memcpy(msg.contentId, session->contentId, sizeof(msg.contentId));
               msg.contentIdLen = session->contentIdLen;
               if (!enqueueImageWork(msg, "end")) {
-                notifyImageStatus(ImageResult::StorageFailed);
+                notifyRenderStatus(RenderResult::StorageFailed, kFieldImage);
                 enqueueImageAbort();
               }
             }
@@ -1823,9 +1832,9 @@ bool notifyButtonEvent(ButtonId button, uint16_t durationTicks, bool isFinal) {
   return g_buttonChar->notify();
 }
 
-void notifyImageStatus(ImageResult result) {
+void notifyRenderStatus(RenderResult result, uint8_t field) {
   if (g_foreground == kNoSession) return;
-  const uint8_t payload[3] = {kSessImageStatus, g_foreground, static_cast<uint8_t>(result)};
+  const uint8_t payload[4] = {kSessRenderStatus, g_foreground, static_cast<uint8_t>(result), field};
   notifySession(payload, sizeof(payload));
 }
 
