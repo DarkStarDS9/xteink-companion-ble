@@ -1390,8 +1390,18 @@ void CompanionModeActivity::loop() {
   // regardless of whether foregroundPeerKey is empty.
   if (handlePickerInput()) return;
 
-  if (foregroundPeerKey.empty()) return;  // no app owns the buttons
-
+  // Deliberately NOT gated on a live foreground session, for the same reason
+  // handleGalleryNav() above isn't: a dropped link does not take the article off
+  // the screen (see the disconnect branch of loop() — "Content is deliberately
+  // NOT cleared here"), so the *local* page buttons have to keep paging that
+  // retained content. Gating the whole map on foregroundPeerKey left LEFT/RIGHT
+  // dead for the entire gap between a disconnect and the app's reconnect, over
+  // an article the user could still see — indistinguishable from a wedged
+  // device, and reported as exactly that. buttons[] survives a disconnect (only
+  // the next peer's loadUiDeclaration() resets it), so routingFor() still gives
+  // the departed app's answer. Only REMOTE presses need a live session, and
+  // handleMappedButton() is what drops those.
+  //
   // Route each button through the foreground app's declared map. Nothing here
   // decides what a button means — routingFor() is the app's own answer, read
   // back off the SD card.
@@ -1531,6 +1541,11 @@ bool CompanionModeActivity::handleMappedButton(MappedInputManager::Button role, 
       return false;
 
     case companionble::ButtonRouting::Remote:
+      // Nothing to deliver the press to once the link is gone.
+      // notifyButtonEvent() already no-ops when disconnected, but going through
+      // notifyHeldButton() anyway would start hold-tracking for a press no app
+      // will ever hear, leaving holdActive set until the button is released.
+      if (foregroundPeerKey.empty()) return false;
       notifyHeldButton(id);
       return true;
 
