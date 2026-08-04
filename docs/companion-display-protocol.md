@@ -89,9 +89,12 @@ implements it, never after.
 > The rule to take away: **only one LLCP procedure may be pending on a connection
 > at a time** (Core Spec Vol 6 Part B §5.3), so `onConnect()` — where the central
 > is still running its own setup exchange — is the wrong place to start one.
-> Data Length Extension is now requested as a controller default in
-> `ensureStarted()` via `ble_gap_write_sugg_def_data_len()`, where the link layer
-> schedules the negotiation itself. Anything added to `onConnect()` in future
+> Data Length Extension is now requested **nowhere at all**. A controller-default
+> request in `ensureStarted()` was tried as a supposedly safe way to keep the
+> capability and brought the disconnect straight back on iOS: this central does
+> not complete a Data Length Update whoever starts it, so any DLE procedure on
+> the link expires the same 40 s timer. Note that a macOS harness cannot show
+> this -- macOS self-negotiates DLE, so it neither benefits nor fails. Anything added to `onConnect()` in future
 > needs checking against that rule; `updatePhy()` is still there and is already
 > one procedure more than is comfortable.
 
