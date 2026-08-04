@@ -239,8 +239,12 @@ constexpr uint16_t kConnTimeoutNearUnits = 1200;  // 12 s
 // HCI 0x22 (LMP/LL response timeout) disconnect. **That theory was wrong, and
 // the revert back to 4 is deliberate.** The real cause was the unanswered
 // LL_LENGTH_REQ that onConnect() used to send (see setDataLen's removal in
-// ServerCallbacks::onConnect below); with that gone, latency=4 is stable. The
-// evidence that overturned it: every 0x22 ever captured -- across both
+// ServerCallbacks::onConnect below). Note what is and is not proven: the
+// 7m20s iOS soak that established the fix ran at latency=1, so latency=4 is
+// restored on the strength of the argument below rather than its own soak. If
+// 0x22 ever returns at 39992-39998 ms with no DLE request anywhere, this is
+// the next thing to re-examine. The evidence that overturned it: every 0x22
+// ever captured -- across both
 // latencies, every connection profile, tethered and untethered -- landed at
 // 39992-39998 ms into the connection, i.e. the Core Spec's 40 s LL procedure
 // response timeout (TPRT), which is anchored to a procedure started at connect
@@ -1600,11 +1604,11 @@ class ServerCallbacks : public NimBLEServerCallbacks {
       // the LL_LENGTH_REQ it sent, and the Core Spec's 40 s LL procedure
       // response timeout dropped the link -- reproduced at 39992-39998 ms on
       // every connection, and fixed outright by removing it (a link that had
-      // never once survived 40 s ran 4+ minutes on the first try). The same
-      // capability is now requested as a controller default in ensureStarted()
-      // via ble_gap_write_sugg_def_data_len(), where the link layer schedules
-      // the negotiation itself instead of the host racing it into the middle of
-      // connection setup; see that call site for the full reasoning.
+      // never once survived 40 s ran 7m20s). This device now asks for DLE
+      // nowhere at all -- a controller-default request was tried in
+      // ensureStarted() as a supposedly safe way to keep the capability and
+      // brought the disconnect straight back on iOS; see the long note there
+      // before considering any variant of this again.
       //
       // The deeper rule this cost a week to learn: only one LLCP procedure may
       // be pending on a connection at a time, so firing several from onConnect()
@@ -1764,18 +1768,32 @@ bool ensureStarted(const GfxRenderer& renderer, int fontId) {
   // Best-effort: a controller that refuses simply keeps the 27-byte legacy
   // default, which costs throughput on large image CHUNKs and nothing else.
   // Logged rather than treated as fatal for that reason.
-  // Measured with companion-bench image-repeat (3 x 104544 B) on 2026-08-04,
-  // against this call present vs absent: no throughput difference either way,
-  // ~40 kB/s both, with the occasional low outlier in both arms. macOS
-  // negotiates DLE itself regardless, so on that central this is invisible.
-  // Kept anyway -- the controller accepts it (rc=0), it cannot reintroduce the
-  // 40 s disconnect the way the old per-connection request did, and iOS is not
-  // this harness and may not self-negotiate. If it ever needs re-testing, that
-  // is the scenario to use.
-  const int dleRc = ble_gap_write_sugg_def_data_len(251, 2120);
-  if (dleRc != 0) {
-    LOG_ERR("CBLE", "suggested default data length rejected (rc=%d), staying on the 27-byte default", dleRc);
-  }
+  // NO Data Length Extension request here, and none from onConnect() either.
+  // This device asks for DLE nowhere at all, on purpose.
+  //
+  // Removing the per-connection setDataLen() from onConnect() is what fixed the
+  // 40 s HCI 0x22 disconnect. A controller-default request
+  // (ble_gap_write_sugg_def_data_len(251, 2120)) was then added here on the
+  // theory that the fault was the *host* injecting an LLCP procedure into the
+  // middle of connection setup, and that letting the link layer schedule the
+  // same negotiation itself would be safe. **It was not.** Against the real
+  // iPhone the 40 s disconnect came straight back, at the same clock. The fault
+  // is not who starts the Data Length Update or when: this central does not
+  // complete it at all, so any DLE procedure on the link eventually expires its
+  // 40 s procedure response timeout and takes the connection with it.
+  //
+  // What misled the intermediate step: companion-bench measured no throughput
+  // difference with it present vs absent (~40 kB/s both), which made it look
+  // free -- but that harness is macOS, and macOS negotiates DLE itself, so it
+  // could neither show a benefit nor reproduce the failure. Do not re-add this
+  // on a macOS measurement. The only evidence that counts is a soak against
+  // iOS, and the configuration proven there is this one: no DLE request,
+  // 7m20s continuous versus a 40 s ceiling.
+  //
+  // The cost is real but small for text: a large image CHUNK is re-fragmented
+  // across more connection events than necessary (see the removed comment in
+  // onConnect() for the original measurement). If image throughput ever has to
+  // improve, the lever is the connection interval, not DLE.
 
   computeCapabilityValue(renderer, fontId);
 
