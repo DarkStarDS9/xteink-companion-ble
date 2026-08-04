@@ -277,8 +277,8 @@ identical hardware — note the thread has **no Apple reply**);
 [Punch Through](https://punchthrough.com/maximizing-ble-throughput-on-ios-and-android/). **COMMUNITY.**
 Apple has never published a number. Do not hard-code one.
 
-**N8. Don't assume arduino-esp32 gives you any power management.** The shipped precompiled C3
-libraries have it switched off:
+**N8. Don't assume arduino-esp32 gives you any power management** — *but see the correction below
+for what this repo actually does.* The shipped precompiled C3 libraries have it switched off:
 [`esp32-arduino-libs/esp32c3/sdkconfig`](https://github.com/espressif/esp32-arduino-libs/blob/idf-release/v5.1/esp32c3/sdkconfig)
 contains `# CONFIG_BT_CTRL_MODEM_SLEEP is not set`, and no `CONFIG_PM_ENABLE` or
 `CONFIG_FREERTOS_USE_TICKLESS_IDLE`. These are compile-time Kconfig options baked into `libbt.a` —
@@ -287,8 +287,18 @@ automatic light sleep when tickless idle is absent. The maintainer tracking issu
 [arduino-esp32 #6563](https://github.com/espressif/arduino-esp32/issues/6563) is **open**, milestone
 3.3.0, with the maintainer stating plainly: *"While it is possible to reduce current consumption
 with ESP-IDF, this option is not accessible to Arduino users."* **VENDOR (repo).**
-*What goes wrong:* every power estimate that assumes BLE modem sleep is wrong on this build, and
+*What goes wrong:* every power estimate that assumes BLE modem sleep is wrong on a stock build, and
 `delay()` busy-waits rather than sleeping.
+
+> **CORRECTION (Phase 3).** This applies to *stock* arduino-esp32, not to this repo. This project has
+> a `custom_sdkconfig` rebuild-on-first-build mechanism that recompiles the ESP-IDF core libraries,
+> and it enables `CONFIG_BT_CTRL_MODEM_SLEEP=y`, `..._MODE_1=y` and
+> `CONFIG_BT_CTRL_LPCLK_SEL_MAIN_XTAL=y` (`platformio.ini:148-160`). **BLE modem sleep is genuinely
+> on here**, so peripheral latency does save real current.
+> What remains blocked is narrower: `CONFIG_PM_ENABLE` + tickless idle link, but `libfreertos.a`
+> ships prebuilt per variant and is not recompiled by that mechanism, so `elf2image` fails on a
+> corrupt `.text.prvGetExpectedIdleTime` segment (`platformio.ini:161-175`). Light sleep needs a
+> from-source FreeRTOS build. See [ble-companion-gap-analysis.md](ble-companion-gap-analysis.md) §0.
 
 **N9. Don't treat multi-second `canSendWriteWithoutResponse == false` as an iOS bug by default.**
 iOS's queue drains at the rate the *link* drains it. If the effective connection interval is long,
@@ -372,6 +382,13 @@ not the cause.
 ---
 
 ## 5. The arithmetic
+
+> **CORRECTION (Phase 3).** The worked examples below assume ATT MTU 185 and a 0.4–1 s panel refresh.
+> Both were measured wrong on this hardware: iOS negotiates **~515**, and the panel settle is
+> **~2.2 s**. The arithmetic method stands; the numbers are pessimistic on MTU and optimistic on the
+> panel. At MTU 515 a 900-byte push is two chunks, not five — and the measured 0.24 s wire time is
+> then dominated entirely by the two Write-With-Response framing round trips, not by the payload.
+> See [ble-companion-gap-analysis.md](ble-companion-gap-analysis.md) §0 and §2 G5.
 
 ### 5.1 Packet air time (LE 1M PHY, unencrypted)
 

@@ -111,7 +111,7 @@ Three modes. All ADG-compliant. Interval is always a multiple of 15 ms.
 |---|---|---|---|---|---|---|
 | **ACTIVE** | 15 ms | 0 | 4 s | 15 ms | 67 /s | during a transfer, +3 s after the last byte |
 | **READY** | 30 ms | 0 | 4 s | 30 ms | 33 /s | default for an open session |
-| **DORMANT** | 30 ms | 30 | 4 s | 930 ms | 1.07 /s | long declared quiet — **disabled today, see §6** |
+| **DORMANT** | 30 ms | 30 | 4 s | 930 ms | 1.07 /s | long declared quiet (**enable it — see §6 correction**) |
 
 ADG compliance check for DORMANT, the only non-trivial one:
 `30 × (30+1) = 930 ms ≤ 2 s` ✓ and `930 × 3 = 2.79 s < 4 s` ✓ and latency `30 ≤ 30` ✓.
@@ -279,18 +279,21 @@ this makes a drop close to a non-event.
 
 ## 6. What is deferred, and why it is safe to defer
 
-**Power.** The Arduino build has no BLE modem sleep, no light sleep and no DFS — they are compile
--time options absent from the shipped libraries. Therefore **DORMANT saves almost nothing today**:
-skipping connection events does not help much while the radio stays powered between them regardless.
+> **CORRECTION (Phase 3): this section's premise was wrong.** It was written believing the build had
+> no BLE modem sleep. It does — this project rebuilds the ESP-IDF core libraries via
+> `custom_sdkconfig` and sets `CONFIG_BT_CTRL_MODEM_SLEEP=y` (`platformio.ini:148-160`). The radio is
+> genuinely gated off between connection events.
+>
+> **Therefore DORMANT should ship enabled, not disabled.** Peripheral latency saves real current
+> here, and it is the *only* power knob that costs nothing in button responsiveness. The paragraph
+> below survives only as the reasoning for why deferring the *light sleep* tier is still safe.
 
-DORMANT is specified anyway, and shipped **disabled**, because the cost of specifying it now is a
-table row and the cost of retrofitting it later is a redesign. When modem sleep becomes available,
-enabling it is a configuration change plus a measurement — not new structure. That is the concrete
-sense in which deferring the ESP-IDF rebuild does not compromise the architecture.
+**Light sleep** remains out of reach: `CONFIG_PM_ENABLE` + tickless idle link, but the prebuilt
+`libfreertos.a` is not recompiled by the custom-sdkconfig mechanism, so the image is corrupt
+(`platformio.ini:161-175`). Reaching that tier needs a from-source FreeRTOS build.
 
-**What would change the answer:** if measurement showed that skipping events saves meaningful
-current *even without* modem sleep, DORMANT becomes worth enabling immediately. That is a
-one-afternoon experiment (§7) and it is worth doing before assuming otherwise.
+Deferring it is safe for the reason the original section gave: sleep depth changes what a connection
+event *costs*, not what the parameter strategy *is*. The mode table is the same either way.
 
 **2M PHY** is deferred for the reasons in §4.2: small gain, real risk, and iOS drives it anyway.
 
