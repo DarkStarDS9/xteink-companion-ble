@@ -223,21 +223,35 @@ constexpr uint16_t kConnTimeoutNearUnits = 1200;  // 12 s
 // being driven -- the "slave latency" lever from the platform research this
 // change is based on, which alone (independent of modem/light-sleep)
 // measurably cuts average current by letting the peripheral skip waking for
-// idle connection events. 150 ms * (4+1) = 750 ms effective, a ~50x cut in
-// radio events versus busy, and worth the full ~900 ms ramp for a device
-// nobody is using.
+// idle connection events. 150 ms * (1+1) = 300 ms effective, a ~20x cut in
+// radio events versus busy.
 //
-// Checks: 150 ms = 10 * 15 ms; latency 4 <= 30; 150 ms * (4+1) = 750 ms
-// <= 6 s; 12000 ms is inside 6-18 s and 12000 > 750 * 3 = 2250 ms.
+// Checks: 150 ms = 10 * 15 ms; latency 1 <= 30; 150 ms * (1+1) = 300 ms
+// <= 6 s; 12000 ms is inside 6-18 s and 12000 > 300 * 3 = 900 ms.
 //
 // The supervision timeout went 6 s -> 12 s here (and on Near) as precautionary
 // insurance, NOT as a demonstrated fix: a 312-second silent-link hold test on
-// the old 6 s timeout did not drop. It only matters when connection events are
-// actually being missed, and at a 750 ms effective cadence 6 s left just 8
-// tolerable consecutive misses. Busy keeps 6 s because at 15 ms that is 400
-// missed events -- there is nothing to buy there.
+// the old 6 s timeout did not drop.
+//
+// Latency was originally 4 (750 ms effective, ~50x cut). Dropped to 1 after
+// on-device root-causing a reproducible disconnect: iOS granting the
+// latency=4 profile via ble_gap_upd_params was reliably followed ~7 s later
+// by an HCI 0x22 (LMP/LL response timeout) disconnect -- see
+// .claude/ISSUE_COMPANION_TRANSFER_REGRESSION.md. When iOS instead declined
+// the request and the link stayed on Near params, the connection was stable
+// indefinitely, so the failure tracks the grant itself, not idle time. This
+// was not a documented Apple guideline violation (latency=4 was inside the
+// interval*(latency+1)<=6s / timeout envelope checked above); the leading
+// theory is that higher latency shrinks the number of connection events
+// available to absorb a lost/retried LL control-PDU ack before its instant
+// passes. Validated at latency=1 (2026-08-04, same doc): a 300s zero-traffic
+// idle-hold soak against the real iOS app logged zero disconnects, versus a
+// steady ~45-51s disconnect cadence at latency=4 in the same scenario.
+// Should keep being watched under real playback traffic for a while longer
+// since the original bug was grant-dependent/intermittent, not proven to
+// reproduce every time even before this fix.
 constexpr uint16_t kConnIntervalDeepUnits = 120;  // 150 ms (120 * 1.25 ms)
-constexpr uint16_t kConnLatencyDeep = 4;
+constexpr uint16_t kConnLatencyDeep = 1;
 constexpr uint16_t kConnTimeoutDeepUnits = 1200;  // 12 s
 
 // How long the link must go without a content/status/session write or an
