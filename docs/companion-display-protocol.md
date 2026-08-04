@@ -66,15 +66,34 @@ implements it, never after.
 > - **`RENDER_STATUS(Superseded)`.** Deliberately untested — the window is small
 >   enough that a test for it would be an intermittent race rather than a check
 >   (see "Superseded pushes").
-> - **Long-run link stability.** A periodic disconnect reported in real
->   SpokenFeeds use is unexplained and did not reproduce from a Mac; the
->   firmware now logs the HCI reason on every disconnect, which is what will
->   identify it.
 > - **Power and battery behaviour** of the connection-profile ladder over a real
 >   discharge.
 >
 > `docs/companion-mode-implementation-notes.md` § "v6 bring-up log" remains the
 > ranked risk list and the measured memory budgets.
+>
+> ### The periodic disconnect: root-caused 2026-08-04
+>
+> This block used to list "long-run link stability" as unexplained. It is not,
+> and the answer is worth carrying because it is a trap any peripheral can fall
+> into.
+>
+> `onConnect()` sent an `LL_LENGTH_REQ` (`NimBLEServer::setDataLen`) that iOS
+> never answered, and the Core Spec's **LL procedure response timeout of 40 s**
+> then dropped the link with **HCI `0x22`**. Every such disconnect ever captured
+> landed at **39992-39998 ms** into the connection — a spec constant, not radio
+> conditions. It also starved the two procedures fired alongside it: with it gone
+> the PHY reaches 2M and the opening conn-param request is granted verbatim,
+> neither of which used to happen.
+>
+> The rule to take away: **only one LLCP procedure may be pending on a connection
+> at a time** (Core Spec Vol 6 Part B §5.3), so `onConnect()` — where the central
+> is still running its own setup exchange — is the wrong place to start one.
+> Data Length Extension is now requested as a controller default in
+> `ensureStarted()` via `ble_gap_write_sugg_def_data_len()`, where the link layer
+> schedules the negotiation itself. Anything added to `onConnect()` in future
+> needs checking against that rule; `updatePhy()` is still there and is already
+> one procedure more than is comfortable.
 
 This is a **BLE peripheral/GATT-server role**, not something upstream
 CrossPoint or this fork's `feat-bluetooth` branch already has — that branch's
