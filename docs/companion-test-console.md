@@ -181,3 +181,41 @@ and shifts every byte after it. The harness detects that (the bytes between the
 header and the footer no longer match the declared size) and retries rather
 than diffing a shifted framebuffer, but a device logging heavily can make the
 screenshot checks fail for reasons that have nothing to do with what was drawn.
+
+The same exclusivity applies to flashing: a serial capture left running holds
+the port, and `pio run -t upload` will fail against it. Stop the reader before
+reflashing, and restart it after.
+
+### Use `CBTN` rather than asking a human to hit a 30-second window
+
+v6 enrollment needs a physical CONFIRM, and the on-device prompt times out after
+30 s. Asking a person to press it on cue is the wrong reflex twice over: it
+fails whenever they are not standing at the device, and it cannot be retried
+unattended. Flash `[env:test]` and send `CMD:CBTN 1` — that is the entire reason
+this console exists (see "Why it exists" above).
+
+The enrollment token lives on the SD card, so it survives reflashing: one
+injected CONFIRM enrolls a host for every later run, across firmware builds.
+Only `CMD:CRESET` (or pulling the card) undoes it.
+
+Reflash `[env:default]` when the automation is done. A build that can be driven
+over serial should not be left on a device in normal use.
+
+### A deep-slept device cannot be flashed, and only POWER wakes it
+
+Companion Mode deep-sleeps `kWaitingIdleSleepMs` (5 minutes) after the last
+central disconnects. The USB CDC port keeps enumerating afterwards, so
+`/dev/cu.usbmodem*` is still listed and everything looks normal — but the CPU is
+down, esptool fails with `Failed to connect to ESP32-C3: No serial data
+received`, and toggling DTR/RTS produces nothing at all.
+
+There is no software way out: serial, BLE and the reset line all need the part
+that is powered down. It takes a physical POWER press — exactly the dependency
+this console exists to avoid — so it is worth planning around rather than
+rediscovering. The countdown starts when the phone disconnects, not when you
+stop typing, so a long unattended soak that ends with the app closing the link
+leaves about five minutes to start the next flash.
+
+A different message, `Invalid head of packet (0x00): Possible serial noise or
+corruption`, is the *other* upload failure and is usually transient — retry once
+before assuming anything is wrong.
