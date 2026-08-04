@@ -223,35 +223,38 @@ constexpr uint16_t kConnTimeoutNearUnits = 1200;  // 12 s
 // being driven -- the "slave latency" lever from the platform research this
 // change is based on, which alone (independent of modem/light-sleep)
 // measurably cuts average current by letting the peripheral skip waking for
-// idle connection events. 150 ms * (1+1) = 300 ms effective, a ~20x cut in
-// radio events versus busy.
+// idle connection events. 150 ms * (4+1) = 750 ms effective, a ~50x cut in
+// radio events versus busy, and worth the full ~900 ms ramp for a device
+// nobody is using.
 //
-// Checks: 150 ms = 10 * 15 ms; latency 1 <= 30; 150 ms * (1+1) = 300 ms
-// <= 6 s; 12000 ms is inside 6-18 s and 12000 > 300 * 3 = 900 ms.
+// Checks: 150 ms = 10 * 15 ms; latency 4 <= 30; 150 ms * (4+1) = 750 ms
+// <= 6 s; 12000 ms is inside 6-18 s and 12000 > 750 * 3 = 2250 ms.
 //
 // The supervision timeout went 6 s -> 12 s here (and on Near) as precautionary
 // insurance, NOT as a demonstrated fix: a 312-second silent-link hold test on
 // the old 6 s timeout did not drop.
 //
-// Latency was originally 4 (750 ms effective, ~50x cut). Dropped to 1 after
-// on-device root-causing a reproducible disconnect: iOS granting the
-// latency=4 profile via ble_gap_upd_params was reliably followed ~7 s later
-// by an HCI 0x22 (LMP/LL response timeout) disconnect -- see
-// .claude/ISSUE_COMPANION_TRANSFER_REGRESSION.md. When iOS instead declined
-// the request and the link stayed on Near params, the connection was stable
-// indefinitely, so the failure tracks the grant itself, not idle time. This
-// was not a documented Apple guideline violation (latency=4 was inside the
-// interval*(latency+1)<=6s / timeout envelope checked above); the leading
-// theory is that higher latency shrinks the number of connection events
-// available to absorb a lost/retried LL control-PDU ack before its instant
-// passes. Validated at latency=1 (2026-08-04, same doc): a 300s zero-traffic
-// idle-hold soak against the real iOS app logged zero disconnects, versus a
-// steady ~45-51s disconnect cadence at latency=4 in the same scenario.
-// Should keep being watched under real playback traffic for a while longer
-// since the original bug was grant-dependent/intermittent, not proven to
-// reproduce every time even before this fix.
+// This was briefly 1, between 6f5a5f1e (2026-08-04 morning) and the same day's
+// root-cause find, on the theory that latency=4 was what provoked the periodic
+// HCI 0x22 (LMP/LL response timeout) disconnect. **That theory was wrong, and
+// the revert back to 4 is deliberate.** The real cause was the unanswered
+// LL_LENGTH_REQ that onConnect() used to send (see setDataLen's removal in
+// ServerCallbacks::onConnect below); with that gone, latency=4 is stable. The
+// evidence that overturned it: every 0x22 ever captured -- across both
+// latencies, every connection profile, tethered and untethered -- landed at
+// 39992-39998 ms into the connection, i.e. the Core Spec's 40 s LL procedure
+// response timeout (TPRT), which is anchored to a procedure started at connect
+// and cannot be a property of a profile change that happens tens of seconds
+// later at a varying offset. The original "~7 s after the Deep grant" reading
+// was arithmetic coincidence: that grant landed at t=+32827 ms, and
+// 40000 - 32827 = 7.2 s. 0x22 was also observed on links that never left Near
+// (latency=2) both before and after that change, which the original
+// investigation recorded but did not reconcile.
+//
+// Keeping latency at 1 would cost real battery for nothing: it wakes the radio
+// every 300 ms instead of every 750 ms on a link nobody is driving.
 constexpr uint16_t kConnIntervalDeepUnits = 120;  // 150 ms (120 * 1.25 ms)
-constexpr uint16_t kConnLatencyDeep = 1;
+constexpr uint16_t kConnLatencyDeep = 4;
 constexpr uint16_t kConnTimeoutDeepUnits = 1200;  // 12 s
 
 // How long the link must go without a content/status/session write or an
@@ -1590,23 +1593,24 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // below is the only way to know what actually landed.
     if (server) {
       server->updatePhy(connInfo.getConnHandle(), BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK, 0);
-      // Without this, the link layer stays on the legacy default data
-      // length (27-byte payload), regardless of the ~522-byte ATT MTU this
-      // firmware now accepts (see kMaxImageChunkPayload). A large ATT write
-      // still has to go out, but gets fragmented into far more over-the-air
-      // LL Data PDUs than necessary -- observed on hardware turning a
-      // single ~510-byte image CHUNK write into a ~250ms round trip despite
-      // an 8x tighter (30ms) connection interval, because most of that time
-      // is spent re-fragmenting one write across many connection events
-      // instead of sending it in one or two. 251 is BLE 4.2+'s max useful
-      // payload (BLE_GAP_MAX_TXOCTETS below) -- matches the write chunk size
-      // far better than the legacy default. Purely a request like the PHY
-      // and conn-param ones above; there is no NimBLE server-role callback
-      // to confirm what a given central actually grants. 251 is the
-      // Bluetooth Core Spec's own max TX octets for Data Length Extension
-      // (not a NimBLE-specific constant, since this build doesn't expose
-      // one).
-      server->setDataLen(connInfo.getConnHandle(), 251);
+      // There used to be a `server->setDataLen(connHandle, 251)` here, for the
+      // real reason that the legacy 27-byte data length re-fragments a ~510-byte
+      // image CHUNK across many connection events. **Do not put it back.** It
+      // was the cause of the periodic HCI 0x22 disconnect: iOS never answered
+      // the LL_LENGTH_REQ it sent, and the Core Spec's 40 s LL procedure
+      // response timeout dropped the link -- reproduced at 39992-39998 ms on
+      // every connection, and fixed outright by removing it (a link that had
+      // never once survived 40 s ran 4+ minutes on the first try). The same
+      // capability is now requested as a controller default in ensureStarted()
+      // via ble_gap_write_sugg_def_data_len(), where the link layer schedules
+      // the negotiation itself instead of the host racing it into the middle of
+      // connection setup; see that call site for the full reasoning.
+      //
+      // The deeper rule this cost a week to learn: only one LLCP procedure may
+      // be pending on a connection at a time, so firing several from onConnect()
+      // -- which still requests the 2M PHY just above -- is inherently a race
+      // against whatever the central is doing at the same moment. Anything added
+      // here needs to be checked against that, and preferably not added here.
     }
   }
   void onConnParamsUpdate(NimBLEConnInfo& connInfo) override {
@@ -1635,10 +1639,9 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // string, which is precisely how a diagnostic stops being read.
     //
     // tick() does the actual reporting once the request has had time to land.
-    g_connParamsMatchedRequest =
-        (g_reqIntervalUnits == 0 ||
-         (connInfo.getConnInterval() == g_reqIntervalUnits && connInfo.getConnLatency() == g_reqLatency &&
-          connInfo.getConnTimeout() == g_reqTimeoutUnits));
+    g_connParamsMatchedRequest = (g_reqIntervalUnits == 0 || (connInfo.getConnInterval() == g_reqIntervalUnits &&
+                                                              connInfo.getConnLatency() == g_reqLatency &&
+                                                              connInfo.getConnTimeout() == g_reqTimeoutUnits));
     g_lastGrantedIntervalUnits = connInfo.getConnInterval();
     g_lastGrantedLatency = connInfo.getConnLatency();
     g_lastGrantedTimeoutUnits = connInfo.getConnTimeout();
@@ -1737,6 +1740,42 @@ bool ensureStarted(const GfxRenderer& renderer, int fontId) {
   // force a from-source Arduino core rebuild for this). v6 also needs it for
   // the handshake: HELLO is up to 76 bytes and is never chunked.
   NimBLEDevice::setMTU(185);
+
+  // Data Length Extension, asked for as a controller-wide *default* rather than
+  // as a per-connection LL_LENGTH_REQ from onConnect().
+  //
+  // The distinction is the whole fix for the 40-second disconnect. Calling
+  // NimBLEServer::setDataLen() at t=+1ms into a connection injects an explicit
+  // LLCP procedure into the middle of the central's own connection-setup
+  // exchange; iOS never answered it, and the Core Spec's 40 s LL procedure
+  // response timeout (TPRT) then killed the link with HCI 0x22 -- every single
+  // capture, at 39992-39998 ms, until this was removed. It also poisoned the
+  // two procedures fired alongside it, since only one LLCP procedure may be
+  // pending at a time: with it gone the PHY reaches 2M and the opening
+  // conn-param request is granted verbatim, neither of which used to happen.
+  //
+  // This form hands the same request to the controller as its default for new
+  // connections, so the DLE negotiation is scheduled by the link layer as part
+  // of connection setup, properly serialized against everything else, instead
+  // of racing it from the host. 251 octets is the Core Spec's maximum useful
+  // payload and 2120 us its matching max TX time on the 1 M PHY (the
+  // conservative figure -- 2 M needs only 1064 us).
+  //
+  // Best-effort: a controller that refuses simply keeps the 27-byte legacy
+  // default, which costs throughput on large image CHUNKs and nothing else.
+  // Logged rather than treated as fatal for that reason.
+  // Measured with companion-bench image-repeat (3 x 104544 B) on 2026-08-04,
+  // against this call present vs absent: no throughput difference either way,
+  // ~40 kB/s both, with the occasional low outlier in both arms. macOS
+  // negotiates DLE itself regardless, so on that central this is invisible.
+  // Kept anyway -- the controller accepts it (rc=0), it cannot reintroduce the
+  // 40 s disconnect the way the old per-connection request did, and iOS is not
+  // this harness and may not self-negotiate. If it ever needs re-testing, that
+  // is the scenario to use.
+  const int dleRc = ble_gap_write_sugg_def_data_len(251, 2120);
+  if (dleRc != 0) {
+    LOG_ERR("CBLE", "suggested default data length rejected (rc=%d), staying on the 27-byte default", dleRc);
+  }
 
   computeCapabilityValue(renderer, fontId);
 
