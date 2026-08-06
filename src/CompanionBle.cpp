@@ -150,10 +150,10 @@ ForegroundChangeCallback g_foregroundCb = nullptr;
 ImageStagedCallback g_imageStagedCb = nullptr;
 
 // ---------------------------------------------------------------------------
-// Adaptive connection interval / slave latency
+// Connection interval / peripheral latency
 // ---------------------------------------------------------------------------
 //
-// Three link-layer profiles, requested via NimBLEServer::updateConnParams (a
+// Two link-layer profiles, requested via NimBLEServer::updateConnParams (a
 // peripheral can only ever *request* new parameters -- the central, iOS here,
 // grants or ignores it). This is transport tuning, not a protocol change: no
 // wire field, byte layout, or characteristic is affected, so it carries no
@@ -163,171 +163,118 @@ ImageStagedCallback g_imageStagedCb = nullptr;
 // into ble_gap_upd_params): interval in 1.25 ms units, latency as a skipped-
 // event count, supervision timeout in 10 ms units.
 //
-// Bounds are iOS's accessory-design-guidelines envelope, since the real
-// central here is a phone (CompanionKit/Snap2Ink/SpokenFeeds), and a request
-// outside it is simply ignored, leaving iOS's own defaults in place:
-//   - peripheral latency <= 30 intervals
-//   - supervision timeout 6-18 s
-//   - interval >= 15 ms, in 15 ms multiples
-//   - maxInterval * (latency+1) <= 6 s
-//   - timeout(ms) > maxInterval(ms) * (latency+1) * 3
+// Chosen by SESSION STATE, not by an activity timer. An earlier design (see
+// git history: the Busy/Near/Deep ladder) renegotiated the *interval* itself
+// on every button press or content write, on the assumption that a tighter
+// interval was needed while "busy" and could be relaxed after a quiet
+// timeout. That assumption was measured wrong: a negotiated parameter change
+// does not take effect when requested -- it takes effect at an "instant"
+// roughly 6 connection events out, counted at the OLD, slower interval. So
+// ramping back from the relaxed stages cost ~360 ms (from the old Near) and
+// ~900 ms (from the old Deep), paid on the first field of every article
+// (measured title wire times of 298 ms and 598 ms, versus 30 ms when the
+// link was already fast). Worse, the renegotiation churn itself caused a
+// traced failure: a relax request and a tighten request overlapped -- only
+// one connection-parameter procedure may be in flight at a time (see
+// pumpConnParams()) -- the tighten request was silently dropped, and a push
+// took ~6 s to reach the panel.
 //
-// "Busy": tight interval, no latency skipping -- lowest round-trip time while
-// a button press or a content/image chunk sequence is actively in flight.
-// 15 ms is iOS's own floor (interval>=15ms/15ms-multiple); latency 0 means
-// maxInterval*(latency+1)=15ms and the timeout floor (6s) clears
-// 15ms*1*3=45ms by a wide margin. Each image chunk write is a full
-// request/ack round trip bound by this interval, so this was previously 30ms
-// (measured ~2.9 KB/s); halving it roughly doubles chunk throughput.
+// Peripheral LATENCY is the right knob instead, and this was verified on
+// real hardware with a BLE sniffer (2026-08-06): with latency 30 negotiated,
+// the peripheral attended only 562 of 3724 connection events (dominant idle
+// gap exactly 31 = latency+1 -- it really does skip almost everything when
+// idle), yet all 56 notifications queued during that capture reached the air
+// within 0-4 connection events of being queued. NimBLE's peripheral-latency
+// implementation on this hardware is a genuine "skip when idle, wake on
+// demand" behaviour, not a rigid low-power mode that only serves data at the
+// latency-extended anchor point. So the interval never needs to move at all:
+// negotiate it once per connection and leave it alone. The peripheral's own
+// wakefulness does the power management for free, with none of the
+// renegotiation-churn cost above.
 //
-// Safe only because image chunk storage no longer does blocking SD I/O on
-// this callback's task -- see the chunk queue in CompanionImageWriter
-// (image writes moved to a dedicated task so a slow SdFat/SPI write or the
-// end-of-image flush()/close() can never stall the BLE host task long enough
-// to miss a scheduled radio event at this tighter interval).
-// Checks: 15 ms is a multiple of 15 ms and meets the >=15 ms floor; latency
-// 0 <= 30; 15 ms * (0+1) = 15 ms <= 6 s; 6000 ms > 15 ms * 1 * 3 = 45 ms.
-// Min == max is legal *only* at 15 ms: the guidelines' own worked exception
-// ("Interval Min == Interval Max == 15 ms"), which some devices answer by
-// scaling to 30 ms. Every other profile needs a real spread -- see
-// kConnIntervalNearMaxUnits.
-constexpr uint16_t kConnIntervalBusyUnits = 12;     // 15 ms (12 * 1.25 ms)
-constexpr uint16_t kConnIntervalBusyMaxUnits = 12;  // 15 ms -- the permitted equality
-constexpr uint16_t kConnLatencyBusy = 0;
-constexpr uint16_t kConnTimeoutBusyUnits = 600;  // 6 s (10 ms units) -- iOS's floor
+// One consequence worth stating plainly: button latency is UNAFFECTED by
+// peripheral latency. The peripheral wakes on demand to transmit, so an
+// outgoing button notify is bounded by one connection interval (~30 ms),
+// regardless of which profile is active. The cost of a high latency value
+// falls only on the FIRST packet of a *central-to-peripheral* push -- up to
+// latency * interval, while the link is genuinely idle and the central has
+// to wait for the next anchor point it is not skipping. Once packets are
+// flowing the peripheral is not skipping connection events at all, so bulk
+// transfers (image/title/body chunks) are unaffected either way.
+//
+// Both profiles below share the same interval, 15-30 ms (12-24 units): iOS
+// is MEASURED to grant Interval Max, so the link runs at 30 ms in practice
+// (this was true of the old ladder's Near/Deep stages too -- see git history
+// for that measurement); the 15 ms min exists only to satisfy the required
+// 15 ms spread (min + 15 ms == max), not because 15 ms is ever actually
+// granted. Only latency differs between the two profiles:
+//
+// "Session": a session currently holds the screen -- the normal case -- so a
+// push is likely at any moment and the link stays relatively responsive.
+// Effective idle cadence 30 ms * (10+1) = 330 ms.
+// Checks (Apple accessory-design-guidelines envelope: peripheral latency
+// <= 30 intervals; interval >= 15 ms in 15 ms multiples; maxInterval *
+// (latency+1) <= 2 s; timeout(ms) > maxInterval(ms) * (latency+1) * 3):
+// min 15 ms is a multiple of 15 ms and at the floor; min + 15 ms == max;
+// latency 10 <= 30; 30 ms * (10+1) = 330 ms <= 2 s; timeout 4000 ms >
+// 330 ms * 3 = 990 ms < 4000 ms.
+constexpr uint16_t kConnIntervalSessionUnits = 12;     // 15 ms -- floor, spread partner for max
+constexpr uint16_t kConnIntervalSessionMaxUnits = 24;  // 30 ms -- what the link actually runs at
+constexpr uint16_t kConnLatencySession = 10;
+constexpr uint16_t kConnTimeoutSessionUnits = 400;  // 4 s (10 ms units)
 
-// "Near": the middle stage, for a link that is quiet *right now* but belongs
-// to an app that currently holds the screen -- i.e. one that is very likely
-// to push again within seconds.
-//
-// Why it exists (measured on hardware 2026-08-03, three identical
-// 104544-byte image pushes over one connection):
-//   image 1, started on the busy profile:     1876 ms, 55727 B/s
-//   image 2, started on the relaxed profile:  3733 ms, 28005 B/s
-//   image 3, started on the relaxed profile:  3763 ms, 27782 B/s
-// All three *ended* on the busy profile, so the entire 2x penalty is the
-// ramp-up window at the start of the transfer. A connection-parameter update
-// does not take effect when it is requested: it takes effect at an "instant"
-// roughly 6 connection events out. At the old 150 ms idle interval that is
-// ~900 ms of crawling before the link tightens. The device relaxes ~4.3 s
-// after connect -- during the render of the very first push -- so every
-// transfer after the first one paid it.
-//
-// Near is the compromise: 60 ms * (2+1) = 180 ms effective wake cadence still
-// cuts radio events ~12x versus busy's 15 ms, but the ramp back to busy costs
-// only ~6 * 60 ms = ~360 ms instead of ~900 ms.
-//
-// Checks (against Apple's published rules, see the note above
-// kConnTimeoutNearUnits): 60 ms = 4 * 15 ms (multiple, and >= the 15 ms
-// floor); min + 15 ms = 75 ms <= max; latency 2 <= 30;
-// 75 ms * (2+1) = 225 ms <= 2 s; 6000 ms > 225 * 3 = 675 ms.
-// Measured 2026-08-06: iOS grants Interval *Max*, every time -- asking 60-75 ms
-// produced a 75 ms link on all 28 grants in a 10-minute session, never 60. So
-// the max is the number that actually takes effect and the min exists only to
-// satisfy the required spread. To land on 60 ms, ask 45-60.
-constexpr uint16_t kConnIntervalNearUnits = 36;     // 45 ms -- min + 15 ms == max, the required spread
-constexpr uint16_t kConnIntervalNearMaxUnits = 48;  // 60 ms -- what the link will actually run at
-constexpr uint16_t kConnLatencyNear = 2;
-// 12 s -> 6 s. Apple's Accessory Design Guidelines R13 §36.6 and QA1931 both
-// state 2 s <= connSupervisionTimeout <= 6 s, so 12 s was outside the range a
-// request has to satisfy to avoid being rejected outright -- and a rejected
-// request is not "precautionary insurance", it is no insurance at all. The
-// comment this replaces claimed a 6-18 s range; no source was found for that
-// figure, and the current guidelines revision could not be retrieved to rule
-// out a later change (docs/ble-companion-do-and-dont.md, open question Q6).
-// 6 s is the one value that is legal under both readings, so it is the safe
-// choice while that stays unresolved.
-constexpr uint16_t kConnTimeoutNearUnits = 600;  // 6 s
+// "Idle": no session holds the screen, so nothing is going to push content to
+// a screen no app owns -- skip aggressively. Effective idle cadence
+// 30 ms * (30+1) = 930 ms.
+// Checks: min/max/spread identical to Session above; latency 30 <= the
+// 30-interval cap (Apple's maximum); 30 ms * (30+1) = 930 ms <= 2 s;
+// timeout 4000 ms > 930 ms * 3 = 2790 ms < 4000 ms.
+constexpr uint16_t kConnIntervalIdleUnits = 12;     // 15 ms
+constexpr uint16_t kConnIntervalIdleMaxUnits = 24;  // 30 ms
+constexpr uint16_t kConnLatencyIdle = 30;
+constexpr uint16_t kConnTimeoutIdleUnits = 400;  // 4 s
 
-// "Deep": relaxed interval + latency skip once the device is genuinely not
-// being driven -- the "slave latency" lever from the platform research this
-// change is based on, which alone (independent of modem/light-sleep)
-// measurably cuts average current by letting the peripheral skip waking for
-// idle connection events. 150 ms * (1+1) = 300 ms effective, a ~20x cut in
-// radio events versus busy.
-//
-// Checks: 150 ms = 10 * 15 ms; min + 15 ms = 165 ms <= max; latency 1 <= 30;
-// 165 ms * (1+1) = 330 ms <= 2 s; 6000 ms > 330 * 3 = 990 ms.
-//
-// The supervision timeout went 6 s -> 12 s here (and on Near) as precautionary
-// insurance, NOT as a demonstrated fix: a 312-second silent-link hold test on
-// the old 6 s timeout did not drop. It is back at 6 s because 12 s is outside
-// the range Apple documents -- see kConnTimeoutNearUnits. The soak that
-// justified keeping it is unaffected: it passed at 6 s.
-//
-// Latency was originally 4 (750 ms effective, ~50x cut). Dropped to 1 after
-// on-device root-causing a reproducible disconnect: iOS granting the
-// latency=4 profile via ble_gap_upd_params was reliably followed ~7 s later
-// by an HCI 0x22 (LMP/LL response timeout) disconnect -- see
-// .claude/ISSUE_COMPANION_TRANSFER_REGRESSION.md. When iOS instead declined
-// the request and the link stayed on Near params, the connection was stable
-// indefinitely, so the failure tracks the grant itself, not idle time. This
-// was not a documented Apple guideline violation (latency=4 was inside the
-// interval*(latency+1)<=6s / timeout envelope checked above); the leading
-// theory is that higher latency shrinks the number of connection events
-// available to absorb a lost/retried LL control-PDU ack before its instant
-// passes. Validated at latency=1 (2026-08-04, same doc): a 300s zero-traffic
-// idle-hold soak against the real iOS app logged zero disconnects, versus a
-// steady ~45-51s disconnect cadence at latency=4 in the same scenario.
-// Should keep being watched under real playback traffic for a while longer
-// since the original bug was grant-dependent/intermittent, not proven to
-// reproduce every time even before this fix.
-// Same "iOS grants the max" correction as Near: ask 135-150 to run at 150 ms.
-constexpr uint16_t kConnIntervalDeepUnits = 108;     // 135 ms -- min + 15 ms == max
-constexpr uint16_t kConnIntervalDeepMaxUnits = 120;  // 150 ms -- what the link will actually run at
-constexpr uint16_t kConnLatencyDeep = 1;
-constexpr uint16_t kConnTimeoutDeepUnits = 600;  // 6 s
-
-// How long the link must go without a content/status/session write or an
-// outgoing button notify before it relaxes one stage. Matches
-// HalPowerManager::IDLE_POWER_SAVING_MS's idea of "idle" (not its value
-// directly -- that constant lives in a different module -- but the same
-// shape: a short, fixed quiet period before backing off).
-constexpr uint32_t kConnIdleRelaxMs = 3000;
-
-// ...and how long before it drops all the way to Deep. Only reached while a
-// session still holds the screen; with no foreground session the link goes
-// straight from Busy to Deep at kConnIdleRelaxMs, because nothing is going to
-// push content to a screen no app owns.
-constexpr uint32_t kConnDeepRelaxMs = 30000;
-
-// Three discrete link stages rather than a bool: the transition rules below
+// Two discrete link stages rather than a bool: the transition rules below
 // depend on *which* stage is wanted, and an exhaustive switch keeps the
-// parameter triples from drifting apart (see .skills control-flow-clarity).
-enum class ConnProfile : uint8_t { Busy, Near, Deep };
+// parameter pairs from drifting apart (see .skills control-flow-clarity).
+enum class ConnProfile : uint8_t { Session, Idle };
 
 const char* connProfileName(ConnProfile profile) {
   switch (profile) {
-    case ConnProfile::Busy:
-      return "busy";
-    case ConnProfile::Near:
-      return "near";
-    case ConnProfile::Deep:
-      return "deep";
+    case ConnProfile::Session:
+      return "session";
+    case ConnProfile::Idle:
+      return "idle";
   }
   return "?";
 }
 
+// millis() of the last write/notify "activity" edge. No longer drives any
+// profile decision (see noteBleActivity() below) -- kept because five call
+// sites already mark this edge and a future feature may want "time since
+// last BLE write". Nothing currently reads it; the only reader was the old
+// Busy/Near/Deep ladder's idle-relax timer in tick(), which this change
+// deleted along with the ladder itself.
 uint32_t g_lastBleActivityMs = 0;
-// Tracks which profile was last requested, so tick() and the activity
-// helpers below don't spam updateConnParams() every call once already in the
-// right state. Starts at Deep so onConnect()'s noteBleActivity() call always
-// fires an explicit Busy request on a fresh connection -- the v6 handshake
-// happens right after connect, and should get the tightest round-trip
-// available rather than whatever the central defaulted to.
-ConnProfile g_connProfile = ConnProfile::Deep;
+// Tracks which profile was last requested, so tick() and requestConnParams()
+// don't spam updateConnParams() every call once already in the right state.
+// Starts at Idle, matching the no-session state a fresh connection begins
+// in -- the first tick() after onConnect() picks up Session as soon as some
+// app's HELLO/ACQUIRE claims the foreground (see setForeground()).
+ConnProfile g_connProfile = ConnProfile::Idle;
 // What we *want* the link to be, as distinct from what it is. These were one
 // variable until a capture (2026-08-06) showed why they cannot be: tick()
-// requested Deep, a push arrived 313 ms later and requested Busy while Deep's
-// procedure was still outstanding, and the Busy request was dropped on the
-// floor -- only one connection-parameter procedure may be in flight at a time.
-// The old code latched the profile at *request* time, so the firmware believed
-// it was Busy while the link sat at Deep's 330 ms effective interval, and
-// nothing ever retried. The push that followed missed its 3 s batch window and
-// took ~6 s to reach the panel.
-ConnProfile g_desiredProfile = ConnProfile::Deep;
+// requested one profile, a push arrived while that procedure was still
+// outstanding and requested the other, and the second request was dropped on
+// the floor -- only one connection-parameter procedure may be in flight at a
+// time. The old code latched the profile at *request* time, so the firmware
+// believed the link was where it had asked for while the link itself sat on
+// the earlier profile's params, and nothing ever retried. The push that
+// followed missed its batch window and took several seconds to reach the
+// panel.
+ConnProfile g_desiredProfile = ConnProfile::Idle;
 // The profile of the request currently outstanding, for logging only.
-ConnProfile g_requestedProfile = ConnProfile::Deep;
+ConnProfile g_requestedProfile = ConnProfile::Idle;
 // True between issuing a parameter request and the central answering it.
 bool g_connParamsInFlight = false;
 
@@ -392,28 +339,22 @@ void pumpConnParams() {
   if (g_desiredProfile == g_connProfile) return;
 
   const ConnProfile profile = g_desiredProfile;
-  uint16_t interval = kConnIntervalBusyUnits;
-  uint16_t intervalMax = kConnIntervalBusyMaxUnits;
-  uint16_t latency = kConnLatencyBusy;
-  uint16_t timeout = kConnTimeoutBusyUnits;
+  uint16_t interval = kConnIntervalSessionUnits;
+  uint16_t intervalMax = kConnIntervalSessionMaxUnits;
+  uint16_t latency = kConnLatencySession;
+  uint16_t timeout = kConnTimeoutSessionUnits;
   switch (profile) {
-    case ConnProfile::Busy:
-      interval = kConnIntervalBusyUnits;
-      intervalMax = kConnIntervalBusyMaxUnits;
-      latency = kConnLatencyBusy;
-      timeout = kConnTimeoutBusyUnits;
+    case ConnProfile::Session:
+      interval = kConnIntervalSessionUnits;
+      intervalMax = kConnIntervalSessionMaxUnits;
+      latency = kConnLatencySession;
+      timeout = kConnTimeoutSessionUnits;
       break;
-    case ConnProfile::Near:
-      interval = kConnIntervalNearUnits;
-      intervalMax = kConnIntervalNearMaxUnits;
-      latency = kConnLatencyNear;
-      timeout = kConnTimeoutNearUnits;
-      break;
-    case ConnProfile::Deep:
-      interval = kConnIntervalDeepUnits;
-      intervalMax = kConnIntervalDeepMaxUnits;
-      latency = kConnLatencyDeep;
-      timeout = kConnTimeoutDeepUnits;
+    case ConnProfile::Idle:
+      interval = kConnIntervalIdleUnits;
+      intervalMax = kConnIntervalIdleMaxUnits;
+      latency = kConnLatencyIdle;
+      timeout = kConnTimeoutIdleUnits;
       break;
   }
   const auto peer = g_server->getPeerInfo(0);
@@ -444,13 +385,13 @@ void requestConnParams(ConnProfile profile) {
 }
 
 // Called from every characteristic write and outgoing notify -- i.e. anything
-// that means a phone app is actively driving the link right now. Cheap: a
-// timestamp store and, only on the edge back up from Near/Deep, one GAP
-// parameter-update request.
-void noteBleActivity() {
-  g_lastBleActivityMs = millis();
-  requestConnParams(ConnProfile::Busy);
-}
+// that means a phone app is actively driving the link right now. Used to
+// force the link to the Session profile on this edge; no longer does, now
+// that the profile is chosen purely by session state (see the comment above
+// ConnProfile) and never renegotiated on a per-write/per-notify basis. Left
+// as a timestamp store only -- see g_lastBleActivityMs's own comment for why
+// it is kept despite having no current reader.
+void noteBleActivity() { g_lastBleActivityMs = millis(); }
 
 // ---------------------------------------------------------------------------
 // Session table
@@ -472,6 +413,20 @@ struct Session {
 
 Session g_sessions[kMaxSessions];
 uint8_t g_foreground = kNoSession;
+
+// The only place that decides which of the two ConnProfiles the link should
+// be in: Session while some app holds the screen, Idle otherwise. Cheap and
+// idempotent -- requestConnParams()/pumpConnParams() no-op once the link is
+// already at the desired profile -- so tick() can simply call this every
+// time rather than needing an edge-triggered hook at every g_foreground
+// writer (setForeground(), dropSession(), onConnect(), onDisconnect()).
+// Given how rarely g_foreground itself changes, this produces at most a
+// couple of real updateConnParams() calls per connection, never one per
+// article -- see the comment above the ConnProfile constants for why that
+// matters.
+void requestConnParamsForSessionState() {
+  requestConnParams(g_foreground != kNoSession ? ConnProfile::Session : ConnProfile::Idle);
+}
 
 // Pending on-screen pairing prompt. Exactly one at a time — a second prompt
 // stacked behind the first would leave the user confirming an app they can no
@@ -744,11 +699,12 @@ void logChunkTiming() {
 // ContentCharCallbacks::onWrite() runs on the NimBLE host task. ESP32-C3 is
 // single-core, so any blocking call made inline there -- SD/SPI I/O very much
 // included, since it is neither fast nor bounded -- can make the host task
-// miss its own scheduled BLE radio events. At the 30ms connection interval
+// miss its own scheduled BLE radio events. At the ~150ms connection interval
 // this link used to run at there was enough slack for that to go unnoticed;
-// at the 15ms interval now in use (see kConnIntervalBusyUnits above) there
-// usually isn't, and an occasionally-slow write -- or the reliably-slower
-// end-of-image flush/close -- caused real disconnects on real hardware.
+// at the 15-30ms interval both profiles now use (see the ConnProfile
+// constants above) there usually isn't, and an occasionally-slow write -- or
+// the reliably-slower end-of-image flush/close -- caused real disconnects on
+// real hardware.
 //
 // So none of the image staging file's open/write/flush/close calls happen on
 // the host task any more. onWrite() only ever copies a small fixed-size
@@ -1678,9 +1634,14 @@ class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
     g_connectMs = millis();
     LOG_DBG("CBLE", "central connected");
-    // Request the tight profile right away: the v6 HELLO handshake happens
-    // immediately after connect, before anything else marks the link busy.
+    // Negotiate the connection params once, right here, rather than waiting
+    // for tick()'s next call to notice -- "negotiate once per connection,
+    // then never again" (see the comment above the ConnProfile constants).
+    // No session has claimed the foreground yet at this point, so this
+    // requests Idle; requestConnParamsForSessionState() picks up Session on
+    // its own once some app's HELLO/ACQUIRE does (see setForeground()).
     noteBleActivity();
+    requestConnParamsForSessionState();
     // 2M PHY halves on-air time per packet versus the 1M PHY default. Purely
     // a request -- the central (iOS) grants or ignores it, same as
     // updateConnParams above -- and iOS decides silently, so onPhyUpdate()
@@ -1766,11 +1727,12 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     g_connectMs = 0;
     g_reqIntervalUnits = 0;
     g_reqIntervalMaxUnits = 0;
-    // The next connect gets a fresh onConnect() -> noteBleActivity() edge;
-    // reset to Deep so a stale "already Busy" doesn't suppress that request.
-    g_connProfile = ConnProfile::Deep;
-    g_desiredProfile = ConnProfile::Deep;
-    g_requestedProfile = ConnProfile::Deep;
+    // The next connect gets a fresh onConnect() -> requestConnParamsForSessionState()
+    // edge; reset to Idle (the no-session state a fresh connection begins in)
+    // so a stale "already there" doesn't suppress that request.
+    g_connProfile = ConnProfile::Idle;
+    g_desiredProfile = ConnProfile::Idle;
+    g_requestedProfile = ConnProfile::Idle;
     g_connParamsInFlight = false;
     resetReassembly();
     // Sessions do not survive the link. The token does — that is what makes the
@@ -1963,10 +1925,16 @@ bool isConnected() { return g_begun && g_server && g_server->getConnectedCount()
 void tick() {
   if (!isConnected()) return;
 
-  // Retry point for a request that was deferred behind another procedure or
-  // went unanswered. Without this the link can sit in a profile nobody asked
-  // for until the next activity edge happens to differ from it.
-  pumpConnParams();
+  // The whole job: make sure the profile matching current session state has
+  // been requested. This is both the initial request on a state change (a
+  // session claiming/losing the foreground) and the retry point for one that
+  // was deferred behind another procedure or went unanswered -- cheap and
+  // idempotent, since requestConnParams()/pumpConnParams() no-op once the
+  // link is already at (or already pursuing) the desired profile. There is
+  // no timer here any more: no periodic idle-relax step, and no per-write or
+  // per-notify tightening -- see the comment above the ConnProfile constants
+  // for why the interval no longer needs to move at all.
+  requestConnParamsForSessionState();
 
   // DIAGNOSTIC: report a parameter request the central never honoured, once per
   // request, and only after it has had kConnParamsGraceMs to land. Checking here
@@ -1985,17 +1953,6 @@ void tick() {
             static_cast<unsigned>(g_lastGrantedIntervalUnits), static_cast<unsigned>(g_lastGrantedLatency),
             static_cast<unsigned>(g_lastGrantedTimeoutUnits));
   }
-
-  const uint32_t quietMs = millis() - g_lastBleActivityMs;
-  if (quietMs < kConnIdleRelaxMs) return;
-  // Two ways to earn Deep: a long enough quiet spell that even an app holding
-  // the screen has clearly stopped driving, or no session holding the screen
-  // at all -- in which case there is nobody whose next push would pay the
-  // ramp, so the ~50x saving is free. Otherwise sit at Near: quiet, but one
-  // ~360 ms ramp away from full speed instead of ~900 ms.
-  const bool screenOwned = g_foreground != kNoSession;
-  const ConnProfile want = (quietMs >= kConnDeepRelaxMs || !screenOwned) ? ConnProfile::Deep : ConnProfile::Near;
-  requestConnParams(want);
 }
 
 const uint8_t* capabilityValue(size_t& lengthOut) {

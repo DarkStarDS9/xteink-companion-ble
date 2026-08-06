@@ -288,13 +288,16 @@ void stop();
 
 bool isConnected();
 
-// Polls whether the link has been idle (no content/status/session write and
-// no outgoing button notify) long enough to relax the connection interval
-// and slave latency. Cheap (a millis() subtraction on every call, an actual
-// GAP request only on the busy->idle edge) — call it once per main loop
-// iteration, e.g. from CompanionModeActivity::loop(). Tightening back to the
-// busy profile happens automatically and immediately on the next write or
-// notify, so nothing needs to call the inverse of this.
+// Ensures the connection interval/peripheral-latency profile matching current
+// session state (Session while some app holds the screen, Idle otherwise —
+// see CompanionBle.cpp's ConnProfile) has been requested. Cheap and idempotent
+// — an actual GAP request only goes out on a real state change or a retry of
+// one the central hasn't answered yet — call it once per main loop iteration,
+// e.g. from CompanionModeActivity::loop(). Unlike the interval-ladder this
+// replaced, there is no periodic relax/tighten timer: the interval is
+// negotiated once per connection and never renegotiated: only peripheral
+// latency differs between the two profiles, and that costs nothing on the
+// outgoing (button-notify) path — see the comment above ConnProfile.
 void tick();
 
 // The capability characteristic's bytes, for diagnostics and for a test host
