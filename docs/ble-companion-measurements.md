@@ -172,6 +172,54 @@ every log line and is the only clock to use.
 
 ---
 
+## Session 3 — 2026-08-06, 17 renders / 13 pushes, render pipeline instrumented
+
+**Build:** `bae14ec9` (per-render `queued->notify / notify->lock / render` split in `ActivityManager`).
+
+### P9 — there is no handoff latency and no lock contention. The 531 ms did not exist.
+
+| Interval | Mean | Max |
+|---|---|---|
+| `requestUpdate()` → `xTaskNotify` | **0.3 ms** | 1 ms |
+| notify → `RenderLock` acquired | **0.0 ms** | 0 ms |
+| `render()` itself | 913 ms (skewed by two outliers) | — |
+
+Typical `render()` durations: 473, 535, 542, 544, 554, 563, 569, 575, 578, 580, 582, 627, 643, 716,
+800 ms, plus two at ~3300 ms.
+
+**Both hypotheses for the 531 ms are dead.** It was neither the deferred-notification path nor
+`RenderLock` contention with an in-flight render — both measure at essentially zero. The time is
+*inside* `render()`, and it always was.
+
+Reconciling with the existing draw log: `clearScreen`→`displayBuffer` is 167 ms mean (P8) and the
+panel waveform is 382 ms, which sums to ~549 ms — matching the typical `render()` figure directly.
+So:
+
+```
+render() ~= 167 ms  layout + drawing   (ours)
+         +  382 ms  panel waveform     (physics)
+         =  ~550 ms
+```
+
+**Corrected total: push → visible ≈ 1.2–1.5 s**, split roughly ~634 ms first-field→commit (of which
+300–600 ms is the parameter ramp, P5) and ~550 ms commit→visible.
+
+The two ~3300 ms renders are presumably the periodic full refresh; not isolated, and with n=17 the
+tail is not well characterised.
+
+### Method error, the second of the same kind
+
+P8 attributed 531 ms to a "render-task handoff" by differencing the timestamps of *adjacent log
+lines* — commit, then the `clearScreen`→`displayBuffer` line — and assuming the gap was scheduling.
+It was not: those intervals overlap, because the draw log is emitted partway through the very work
+being measured. Direct instrumentation shows the handoff is ~0.
+
+Twice now a confident number has come from inferring durations from log-line adjacency (first the
+host clock in P6, then overlapping intervals here). **Instrument the interval you want to measure;
+do not difference two lines that happen to sit near each other.**
+
+---
+
 ## Open questions, in priority order
 
 **Q1. Does the `0x22` still occur at all under compliant parameters?**
@@ -185,11 +233,15 @@ typical inter-article gap would remove ~373 ms from every push, at the cost of h
 interval for longer. **This is a power-vs-latency judgement with real numbers on both sides and has
 not been made** — it needs the battery measurement that has never been run (below).
 
-**Q3. Why is there 531 ms between a batch committing and the render starting?** *(Now the largest
-single term in push-to-visible — see P8.)* It is neither BLE nor the panel: it is the handoff from
-the commit in `CompanionModeActivity::loop()` to the render task. Candidates: main-loop polling
-cadence, `RenderLock` contention with an in-flight render, or the render task's wake latency. None
-investigated. Likely the cheapest remaining win, and entirely local — no phone, no sniffer.
+**Q3. ~~Why is there 531 ms between a batch committing and the render starting?~~ ANSWERED: there
+isn't.** Handoff and lock contention both measure ~0 (P9). The render pipeline is ~550 ms, of which
+~382 ms is the panel waveform and ~167 ms our layout and drawing. **There is little left to win
+here** — the remaining controllable term in push-to-visible is the parameter ramp (Q2), not
+rendering.
+
+**Q3b (new, low priority). What are the ~3300 ms renders?** Two of 17. Presumably the periodic full
+refresh from `displayWithRefreshCycle`. If they land on article pushes rather than on idle redraws,
+they are worth moving; if they are already opportunistic, they are free. Not isolated yet.
 
 **Q4. Does the peripheral really transmit at the next anchor point when latency is high?**
 The sleepy-mode design in the architecture doc rests on this and it is still unverified. Test: set
