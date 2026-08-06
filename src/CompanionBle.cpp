@@ -187,7 +187,12 @@ ImageStagedCallback g_imageStagedCb = nullptr;
 // to miss a scheduled radio event at this tighter interval).
 // Checks: 15 ms is a multiple of 15 ms and meets the >=15 ms floor; latency
 // 0 <= 30; 15 ms * (0+1) = 15 ms <= 6 s; 6000 ms > 15 ms * 1 * 3 = 45 ms.
-constexpr uint16_t kConnIntervalBusyUnits = 12;  // 15 ms (12 * 1.25 ms)
+// Min == max is legal *only* at 15 ms: the guidelines' own worked exception
+// ("Interval Min == Interval Max == 15 ms"), which some devices answer by
+// scaling to 30 ms. Every other profile needs a real spread -- see
+// kConnIntervalNearMaxUnits.
+constexpr uint16_t kConnIntervalBusyUnits = 12;     // 15 ms (12 * 1.25 ms)
+constexpr uint16_t kConnIntervalBusyMaxUnits = 12;  // 15 ms -- the permitted equality
 constexpr uint16_t kConnLatencyBusy = 0;
 constexpr uint16_t kConnTimeoutBusyUnits = 600;  // 6 s (10 ms units) -- iOS's floor
 
@@ -212,12 +217,23 @@ constexpr uint16_t kConnTimeoutBusyUnits = 600;  // 6 s (10 ms units) -- iOS's f
 // cuts radio events ~12x versus busy's 15 ms, but the ramp back to busy costs
 // only ~6 * 60 ms = ~360 ms instead of ~900 ms.
 //
-// Checks: 60 ms = 4 * 15 ms (multiple, and >= the 15 ms floor); latency
-// 2 <= 30; 60 ms * (2+1) = 180 ms <= 6 s; 12000 ms is inside 6-18 s and
-// 12000 > 180 * 3 = 540 ms.
-constexpr uint16_t kConnIntervalNearUnits = 48;  // 60 ms (48 * 1.25 ms)
+// Checks (against Apple's published rules, see the note above
+// kConnTimeoutNearUnits): 60 ms = 4 * 15 ms (multiple, and >= the 15 ms
+// floor); min + 15 ms = 75 ms <= max; latency 2 <= 30;
+// 75 ms * (2+1) = 225 ms <= 2 s; 6000 ms > 225 * 3 = 675 ms.
+constexpr uint16_t kConnIntervalNearUnits = 48;     // 60 ms (48 * 1.25 ms)
+constexpr uint16_t kConnIntervalNearMaxUnits = 60;  // 75 ms -- min + 15 ms, the required spread
 constexpr uint16_t kConnLatencyNear = 2;
-constexpr uint16_t kConnTimeoutNearUnits = 1200;  // 12 s
+// 12 s -> 6 s. Apple's Accessory Design Guidelines R13 §36.6 and QA1931 both
+// state 2 s <= connSupervisionTimeout <= 6 s, so 12 s was outside the range a
+// request has to satisfy to avoid being rejected outright -- and a rejected
+// request is not "precautionary insurance", it is no insurance at all. The
+// comment this replaces claimed a 6-18 s range; no source was found for that
+// figure, and the current guidelines revision could not be retrieved to rule
+// out a later change (docs/ble-companion-do-and-dont.md, open question Q6).
+// 6 s is the one value that is legal under both readings, so it is the safe
+// choice while that stays unresolved.
+constexpr uint16_t kConnTimeoutNearUnits = 600;  // 6 s
 
 // "Deep": relaxed interval + latency skip once the device is genuinely not
 // being driven -- the "slave latency" lever from the platform research this
@@ -226,12 +242,14 @@ constexpr uint16_t kConnTimeoutNearUnits = 1200;  // 12 s
 // idle connection events. 150 ms * (1+1) = 300 ms effective, a ~20x cut in
 // radio events versus busy.
 //
-// Checks: 150 ms = 10 * 15 ms; latency 1 <= 30; 150 ms * (1+1) = 300 ms
-// <= 6 s; 12000 ms is inside 6-18 s and 12000 > 300 * 3 = 900 ms.
+// Checks: 150 ms = 10 * 15 ms; min + 15 ms = 165 ms <= max; latency 1 <= 30;
+// 165 ms * (1+1) = 330 ms <= 2 s; 6000 ms > 330 * 3 = 990 ms.
 //
 // The supervision timeout went 6 s -> 12 s here (and on Near) as precautionary
 // insurance, NOT as a demonstrated fix: a 312-second silent-link hold test on
-// the old 6 s timeout did not drop.
+// the old 6 s timeout did not drop. It is back at 6 s because 12 s is outside
+// the range Apple documents -- see kConnTimeoutNearUnits. The soak that
+// justified keeping it is unaffected: it passed at 6 s.
 //
 // Latency was originally 4 (750 ms effective, ~50x cut). Dropped to 1 after
 // on-device root-causing a reproducible disconnect: iOS granting the
@@ -250,9 +268,10 @@ constexpr uint16_t kConnTimeoutNearUnits = 1200;  // 12 s
 // Should keep being watched under real playback traffic for a while longer
 // since the original bug was grant-dependent/intermittent, not proven to
 // reproduce every time even before this fix.
-constexpr uint16_t kConnIntervalDeepUnits = 120;  // 150 ms (120 * 1.25 ms)
+constexpr uint16_t kConnIntervalDeepUnits = 120;     // 150 ms (120 * 1.25 ms)
+constexpr uint16_t kConnIntervalDeepMaxUnits = 132;  // 165 ms -- min + 15 ms, the required spread
 constexpr uint16_t kConnLatencyDeep = 1;
-constexpr uint16_t kConnTimeoutDeepUnits = 1200;  // 12 s
+constexpr uint16_t kConnTimeoutDeepUnits = 600;  // 6 s
 
 // How long the link must go without a content/status/session write or an
 // outgoing button notify before it relaxes one stage. Matches
@@ -307,6 +326,11 @@ uint32_t connUptimeMs() { return g_connectMs == 0 ? 0 : millis() - g_connectMs; 
 // g_connProfile on the *request*; if iOS silently ignores or alters it, the
 // firmware otherwise carries on believing the link is tight.
 uint16_t g_reqIntervalUnits = 0;
+// The request is a *range* now that the profiles carry the guidelines' required
+// min/max spread, so a grant anywhere inside it is compliance, not divergence.
+// Comparing against the min alone would report every legitimately-granted
+// interval as a mismatch.
+uint16_t g_reqIntervalMaxUnits = 0;
 uint16_t g_reqLatency = 0;
 uint16_t g_reqTimeoutUnits = 0;
 // millis() of the last requestConnParams() call, and whether the most recent
@@ -331,37 +355,42 @@ void requestConnParams(ConnProfile profile) {
   if (!g_server || g_server->getConnectedCount() == 0) return;
   if (g_connProfile == profile) return;
   uint16_t interval = kConnIntervalBusyUnits;
+  uint16_t intervalMax = kConnIntervalBusyMaxUnits;
   uint16_t latency = kConnLatencyBusy;
   uint16_t timeout = kConnTimeoutBusyUnits;
   switch (profile) {
     case ConnProfile::Busy:
       interval = kConnIntervalBusyUnits;
+      intervalMax = kConnIntervalBusyMaxUnits;
       latency = kConnLatencyBusy;
       timeout = kConnTimeoutBusyUnits;
       break;
     case ConnProfile::Near:
       interval = kConnIntervalNearUnits;
+      intervalMax = kConnIntervalNearMaxUnits;
       latency = kConnLatencyNear;
       timeout = kConnTimeoutNearUnits;
       break;
     case ConnProfile::Deep:
       interval = kConnIntervalDeepUnits;
+      intervalMax = kConnIntervalDeepMaxUnits;
       latency = kConnLatencyDeep;
       timeout = kConnTimeoutDeepUnits;
       break;
   }
   const auto peer = g_server->getPeerInfo(0);
-  g_server->updateConnParams(peer.getConnHandle(), interval, interval, latency, timeout);
+  g_server->updateConnParams(peer.getConnHandle(), interval, intervalMax, latency, timeout);
   g_connProfile = profile;
   g_reqIntervalUnits = interval;
+  g_reqIntervalMaxUnits = intervalMax;
   g_reqLatency = latency;
   g_reqTimeoutUnits = timeout;
   g_connParamsRequestedMs = millis();
   g_connParamsMatchedRequest = false;  // until an update event says otherwise
   g_connParamsDivergenceLogged = false;
-  LOG_DBG("CBLE", "t=+%lums requested %s conn params (interval=%u latency=%u timeout=%u)",
+  LOG_DBG("CBLE", "t=+%lums requested %s conn params (interval=%u-%u latency=%u timeout=%u)",
           static_cast<unsigned long>(connUptimeMs()), connProfileName(profile), static_cast<unsigned>(interval),
-          static_cast<unsigned>(latency), static_cast<unsigned>(timeout));
+          static_cast<unsigned>(intervalMax), static_cast<unsigned>(latency), static_cast<unsigned>(timeout));
 }
 
 // Called from every characteristic write and outgoing notify -- i.e. anything
@@ -1655,8 +1684,8 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // tick() does the actual reporting once the request has had time to land.
     g_connParamsMatchedRequest =
         (g_reqIntervalUnits == 0 ||
-         (connInfo.getConnInterval() == g_reqIntervalUnits && connInfo.getConnLatency() == g_reqLatency &&
-          connInfo.getConnTimeout() == g_reqTimeoutUnits));
+         (connInfo.getConnInterval() >= g_reqIntervalUnits && connInfo.getConnInterval() <= g_reqIntervalMaxUnits &&
+          connInfo.getConnLatency() == g_reqLatency && connInfo.getConnTimeout() == g_reqTimeoutUnits));
     g_lastGrantedIntervalUnits = connInfo.getConnInterval();
     g_lastGrantedLatency = connInfo.getConnLatency();
     g_lastGrantedTimeoutUnits = connInfo.getConnTimeout();
@@ -1677,6 +1706,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
             g_activeField);
     g_connectMs = 0;
     g_reqIntervalUnits = 0;
+    g_reqIntervalMaxUnits = 0;
     // The next connect gets a fresh onConnect() -> noteBleActivity() edge;
     // reset to Deep so a stale "already Busy" doesn't suppress that request.
     g_connProfile = ConnProfile::Deep;
@@ -1880,10 +1910,11 @@ void tick() {
       g_connParamsRequestedMs != 0 && millis() - g_connParamsRequestedMs > kConnParamsGraceMs) {
     g_connParamsDivergenceLogged = true;
     LOG_ERR("CBLE",
-            "conn params NOT honoured after %lums: asked interval=%u latency=%u timeout=%u, link is interval=%u "
+            "conn params NOT honoured after %lums: asked interval=%u-%u latency=%u timeout=%u, link is interval=%u "
             "latency=%u timeout=%u (units: 1.25ms / events / 10ms)",
             static_cast<unsigned long>(kConnParamsGraceMs), static_cast<unsigned>(g_reqIntervalUnits),
-            static_cast<unsigned>(g_reqLatency), static_cast<unsigned>(g_reqTimeoutUnits),
+            static_cast<unsigned>(g_reqIntervalMaxUnits), static_cast<unsigned>(g_reqLatency),
+            static_cast<unsigned>(g_reqTimeoutUnits),
             static_cast<unsigned>(g_lastGrantedIntervalUnits), static_cast<unsigned>(g_lastGrantedLatency),
             static_cast<unsigned>(g_lastGrantedTimeoutUnits));
   }
