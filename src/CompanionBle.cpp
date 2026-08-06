@@ -1637,11 +1637,17 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // Negotiate the connection params once, right here, rather than waiting
     // for tick()'s next call to notice -- "negotiate once per connection,
     // then never again" (see the comment above the ConnProfile constants).
-    // No session has claimed the foreground yet at this point, so this
-    // requests Idle; requestConnParamsForSessionState() picks up Session on
-    // its own once some app's HELLO/ACQUIRE does (see setForeground()).
+    //
+    // Deliberately Session, not requestConnParamsForSessionState(): no app has
+    // claimed the foreground this early, so asking by session state would ask
+    // for Idle and then immediately ask again for Session as soon as the
+    // handshake completes -- two negotiations per connection where one will
+    // do. Asking for Session up front also means the v6 handshake and the
+    // first push run at the 330 ms cadence rather than Idle's 930 ms. A
+    // connection that never gets a foreground session is the rare case, and
+    // tick() drops it to Idle on its own.
     noteBleActivity();
-    requestConnParamsForSessionState();
+    requestConnParams(ConnProfile::Session);
     // 2M PHY halves on-air time per packet versus the 1M PHY default. Purely
     // a request -- the central (iOS) grants or ignores it, same as
     // updateConnParams above -- and iOS decides silently, so onPhyUpdate()
