@@ -78,9 +78,10 @@ and the article reached the panel ~6 s after it was sent. Because the old code l
 profile back to Busy, paid on the first field of **every article**. The body, arriving after the ramp
 has landed, costs 152 ms.
 
-**P6. The panel is ~3.0 s from commit to visible**, not the ~2.2 s recorded in the code comments.
-Worked example: commit at 526.305 → layout logged at 526.977 (219 ms `clearScreen`→`displayBuffer`)
-→ render complete 529.312. The driver's own `X3_DRF (382 ms)` wait accounts for only a fraction of it.
+**P6. ~~The panel is ~3.0 s from commit to visible.~~ WITHDRAWN — this was a measurement error.**
+See the Session 2 correction below. The host-side timestamps used here are distorted by USB serial
+burst delivery and must not be used for sub-second timing; the firmware's own `millis()` (the second
+bracketed field on every line) is the only trustworthy clock in these logs.
 
 **P7. Link stability under compliant parameters.** ~600 s of continuous connection, **zero `0x22`,
 zero `0x08`**. The one disconnect was `0x13` remote-user-terminated — the app closing the link
@@ -122,6 +123,55 @@ two requests, mid-session, not between firmware and central at connect.
 
 ---
 
+## Session 2 — 2026-08-06, 42 pushes, post-fix
+
+**Build:** `0fb3440e` (deferred/retried parameter requests + interval-max correction).
+
+### Fixes verified
+
+| Check | Result |
+|---|---|
+| Granted intervals | **60.00 ms** (39) and **150.00 ms** (9) — the values actually wanted |
+| `conn params NOT honoured` | **0** (was 1) |
+| New `unanswered … retrying` path | fired twice and recovered |
+| Batch commit | median 634 ms, max 2770 ms — no longer reaching the 3 s timeout |
+| Disconnects | none |
+
+Two grants came back at 58.75 ms and 148.75 ms, i.e. *just inside* the requested range rather than at
+the max — so "iOS always grants Interval Max" (P2) is very nearly, but not strictly, true.
+
+### P8 — the panel is not the bottleneck, and P6 was wrong
+
+Recomputed on the firmware clock across 42 pushes:
+
+| Stage | Mean | Owner |
+|---|---|---|
+| Batch commit → render starts | **531 ms** | firmware — render-task handoff |
+| `clearScreen` → `displayBuffer` | 167 ms | firmware — layout + drawing |
+| `displayBuffer` → complete | **485 ms** | **the panel** |
+| First field → batch commit | ~634 ms | firmware + link (incl. the ramp, P5) |
+| **Total push → visible** | **~1.8 s** | |
+
+The underlying waveform wait is `X3_DRF (382 ms)` in 33 of 45 renders, with three at ~936 ms — the
+periodic full refresh from `displayWithRefreshCycle`, **the same helper the reader uses for ordinary
+page turns**. So the companion path is not using a slower waveform than a page turn, and the panel is
+the *smallest* of the four terms.
+
+**This reverses the gap analysis's framing.** Three of the four terms are firmware-side; the panel is
+not where push-to-visible time goes. The largest single item, the 531 ms between committing a batch
+and the render starting, has never been examined.
+
+Unattributed: the driver reports 382 ms while wall-clock around `displayBuffer` is 485 ms.
+
+### Method error worth remembering
+
+P6 claimed a ~3.0 s panel. That came from timestamping serial lines as the **host** received them.
+USB serial delivers in bursts: in one worked example 1 ms of host time covered 1924 ms of firmware
+time. Every sub-second figure taken that way is meaningless. The firmware's `millis()` is present on
+every log line and is the only clock to use.
+
+---
+
 ## Open questions, in priority order
 
 **Q1. Does the `0x22` still occur at all under compliant parameters?**
@@ -135,11 +185,11 @@ typical inter-article gap would remove ~373 ms from every push, at the cost of h
 interval for longer. **This is a power-vs-latency judgement with real numbers on both sides and has
 not been made** — it needs the battery measurement that has never been run (below).
 
-**Q3. What does the panel actually spend 3.0 s on?**
-It is the single largest term in push-to-visible, ~3× everything else combined, and it is not
-instrumented beyond one `clearScreen`→`displayBuffer` figure and a driver wait that does not add up
-to the total. A partial-refresh path for text updates would be worth more than every remaining link
-optimisation put together — one already exists for tag-only redraws.
+**Q3. Why is there 531 ms between a batch committing and the render starting?** *(Now the largest
+single term in push-to-visible — see P8.)* It is neither BLE nor the panel: it is the handoff from
+the commit in `CompanionModeActivity::loop()` to the render task. Candidates: main-loop polling
+cadence, `RenderLock` contention with an in-flight render, or the render task's wake latency. None
+investigated. Likely the cheapest remaining win, and entirely local — no phone, no sniffer.
 
 **Q4. Does the peripheral really transmit at the next anchor point when latency is high?**
 The sleepy-mode design in the architecture doc rests on this and it is still unverified. Test: set
