@@ -1184,6 +1184,14 @@ void CompanionModeActivity::loop() {
     commit = true;
   }
   if (commit) {
+    // How long the batch sat between its first field landing and committing.
+    // The kPendingBatchTimeoutMs branch above only shouts when it fires at
+    // 3000ms; this catches the sub-threshold waits, which are invisible today
+    // and are the part of push-to-visible time nothing else accounts for.
+    if (g_pendingBatchStartMs != 0) {
+      LOG_DBG("CMA", "content batch committed %lu ms after its first field",
+              static_cast<unsigned long>(millis() - g_pendingBatchStartMs));
+    }
     poisoned = g_pendingBatchPoisoned;
     batchPushId = g_pendingBatchPushId;
     g_pendingTitleReady = false;

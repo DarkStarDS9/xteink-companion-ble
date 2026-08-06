@@ -571,6 +571,12 @@ bool g_activeSeqGap = false;
 // here on the host task rather than in the writer task, so a slow flush/close
 // or a backlog of still-queued CHUNKs never inflates this number.
 uint32_t g_imageTransferStartMs = 0;
+// Same idea for the text fields, which had no timing at all until now: every
+// instrument above is gated on kFieldImage, so an image push could be
+// attributed down to the individual SD write while a title/body push was a
+// black box between "phone says it sent" and "panel shows it". That is the
+// half the news-companion workload actually lives in.
+uint32_t g_textTransferStartMs = 0;
 
 // Temporary instrumentation: per-CHUNK timing taken directly in
 // ContentCharCallbacks::onWrite() (host task), to tell apart "peripheral is
@@ -1255,6 +1261,8 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           return;
         }
 
+        if (field == kFieldTitle || field == kFieldBody) g_textTransferStartMs = millis();
+
         g_activeTotalLen = totalLen > cap ? cap : totalLen;
         g_activeBuf = makeUniqueNoThrow<uint8_t[]>(g_activeTotalLen == 0 ? 1 : g_activeTotalLen);
         if (!g_activeBuf) {
@@ -1497,6 +1505,16 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
             // poisons the batch on this and discards it instead. The phone's
             // recovery is unchanged: re-push the whole batch on
             // kSessFieldSeqGap.
+            // Wire time for this field, plus the parameters it actually ran
+            // under. Logged before the seq-gap bail-out so a dropped field is
+            // still timed -- a slow transfer and a lossy one look identical
+            // from the phone, and telling them apart is the point.
+            {
+              const uint32_t transferMs = millis() - g_textTransferStartMs;
+              LOG_DBG("CBLE", "text field 0x%02x: %u bytes in %u ms%s", field, static_cast<unsigned>(g_activeWritten),
+                      static_cast<unsigned>(transferMs), g_activeSeqGap ? " (SEQ GAP)" : "");
+              logLastConnParams();
+            }
             if (g_activeSeqGap) {
               LOG_ERR("CBLE", "field 0x%02x dropped: CHUNK sequence gap under Write Without Response", field);
               const uint8_t payload[3] = {kSessFieldSeqGap, sessionId, field};
