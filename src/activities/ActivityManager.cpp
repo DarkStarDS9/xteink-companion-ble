@@ -45,13 +45,34 @@ void ActivityManager::renderTaskTrampoline(void* param) {
 void ActivityManager::renderTaskLoop() {
   while (true) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    // DIAGNOSTIC: snapshot the queued/notified timestamps stamped by whichever
+    // requestUpdate()/requestUpdateAndWait() call site woke us, before doing
+    // anything that could itself take time (see the field comments in
+    // ActivityManager.h for why this exists and when to remove it).
+    const uint32_t diagQueuedAtMsSnapshot = diagQueuedAtMs;
+    const uint32_t diagNotifiedAtMsSnapshot = diagNotifiedAtMs;
+
     // Acquire the lock before reading currentActivity to avoid a TOCTOU race
     // where the main task deletes the activity between the null-check and render().
     RenderLock lock;
+    const uint32_t diagLockAtMs = millis();  // DIAGNOSTIC
     if (currentActivity) {
       HalPowerManager::Lock powerLock;  // Ensure we don't go into low-power mode while rendering
       currentActivity->render(std::move(lock));
     }
+    const uint32_t diagRenderDoneAtMs = millis();  // DIAGNOSTIC
+    // DIAGNOSTIC: one line per render, split into the three intervals that
+    // make up queued->visible. notify->lock is the one we most care about --
+    // it isolates contention with an already-running render from everything
+    // else. Cross-reference the sequence number against CompanionModeActivity's
+    // "content batch committed" log to see how many renders one push produced.
+    LOG_DBG("ACT", "render #%lu: queued->notify %lu ms, notify->lock %lu ms, render %lu ms",
+            static_cast<unsigned long>(++diagRenderSeq),
+            static_cast<unsigned long>(diagNotifiedAtMsSnapshot - diagQueuedAtMsSnapshot),
+            static_cast<unsigned long>(diagLockAtMs - diagNotifiedAtMsSnapshot),
+            static_cast<unsigned long>(diagRenderDoneAtMs - diagLockAtMs));
+
     // Notify any task blocked in requestUpdateAndWait() that the render is done.
     TaskHandle_t waiter = nullptr;
     taskENTER_CRITICAL(&activityManagerSpinlock);
@@ -157,6 +178,7 @@ void ActivityManager::loop() {
     // Using direct notification to signal the render task to update
     // Increment counter so multiple rapid calls won't be lost
     if (renderTaskHandle) {
+      diagNotifiedAtMs = millis();  // DIAGNOSTIC, see ActivityManager.h
       xTaskNotify(renderTaskHandle, 1, eIncrement);
     }
   }
@@ -285,12 +307,24 @@ ScreenshotInfo ActivityManager::getScreenshotInfo() const {
 void ActivityManager::requestUpdate(bool immediate) {
   if (immediate) {
     if (renderTaskHandle) {
+      // DIAGNOSTIC: immediate requests skip the deferred queue entirely, so
+      // queued and notified are the same instant (see ActivityManager.h).
+      const uint32_t diagNow = millis();
+      diagQueuedAtMs = diagNow;
+      diagNotifiedAtMs = diagNow;
       xTaskNotify(renderTaskHandle, 1, eIncrement);
     }
   } else {
     // Deferring the update until current loop is finished
     // This is to avoid multiple updates being requested in the same loop
-    requestedUpdate = true;
+    // DIAGNOSTIC: stamp the queued time only on the transition that actually
+    // sets the flag (mirrors loop()'s exchange below), so a second
+    // requestUpdate() while one is already pending doesn't reset the clock.
+    // requestedUpdate ends up true either way -- same as the plain assignment
+    // this replaced -- exchange() is only needed here to see the prior value.
+    if (!requestedUpdate.exchange(true)) {
+      diagQueuedAtMs = millis();
+    }
   }
 }
 void ActivityManager::requestUpdateAndWait() {
@@ -319,6 +353,13 @@ void ActivityManager::requestUpdateAndWait() {
   // Cannot call while holding RenderLock or it will cause a deadlock
   assert(!holdingRenderLock && "Cannot call requestUpdateAndWait() while holding RenderLock");
 
+  // DIAGNOSTIC: this path bypasses requestUpdate() entirely, so stamp both
+  // here too -- otherwise renderTaskLoop() would log stale timestamps left
+  // over from an unrelated earlier request for this render (see
+  // ActivityManager.h).
+  const uint32_t diagNow = millis();
+  diagQueuedAtMs = diagNow;
+  diagNotifiedAtMs = diagNow;
   xTaskNotify(renderTaskHandle, 1, eIncrement);
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 }

@@ -66,6 +66,24 @@ class ActivityManager {
   // This variable must only be set by the main loop, to avoid race conditions
   std::atomic<bool> requestedUpdate{false};
 
+  // DIAGNOSTIC (temporary): investigating a measured 531ms mean between a
+  // content batch committing and the render actually starting. These two
+  // timestamps let renderTaskLoop() split that gap into queued->notify and
+  // notify->lock-acquired instead of guessing. Written at every requestUpdate()
+  // / requestUpdateAndWait() call site that leads to an xTaskNotify() of the
+  // render task, read once per render in renderTaskLoop(). millis() writes are
+  // not atomicity-critical here (worst case is a stale reading on a race
+  // between two near-simultaneous requests, which just skews one diagnostic
+  // log line, never behaviour), but they're kept atomic anyway since they're
+  // written from more than one task. Remove this pair, diagRenderSeq below,
+  // and every DIAGNOSTIC-tagged line in ActivityManager.cpp together once the
+  // 531ms question is answered.
+  std::atomic<uint32_t> diagQueuedAtMs{0};
+  std::atomic<uint32_t> diagNotifiedAtMs{0};
+  // Render-task-only counter (never touched off that task), so a plain
+  // uint32_t is fine.
+  uint32_t diagRenderSeq{0};
+
  public:
   explicit ActivityManager(GfxRenderer& renderer, MappedInputManager& mappedInput)
       : renderer(renderer), mappedInput(mappedInput), renderingMutex(xSemaphoreCreateMutex()) {
