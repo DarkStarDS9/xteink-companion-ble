@@ -221,8 +221,12 @@ constexpr uint16_t kConnTimeoutBusyUnits = 600;  // 6 s (10 ms units) -- iOS's f
 // kConnTimeoutNearUnits): 60 ms = 4 * 15 ms (multiple, and >= the 15 ms
 // floor); min + 15 ms = 75 ms <= max; latency 2 <= 30;
 // 75 ms * (2+1) = 225 ms <= 2 s; 6000 ms > 225 * 3 = 675 ms.
-constexpr uint16_t kConnIntervalNearUnits = 48;     // 60 ms (48 * 1.25 ms)
-constexpr uint16_t kConnIntervalNearMaxUnits = 60;  // 75 ms -- min + 15 ms, the required spread
+// Measured 2026-08-06: iOS grants Interval *Max*, every time -- asking 60-75 ms
+// produced a 75 ms link on all 28 grants in a 10-minute session, never 60. So
+// the max is the number that actually takes effect and the min exists only to
+// satisfy the required spread. To land on 60 ms, ask 45-60.
+constexpr uint16_t kConnIntervalNearUnits = 36;     // 45 ms -- min + 15 ms == max, the required spread
+constexpr uint16_t kConnIntervalNearMaxUnits = 48;  // 60 ms -- what the link will actually run at
 constexpr uint16_t kConnLatencyNear = 2;
 // 12 s -> 6 s. Apple's Accessory Design Guidelines R13 §36.6 and QA1931 both
 // state 2 s <= connSupervisionTimeout <= 6 s, so 12 s was outside the range a
@@ -268,8 +272,9 @@ constexpr uint16_t kConnTimeoutNearUnits = 600;  // 6 s
 // Should keep being watched under real playback traffic for a while longer
 // since the original bug was grant-dependent/intermittent, not proven to
 // reproduce every time even before this fix.
-constexpr uint16_t kConnIntervalDeepUnits = 120;     // 150 ms (120 * 1.25 ms)
-constexpr uint16_t kConnIntervalDeepMaxUnits = 132;  // 165 ms -- min + 15 ms, the required spread
+// Same "iOS grants the max" correction as Near: ask 135-150 to run at 150 ms.
+constexpr uint16_t kConnIntervalDeepUnits = 108;     // 135 ms -- min + 15 ms == max
+constexpr uint16_t kConnIntervalDeepMaxUnits = 120;  // 150 ms -- what the link will actually run at
 constexpr uint16_t kConnLatencyDeep = 1;
 constexpr uint16_t kConnTimeoutDeepUnits = 600;  // 6 s
 
@@ -311,6 +316,20 @@ uint32_t g_lastBleActivityMs = 0;
 // happens right after connect, and should get the tightest round-trip
 // available rather than whatever the central defaulted to.
 ConnProfile g_connProfile = ConnProfile::Deep;
+// What we *want* the link to be, as distinct from what it is. These were one
+// variable until a capture (2026-08-06) showed why they cannot be: tick()
+// requested Deep, a push arrived 313 ms later and requested Busy while Deep's
+// procedure was still outstanding, and the Busy request was dropped on the
+// floor -- only one connection-parameter procedure may be in flight at a time.
+// The old code latched the profile at *request* time, so the firmware believed
+// it was Busy while the link sat at Deep's 330 ms effective interval, and
+// nothing ever retried. The push that followed missed its 3 s batch window and
+// took ~6 s to reach the panel.
+ConnProfile g_desiredProfile = ConnProfile::Deep;
+// The profile of the request currently outstanding, for logging only.
+ConnProfile g_requestedProfile = ConnProfile::Deep;
+// True between issuing a parameter request and the central answering it.
+bool g_connParamsInFlight = false;
 
 // DIAGNOSTIC (2026-08-03 link-robustness investigation): millis() at the last
 // onConnect, so every link-layer log line can carry "t=+Nms into this
@@ -351,9 +370,28 @@ uint16_t g_lastGrantedTimeoutUnits = 0;
 // genuinely ignored request go unnoticed for long.
 constexpr uint32_t kConnParamsGraceMs = 3000;
 
-void requestConnParams(ConnProfile profile) {
+// Issues the request for g_desiredProfile if the link is not already there and
+// no procedure is outstanding. Safe and cheap to call repeatedly -- tick() does
+// exactly that, which is what turns a deferred request into a retried one.
+void pumpConnParams() {
   if (!g_server || g_server->getConnectedCount() == 0) return;
-  if (g_connProfile == profile) return;
+
+  if (g_connParamsInFlight) {
+    // Still inside the window the central is allowed to take. Do not start a
+    // second procedure: it would be the one that gets dropped.
+    if (millis() - g_connParamsRequestedMs <= kConnParamsGraceMs) return;
+    // The grace expired with no matching update. Either the central ignored
+    // the request or the answer never came; either way the procedure is no
+    // longer usefully outstanding, so allow a fresh attempt rather than
+    // wedging here for the rest of the connection.
+    LOG_DBG("CBLE", "conn params request for %s unanswered after %lums, retrying", connProfileName(g_requestedProfile),
+            static_cast<unsigned long>(kConnParamsGraceMs));
+    g_connParamsInFlight = false;
+  }
+
+  if (g_desiredProfile == g_connProfile) return;
+
+  const ConnProfile profile = g_desiredProfile;
   uint16_t interval = kConnIntervalBusyUnits;
   uint16_t intervalMax = kConnIntervalBusyMaxUnits;
   uint16_t latency = kConnLatencyBusy;
@@ -380,7 +418,11 @@ void requestConnParams(ConnProfile profile) {
   }
   const auto peer = g_server->getPeerInfo(0);
   g_server->updateConnParams(peer.getConnHandle(), interval, intervalMax, latency, timeout);
-  g_connProfile = profile;
+  // Deliberately NOT g_connProfile: that only moves when the central actually
+  // grants the request (see onConnParamsUpdate). Latching it here is what made
+  // the firmware believe a dropped request had taken effect.
+  g_requestedProfile = profile;
+  g_connParamsInFlight = true;
   g_reqIntervalUnits = interval;
   g_reqIntervalMaxUnits = intervalMax;
   g_reqLatency = latency;
@@ -391,6 +433,14 @@ void requestConnParams(ConnProfile profile) {
   LOG_DBG("CBLE", "t=+%lums requested %s conn params (interval=%u-%u latency=%u timeout=%u)",
           static_cast<unsigned long>(connUptimeMs()), connProfileName(profile), static_cast<unsigned>(interval),
           static_cast<unsigned>(intervalMax), static_cast<unsigned>(latency), static_cast<unsigned>(timeout));
+}
+
+// Records the profile the link should be in. The request itself may go out now
+// or be deferred behind an outstanding procedure -- either way tick() keeps
+// trying until the link actually gets there.
+void requestConnParams(ConnProfile profile) {
+  g_desiredProfile = profile;
+  pumpConnParams();
 }
 
 // Called from every characteristic write and outgoing notify -- i.e. anything
@@ -1686,6 +1736,15 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         (g_reqIntervalUnits == 0 ||
          (connInfo.getConnInterval() >= g_reqIntervalUnits && connInfo.getConnInterval() <= g_reqIntervalMaxUnits &&
           connInfo.getConnLatency() == g_reqLatency && connInfo.getConnTimeout() == g_reqTimeoutUnits));
+    // The link only counts as being in a profile once the central says so. An
+    // update that does not match what we asked for is either the central's own
+    // opening parameters or a request of ours it declined -- in both cases the
+    // procedure is done, so stop treating ours as outstanding and let
+    // pumpConnParams() decide whether to ask again.
+    if (g_connParamsMatchedRequest) {
+      g_connProfile = g_requestedProfile;
+      g_connParamsInFlight = false;
+    }
     g_lastGrantedIntervalUnits = connInfo.getConnInterval();
     g_lastGrantedLatency = connInfo.getConnLatency();
     g_lastGrantedTimeoutUnits = connInfo.getConnTimeout();
@@ -1710,6 +1769,9 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // The next connect gets a fresh onConnect() -> noteBleActivity() edge;
     // reset to Deep so a stale "already Busy" doesn't suppress that request.
     g_connProfile = ConnProfile::Deep;
+    g_desiredProfile = ConnProfile::Deep;
+    g_requestedProfile = ConnProfile::Deep;
+    g_connParamsInFlight = false;
     resetReassembly();
     // Sessions do not survive the link. The token does — that is what makes the
     // next connect silent.
@@ -1900,6 +1962,11 @@ bool isConnected() { return g_begun && g_server && g_server->getConnectedCount()
 
 void tick() {
   if (!isConnected()) return;
+
+  // Retry point for a request that was deferred behind another procedure or
+  // went unanswered. Without this the link can sit in a profile nobody asked
+  // for until the next activity edge happens to differ from it.
+  pumpConnParams();
 
   // DIAGNOSTIC: report a parameter request the central never honoured, once per
   // request, and only after it has had kConnParamsGraceMs to land. Checking here
