@@ -273,6 +273,65 @@ bulk image transfers need no separate profile.
 
 ---
 
+## Resolved design questions
+
+### R1 — "Can the phone hint a quiet period, and the reader wake itself just before it ends?"
+
+Asked 2026-08-07. Proposal: the phone pushes an article plus "this will play for 32 s"; the reader
+sleeps deeply and, at ~T−1 s, simply stops skipping connection events — no renegotiation — so it is
+fully attentive by the time the next article arrives.
+
+**Verdict: the scheme is sound and buildable. The "stop skipping" step needs a parameter update on
+this stack, but that update now costs ~180 ms and does not slow data, so the scheme works as
+described.**
+
+**At spec level the premise is correct.** Peripheral latency is a maximum permitted skip, not an
+obligation; a peripheral may attend every connection event whenever it chooses. "Stop skipping" is
+legal with no air exchange. The obstacle is the stack API — latency is applied by the *controller*,
+and the host needs a way to command it.
+
+**NimBLE has no such command.** Verified by reading the vendored source in
+`.pio/libdeps/default/NimBLE-Arduino/src/nimble/nimble/host/`, not inferred:
+
+| Path | What it is |
+|---|---|
+| `ble_gap_update_params()` → `NimBLEServer::updateConnParams()` | full connection-parameter update procedure |
+| `ble_gap_subrate_req()`, `ble_gap_set_default_subrate()` (`ble_gap.h` ~3343/3363) | BT 5.3 Connection Subrating; HCI `0x007D`/`0x007E` (`hci_common.h:1233,1242`) |
+
+Greps for `slave_latency_disable`, `periph_latency.*disable` and force-awake variants returned
+**empty** outside those two paths. For comparison, Nordic's SoftDevice *does* expose the local,
+no-air-exchange toggle as `BLE_GAP_OPT_SLAVE_LATENCY_DISABLE` via `sd_ble_opt_set()` — the capability
+is real, just absent here. **SOURCE-VERIFIED.**
+
+**Connection Subrating is the standardised form of this idea, and is unavailable on three counts:**
+compiled out in this build (`CONFIG_BT_NIMBLE_SUBRATE` unset → `MYNEWT_VAL_BLE_CONN_SUBRATING` = 0);
+ESP32-C3 *controller* support unconfirmed (Espressif advertises "BLE 5.4 certified", which does not
+imply every optional 5.3 feature is implemented); and **iOS central support unconfirmed, leaning
+negative** — no Apple documentation found either way. And even fully enabled it is still an air
+exchange (`LL_SUBRATE_REQ`/`LL_SUBRATE_IND`), i.e. negotiation-lite, not a local flag.
+
+**Why the fallback is nevertheless cheap now.** The old objection priced a parameter update at
+~900 ms, because the old design moved the **connection interval** and the instant is ~6 events
+counted at the *old, slow* interval — with data crawling throughout. With the interval fixed at
+30 ms and only latency changing, the same procedure is **~6 × 30 ms ≈ 180 ms, and the link runs at
+full speed the whole time it is pending**. A T−1 s wake-ahead has roughly 5× the margin it needs.
+
+**Cost of building it:** two control procedures per article (sleep after the push, wake before the
+article ends). That is the churn pattern behind the dropped-request failure (P3) — but that bug is
+fixed (deferral + retry), the interval no longer moves, and a 1 s margin is not a 313 ms race.
+
+**Why it is not being built yet.** The benefit is unquantified: roughly 3/s → 1.07/s idle wake-ups,
+against a battery nobody has measured (Q5). The A/B discharge test settles it and needs no protocol
+work. If wake-ups dominate, this is worth building and the design is ready; the phone-side shape is
+already sketched in [ble-companion-ideal-architecture.md](ble-companion-ideal-architecture.md) §3.2.
+
+**One free variant needs no protocol at all:** when the user skips using the *reader's* buttons, the
+reader is the one sending the button event, so it already knows a push is imminent and can drop its
+own latency at that instant without being told. In companion mode the unpredictable input arrives at
+the reader first, which makes the hint scheme more reliable, not less.
+
+---
+
 ## Open questions, in priority order
 
 **Q1. Does the `0x22` still occur at all under compliant parameters?**
@@ -302,8 +361,17 @@ Deep's latency high, press a button, measure. If it fails, that design should be
 disabled.
 
 **Q5. Battery.** No measurement has ever been taken on this fork; there is no current-sense hardware,
-so the plan of record is an A/B discharge-to-empty rather than a bench meter. Q2 cannot be settled
-without it.
+so the plan of record is an A/B discharge-to-empty rather than a bench meter. **This is now the
+gating measurement for the whole power line of work** — R1 (the phone traffic hint), the choice
+between latency 10 and latency 30, and whether idle wake-ups matter at all against the framebuffer
+and panel, all wait on it. Everything it gates is designed and ready; none of it should be built
+until it says the gain is real.
+
+**Q6 (new). Does the ESP32-C3 controller implement LE Connection Subrating, and does iOS support it
+as central?** Both unconfirmed (R1). If both are yes, enabling `CONFIG_BT_NIMBLE_SUBRATE` would give
+a lighter mechanism than a full parameter update for R1's wake-ahead. Low priority: the parameter
+update is already cheap enough at a fixed interval, so this would be an optimisation of something
+that is no longer expensive.
 
 ---
 

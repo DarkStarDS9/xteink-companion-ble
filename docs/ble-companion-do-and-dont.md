@@ -348,11 +348,39 @@ arbitrary-length nap. Genuinely unbounded sleep requires **disconnecting**.
 This is the honest answer to "the phone knows nothing will be pushed for 30 s — can it hand that
 knowledge to the reader?" **The knowledge cannot be turned into sleep directly.** It can only be
 turned into sleep *indirectly*: the phone tells the firmware (over GATT, at the application layer)
-what to expect, and the **firmware** then petitions for a longer effective interval through the
-connection-parameter machinery. The connection-parameter machinery is the only lever. Every use of
-it costs a control-procedure round trip, is subject to rejection, and is a collision risk (N2).
-Whether that trade is worth making is a design question for Deliverable 2; that it is the *only*
-available shape is a fact. **SPEC.**
+what to expect, and the **firmware** then petitions through the connection-parameter machinery. That
+machinery is the only lever. Every use of it costs a control-procedure round trip, is subject to
+rejection, and is a collision risk (N2). That this is the *only* available shape is a fact. **SPEC.**
+
+> **REFINED (Phase 3, verified 2026-08-07).** Two things about this were framed too pessimistically.
+>
+> **The "wake up early" half needs no negotiation at spec level.** Peripheral latency is a *maximum
+> permitted skip*, not an obligation — a peripheral may listen at every connection event whenever it
+> likes. So "stop skipping now" is spec-legal without any air exchange. The obstacle is purely the
+> **stack API**: latency is applied by the controller, and NimBLE exposes no way to command it.
+> Verified by reading the vendored source, not asserted — greps for `slave_latency_disable` /
+> `periph_latency.*disable` / force-awake variants come back **empty** outside two paths:
+> `ble_gap_update_params()` (full parameter update) and `ble_gap_subrate_req()` (below). Nordic's
+> SoftDevice *does* expose exactly this, as `BLE_GAP_OPT_SLAVE_LATENCY_DISABLE` via
+> `sd_ble_opt_set()` — so the capability is real, just not here. **SOURCE-VERIFIED.**
+>
+> **Bluetooth 5.3 standardised it as LE Connection Subrating**, and NimBLE implements it:
+> `ble_gap_subrate_req()` and `ble_gap_set_default_subrate()` (`ble_gap.h` ~3343/3363), mapping to
+> HCI opcodes `BLE_HCI_OCF_LE_SET_DEFAULT_SUBRATE` (0x007D) and `BLE_HCI_OCF_LE_SUBRATE_REQ` (0x007E)
+> (`hci_common.h:1233,1242`). Three blockers, stacked: it is **compiled out** here
+> (`CONFIG_BT_NIMBLE_SUBRATE` unset, so `MYNEWT_VAL_BLE_CONN_SUBRATING` is 0); ESP32-C3 **controller**
+> support is unconfirmed (Espressif advertises "BLE 5.4 certified", which does not imply every
+> optional 5.3 feature is implemented); and **iOS central** support is unconfirmed, leaning negative.
+> Even if all three resolved, `LL_SUBRATE_REQ`/`LL_SUBRATE_IND` is still an air exchange —
+> negotiation-lite, not a local flag. **SOURCE-VERIFIED** for the API, **unverified** for chip/iOS.
+>
+> **And the cost of the fallback collapsed.** The "control-procedure round trip" above was priced
+> when the design moved the *connection interval*, where the instant is ~6 events at the **old, slow**
+> interval (~900 ms from a 150 ms profile) and data crawls throughout. With the interval fixed at
+> 30 ms and only latency changing, the same procedure costs **~180 ms and does not slow data at all
+> while pending**. A phone hint of the form "quiet for N seconds, wake at N−1" is therefore
+> practical — the margin needed is a few hundred ms, not a second.
+> See [ble-companion-measurements.md](ble-companion-measurements.md), "Resolved design questions".
 
 **I2. You cannot get sub-interval latency in either direction.** Nothing can be delivered between
 anchor points. The floor on any push is one connection interval, and Apple's floor on the interval
