@@ -220,18 +220,71 @@ do not difference two lines that happen to sit near each other.**
 
 ---
 
+## Session 4 — 2026-08-06, latency wake-on-demand test
+
+**Build:** `f1c261a2`, a throwaway experiment (since reverted): ladder disabled, link pinned to a
+single negotiation of interval 30 ms / **latency 30** / timeout 6 s. 12 button presses, which
+produced 56 notifications (each press emits press + hold-ticks + release, ~300 ms tick cadence).
+
+**Question:** peripheral latency is a permission to skip, not an obligation. Does *this* controller
+still transmit at the next anchor point when it has data queued, or does it hold data until its next
+scheduled wake? The whole fixed-parameter design depends on the answer.
+
+### P10 — it wakes on demand. Confirmed.
+
+- **iOS granted latency 30** outright: `interval=30.00ms latency=30 timeout=6000ms`.
+- **Latency was genuinely in force** (the check that stops this being a vacuous test): the peripheral
+  participated in only **562 of 3724** connection events, and the dominant idle gap between events it
+  attended was exactly **31** (= latency + 1), 98 times. It really was sleeping through 30 events.
+- **All 56 notifications reached the air within 0–4 connection events (0–120 ms)** of being queued.
+  None waited for the ~930 ms boundary.
+
+**Confounders checked.** The central transmitted at ~99% of all events, yet the peripheral still
+attended only 15% — so constant central traffic does not drag it awake. Of the 14 "cold"
+burst-openers, only 1 had non-empty central traffic nearby; the other 13 cannot be attributed to a
+central-initiated exchange. One burst fired ~450 ms *before* the mandatory deadline, which is only
+explicable as interrupt-driven. Sniffer sync was clean for the whole connection. Reader-to-capture
+clock correlation carries ±20–50 ms uncertainty, which is why a few deltas read slightly negative;
+it does not affect the event-gap conclusion.
+
+**Also:** no `0x22` and no `0x08` across the session, at latency 30 — far beyond the latency 4 that
+historically correlated with `0x22`. Consistent with renegotiation having been the culprit rather
+than the latency value. One session is not a soak; not settled.
+
+### The constraint this test also established
+
+The peripheral wakes early only when **it** has data to send. It cannot pre-emptively listen harder
+for *incoming* data — no host API exists for "ignore latency for a while". So a phone→reader push
+still pays up to `latency × interval` on its **first packet**, and the only way to vary that
+dynamically is renegotiation, i.e. the thing being removed. Latency is therefore a standing trade,
+chosen once:
+
+| Config | Mean first-packet delay | Worst | Idle wake-ups |
+|---|---|---|---|
+| Old ladder (60 ms/lat 2 + ~360 ms ramp) | ~450 ms | ~540 ms | 5.5/s |
+| **Fixed 30 ms, latency 10** | **150 ms** | 300 ms | **3/s** |
+| Fixed 30 ms, latency 30 | 465 ms | 930 ms | 1.07/s |
+
+Latency 10 beats the old ladder on *both* axes, so it is not a compromise. Latency 30 trades a worse
+tail for more saving and is deferred to Q5 (battery).
+
+Latency is self-cancelling during traffic — once packets flow the peripheral is not skipping — so
+bulk image transfers need no separate profile.
+
+---
+
 ## Open questions, in priority order
 
 **Q1. Does the `0x22` still occur at all under compliant parameters?**
 600 s clean is suggestive, not proof — the historic failure was intermittent. Needs a long soak
 (30+ min) with real playback traffic, serial only, no sniffer required.
 
-**Q2. Is the 373 ms ramp worth paying on every article?**
-It exists because the link relaxes to Near after `kConnIdleRelaxMs` = 3 s of quiet, and articles
-arrive every 7–60 s, so essentially every article pays it. Raising the relax threshold above the
-typical inter-article gap would remove ~373 ms from every push, at the cost of holding a 15 ms
-interval for longer. **This is a power-vs-latency judgement with real numbers on both sides and has
-not been made** — it needs the battery measurement that has never been run (below).
+**Q2. ~~Is the 373 ms ramp worth paying on every article?~~ RESOLVED — the ramp is gone.**
+The question assumed the interval had to move. It does not: peripheral latency delivers the same
+idle saving with no renegotiation, and P10 confirmed this controller wakes on demand. The ladder was
+replaced with two fixed profiles chosen by session state (latency 10 with a foreground session,
+30 without), negotiated once per connection. **Unverified in the field** — needs a session on the new
+build to confirm the ramp has actually disappeared from title wire times.
 
 **Q3. ~~Why is there 531 ms between a batch committing and the render starting?~~ ANSWERED: there
 isn't.** Handoff and lock contention both measure ~0 (P9). The render pipeline is ~550 ms, of which
