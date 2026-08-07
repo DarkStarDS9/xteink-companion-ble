@@ -51,6 +51,30 @@ the wire format. Consumer apps depend on it.
   firmware, though unproven on real hardware (see the protocol doc's status warning). It was a
   **clean break**: v6 requires a handshake, so a v5 client gets no error, just silence.
 
+## The phone is not a test harness
+
+**Do not make the user pick up their phone to reproduce something.** The reader
+(`/dev/cu.usbmodem*`) and the Sniffle sniffer (`/dev/cu.usbserial-*`) are both attached to the same
+Mac the agent runs on. Anything that is *protocol*, *firmware*, or *app behaviour* — batch framing,
+the final-field flag, push cadence, `RENDER_STATUS` correlation, timeout interactions, a client that
+waits on an acknowledgement — is reproducible from a host script, and must be. Tying iterative
+testing to a human tapping a phone is what produced the circular, bug-driven stretches in this
+work's history.
+
+- Extend the harness that already exists: `scripts/companion_protocol.py` (the shared client),
+  `scripts/companion_e2e_test.py`, `scripts/push_companion_content.py`. Do not write a fourth
+  one-off script.
+- A harness that mimics a consumer app must mimic its **behaviour**, not just its bytes — SpokenFeeds
+  pushes an article as a batch and then *waits* for the render acknowledgement before starting audio.
+  A harness that fires and forgets cannot reproduce the failures that matter.
+- **What a host harness genuinely cannot prove**: controller-level behaviour that is the *central's*,
+  not ours — the exact peripheral-latency grant, DLE, PHY negotiation. macOS's central stack is not
+  iOS's and is not steerable. Those need the phone plus the sniffer. Everything else does not, and
+  claiming otherwise is how a phone-only loop gets rationalised.
+- Known obstacle: host BLE via `bleak` fails with `DENIED_BY_UNKNOWN` when run **inside tmux** — a
+  macOS TCC quirk, not a code bug. Run the harness from a plain terminal, or drive it as a launched
+  process outside the multiplexer. Serial over USB is unaffected.
+
 ## Upstream relationship
 
 - **`companion`** is the trunk and default branch. **`develop`** is a pristine mirror of
