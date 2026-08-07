@@ -461,6 +461,10 @@ that is no longer expensive.
 
 - **Stop the serial logger before flashing.** It holds `/dev/cu.usbmodem212401`; `esptool` then fails
   with "No serial data received", which reads like a hardware fault and isn't.
+- **`grep` goes binary-silent on a log that spans a reflash.** Flashing injects NUL bytes into the
+  capture; `grep -o` then matches nothing and prints nothing, rather than saying "binary file
+  matches". An empty result from such a log is **not** a negative result, it is a failed check —
+  use `grep -a`. Cost one wrong "the reader never connected" conclusion on 2026-08-07.
 - **`system_profiler` is unavailable in this sandbox**; use `ioreg` to enumerate USB.
 - **Don't identify a board by its `/dev/cu.*` name alone.** The reader (native USB CDC) is
   `usbmodem*`; the sniffer's CP2102N is `usbserial*`. Getting these the wrong way round risks
