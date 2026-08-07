@@ -112,9 +112,12 @@ opposite role from what Companion Mode needs. See
 `src/CompanionBle.h`/`src/CompanionBle.cpp` are the implementation, and
 `docs/companion-multi-app-design.md` is the design this version implements.
 
-A reference client implementation of everything below ships in this repo:
-`clients/swift/CompanionKit` (SwiftPM package, iOS/macOS) and
-`scripts/push_companion_content.py` (dev-machine Python, `bleak`).
+A reference client implementation of everything below is `CompanionKit`
+(SwiftPM package, iOS/macOS), maintained in its own repo at
+https://github.com/DarkStarDS9/CompanionKit — extracted from this repo on
+2026-08-07 with full history; both consumer apps depend on it via SPM. See
+`clients/README.md`. Also: `scripts/push_companion_content.py`
+(dev-machine Python, `bleak`).
 
 ## GATT service
 
@@ -1642,10 +1645,12 @@ READ_LATER) and added the Status characteristic.
   on-device screen: pagination, pairing prompt, button routing, image render,
   sleep grid). See `docs/companion-mode-implementation-notes.md` for the
   bring-up log.
-- **Swift client**: `clients/swift/CompanionKit` — a SwiftPM package
-  implementing discovery, the handshake, token/appId/installId persistence,
-  ACQUIRE/RELEASE, asset digest compare-and-push, the framer, and button-event
-  decoding. Shared by this fork's consumer apps; see its `README.md`.
+- **Swift client**: `CompanionKit` (https://github.com/DarkStarDS9/CompanionKit)
+  — a SwiftPM package implementing discovery, the handshake,
+  token/appId/installId persistence, ACQUIRE/RELEASE, asset digest
+  compare-and-push, the framer, and button-event decoding. Shared by this
+  fork's consumer apps via SPM; see its `README.md` and `clients/README.md`
+  here.
 - **Python client**: `scripts/companion_protocol.py` is the single Python
   implementation of everything above — UUIDs, opcodes, field ids, the
   notification decoder, capability parsing, the handshake, token persistence
