@@ -13,100 +13,81 @@ most expensive kind of knowledge to re-acquire.
 
 # CURRENT STATE — read this first
 
-**As of 2026-08-07.** This section is the handoff. Everything below it is the historical record.
+**As of 2026-08-07, consolidated.** This section is the handoff, and it tracks **every live line,
+not just the one you are sitting in** — a session that updates only its own line recreates the
+cross-worktree amnesia the 2026-08-07 consolidation had to undo. Cross-repo sessions (e.g. run
+from a SpokenFeeds checkout) that touch firmware must update this section too. Before analyzing
+anything, run `git worktree list` and `git cherry companion <branch>` for every listed branch.
 
 ## Where the code is
 
-| Branch | State |
+| Line | State |
 |---|---|
-| `companion` | up to `84c6b70b`. All research docs, the parameter fixes, the render instrumentation. **Good state.** |
-| `worktree-bridge-cse_*` | two further commits **not landed**, both untested by a real session: `81f0947c` (Idle holdoff) and `bee97fe1` (drop latency to 0 while a session holds the screen) |
+| `companion` | Consolidated trunk: parameter fixes, render instrumentation, the 2026-08-04 DLE root-cause (DLE requested nowhere), disconnected-page-buttons fix, 2026-08-04 docs. |
+| `worktree-bridge-cse_01AXp4…` | 2 unlanded: `81f0947c` (Idle holdoff) + `bee97fe1` (latency 0 while a session holds the screen). n=1 verified (reader_serial7.log: latency=0 granted once, 30 ms fields, 242 ms batch commit, no safety net). Land after the harness reproduces it. `f1c261a2`/`801ca7fd` are a cancelling pair — intentionally unlanded forever. |
+| formerly `worktree-…01Fh3y` | The 2026-08-04 DLE line — fully landed by the consolidation. |
 
-The two unlanded commits are flashed to the reader. They are deliberately unlanded because the two
-changes before them were regressions that reached the user's hands — see "How this went wrong" below.
-**Land them only after a session confirms them.**
-
-The reverted experiment `f1c261a2` and its revert `801ca7fd` also show as unlanded by `git cherry`.
-That is correct and intentional: they cancel out and `companion` never had either.
-
-## What the link does now
-
-One profile negotiation per connection, no per-article churn.
-
-| Profile | Interval | Latency | Timeout | When |
-|---|---|---|---|---|
-| `Session` | 15 ms (min == max, the permitted equality) | **0** | 4 s | an app holds the screen |
-| `Idle` | 15–30 ms (iOS grants 30) | 30 | 4 s | no foreground session for ≥ `kIdleHoldoffMs` (10 s) |
-
-`Session` is requested in `onConnect`. `tick()` calls `requestConnParamsForSessionState()`, which
-holds `Session` unless the screen has been unowned for the full holdoff.
+**The reader currently runs `bee97fe1`, an unlanded build.** A trunk flash before `81f0947c` +
+`bee97fe1` land would lose the latency-0 behaviour (but now keeps the DLE fix and button fix).
 
 ## What is proven
 
-- Guideline violations were real; fixing them made iOS grant our requests (60 of 61).
-- iOS grants **Interval Max**, essentially always (2 of 82 grants came back just inside the range).
-- Parameter requests were being **silently dropped** when one was already in flight; fixed with
-  deferral + retry, and the profile now only moves on a matching grant.
-- The controller **wakes on demand**: with latency 30 in force (562 of 3724 events attended), all 56
-  notifications reached the air within 0–4 connection events. Peripheral→central is never delayed by
-  latency.
-- The **render path and the panel are fine**: ~550 ms total, of which ~382 ms is the panel waveform,
-  via the same helper the reader uses for ordinary page turns. Handoff and lock contention are ~0.
-- Push-to-visible is **~1.2–1.5 s**, not the ~4 s originally reported.
-
-## What is NOT proven
-
-- That the current build is good. **No session has run against `bee97fe1`.**
-- That `0x22` is gone. It has not recurred since the guideline fix, but there has been no soak.
-- Anything about battery. Never measured on this fork (Q5).
+- Guideline violations were real; fixing them made iOS grant our requests (60 of 61). iOS grants
+  Interval Max essentially always.
+- The controller wakes on demand: peripheral→central is never delayed by latency.
+- Render path ~550 ms total (~382 ms panel waveform). Push-to-visible ~1.2–1.5 s.
+- **The 40 s `0x22` was the DLE request at connect.** Every captured `0x22` sits at
+  39992–40001 ms = TPRT, a spec constant anchored at connect. Removing `setDataLen()` from
+  `onConnect` took a link that had never survived 40 s to a 7m20s soak (2026-08-04, real iPhone).
+  Two further `0x22` at exactly 40001 ms on 2026-08-07 — on a build with the Session/Idle rework
+  and `setDataLen` still present — ruled the profile design out. The 2026-08-06 capture of iOS
+  completing `LL_LENGTH_REQ → RSP` on a healthy connection is not a counterexample: procedures
+  racing at connect sometimes collide, and a collided procedure times out at exactly TPRT.
+- Peripheral latency is not free for phone→reader traffic: latency 10 multiplied every inbound
+  duration ~12× (title 30→361 ms, body 31→390 ms, batch commit 242→~2900 ms) and made the 3 s
+  batch safety net a coin flip. Latency belongs to `Idle` only.
+- The sleep-inhibit fix `fefd310d` is hardware-verified (user, 2026-08-07, including physical
+  unplug).
 
 ## Known open defects
 
-1. **A batch resolved by the 3 s safety net sends no `RENDER_STATUS`.** `g_pendingBatchPushId` is 0
-   on that path, so the firmware stays silent by design. The panel updates and the phone waits out
-   its own render timeout. Firmware-side fix: answer *something* so a slow batch degrades to "late"
-   rather than "silent". **Not yet done** — it is a protocol-semantics change.
-2. **SpokenFeeds gates audio playback on the render acknowledgement.** Observed 2026-08-07: an
-   article's `activateSessionAttempt` fired only after `render wait timed out after 3.0 seconds`,
-   13 s after `playNewsStart`. This is an app-side coupling, not firmware, and it converts any
-   firmware hiccup into user-visible silence. **Arguably the highest-value fix available**, and it
-   inverts the fork's own dumb-firmware/smart-phone principle.
-3. **Three notifications per button tap** (press + one hold tick + release). Deliberate — the phone
-   needs live hold feedback — but for a plain tap the middle one is redundant.
-4. **G6, content-id readback**, from the gap analysis: never started. Still the cheapest way to stop
-   a reconnect re-pushing content the panel already shows.
-
-## How this went wrong, so it does not repeat
-
-Three corrections had to be issued during this work, and two of them shipped to the user as
-regressions:
-
-- The ~3 s panel figure came from **host-side serial receive timestamps**. USB serial delivers in
-  bursts; 1 ms of host time covered 1924 ms of firmware time. Use the firmware's `millis()`.
-- The 531 ms "render handoff" came from **differencing two adjacent log lines** whose intervals
-  overlap. Instrument the interval you want; do not subtract nearby lines.
-- **Latency 10 shipped on reasoning, not measurement.** The mechanism (wake-on-demand) was tested
-  rigorously; the state machine built on top of it was not tested at all before being handed over.
-  It regressed median batch commit from 634 ms to 2916 ms.
-
-**The rule this implies: measure the change you are shipping, not just the principle behind it.** A
-verified mechanism does not validate the policy wrapped around it. And when a symptom appears, stop
-and re-plan rather than patching the symptom — the last stretch of this work was, fairly, described
-as bug-driven development.
+1. **A batch resolved by the 3 s safety net sends no `RENDER_STATUS`** (pushId is 0 on that path).
+   Cheap fix, not a protocol change: every field's END already carries the batch's pushId on the
+   wire — latch it from the batch's *first* END and answer late instead of never. Separately, 3 s
+   is tuned like a slow-link timeout when its real job is "the phone died" — reconsider value and
+   trigger (link-idle, not wall time).
+2. **SpokenFeeds gates audio on the render ack** — app-side; converts any firmware hiccup into
+   user-audible silence.
+3. Three notifications per plain button tap (the middle hold-tick is redundant for a tap).
+4. G6 content-id readback: never started; cheapest way to stop a reconnect re-pushing content the
+   panel already shows.
+5. Snap2Ink must stop routing Up/Down to Remote (dependency from the 2026-07-30 gallery-nav
+   revert; never checked since).
 
 ## What to do next, in order
 
-1. **Run a session against the current build** and check: `conn params granted ... latency=0` once per
-   connection, title/body wire times near 60 ms, batch commit well under 1 s, no `commit flag
-   missed`. Then land `81f0947c` and `bee97fe1`.
-2. **Fix open defect 1** (silent safety-net path) — small, firmware-local, removes a whole class of
-   "screen updated but nothing happened".
-3. **Raise open defect 2 with the app** — the audio/render coupling.
-4. **Q5, the battery A/B discharge.** It gates every remaining power decision, including R1.
-5. Only then revisit power: R1 (phone quiet-period hint) and Idle's latency value.
+1. **Harness** (phase 1b): SpokenFeeds-behaviour mode (push batch → block on `RENDER_STATUS`,
+   per-field wire times in the serial log's shape), soak mode (assert no disconnect ≥ N min,
+   report HCI reason), single entry point. Plain terminal, not tmux (TCC).
+2. **Verified landings** (1c): soak a trunk build (expect it to outlive 40 s now); reproduce the
+   latency-0 result; land `81f0947c` + `bee97fe1`; reflash the reader from trunk.
+3. **TDD extractions**: `CompanionBatchModel` + `CompanionConnPolicy` host suites; the "Every fix
+   starts red" rule.
+4. **Q5, the battery A/B discharge** — gates all remaining power work (including R1 and Idle's
+   latency value). Do not start power work before it.
 
-Do not start 5 before 4. The whole reason the power work went wrong was optimising an unquantified
-gain.
+## How this went wrong, so it does not repeat
+
+The three measurement corrections from the 2026-08-04→07 stretch stand: use firmware `millis()`,
+never host-side serial timestamps; instrument the interval you want, never difference adjacent log
+lines; **measure the change you ship, not just the principle behind it** — a verified mechanism
+does not validate the policy wrapped around it.
+
+The worst failure was **cross-worktree amnesia**: the 2026-08-04 session that root-caused the 40 s
+`0x22` ran from a SpokenFeeds project dir and committed into a firmware worktree; no firmware-side
+handoff ever saw it. Its proven fix sat unlanded for three days while a parallel line
+re-investigated the same bug and reached a weaker conclusion. Hence the rules at the top of this
+section.
 
 ---
 
