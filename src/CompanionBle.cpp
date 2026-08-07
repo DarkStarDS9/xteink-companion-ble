@@ -210,17 +210,36 @@ ImageStagedCallback g_imageStagedCb = nullptr;
 // granted. Only latency differs between the two profiles:
 //
 // "Session": a session currently holds the screen -- the normal case -- so a
-// push is likely at any moment and the link stays relatively responsive.
-// Effective idle cadence 30 ms * (10+1) = 330 ms.
+// push is likely at any moment and the link must be fully responsive. No
+// skipping at all: effective cadence == the 15 ms interval.
 // Checks (Apple accessory-design-guidelines envelope: peripheral latency
 // <= 30 intervals; interval >= 15 ms in 15 ms multiples; maxInterval *
 // (latency+1) <= 2 s; timeout(ms) > maxInterval(ms) * (latency+1) * 3):
-// min 15 ms is a multiple of 15 ms and at the floor; min + 15 ms == max;
-// latency 10 <= 30; 30 ms * (10+1) = 330 ms <= 2 s; timeout 4000 ms >
-// 330 ms * 3 = 990 ms < 4000 ms.
-constexpr uint16_t kConnIntervalSessionUnits = 12;     // 15 ms -- floor, spread partner for max
-constexpr uint16_t kConnIntervalSessionMaxUnits = 24;  // 30 ms -- what the link actually runs at
-constexpr uint16_t kConnLatencySession = 10;
+// 15 ms is a multiple of 15 ms and at the floor; min == max == 15 ms is the
+// one equality the rules permit (some devices scale it to 30 ms, which is
+// fine); latency 0 <= 30; 15 ms * 1 = 15 ms <= 2 s; timeout 4000 ms >
+// 15 ms * 3 = 45 ms.
+// Latency 10 at a 30 ms interval was tried and reverted (2026-08-07). The
+// reasoning behind it -- "latency is self-cancelling during traffic, because a
+// peripheral with packets flowing is not skipping anyway" -- is only true of a
+// *continuous* stream. This protocol is bursty: START / chunks / END per field,
+// several of them Write-With-Response round trips, with a gap after each one
+// long enough for the controller to resume skipping. Every gap then costs up to
+// latency x interval on the next packet. Measured: text fields at 360-390 ms
+// each (about one 300 ms latency window), batch commits at a 2919 ms median
+// against 634 ms before, and the 3 s batch safety net firing on 4 of 11
+// pushes. Worse, a batch resolved by that safety net carries no pushId, so no
+// RENDER_STATUS is sent at all -- the panel updates and the phone waits out its
+// own render timeout, which in SpokenFeeds delays the *audio*.
+//
+// So: no latency while an app holds the screen. Interval min == max == 15 ms is
+// the one equality Apple's rules permit, and it is what the old Busy profile
+// used, proven fast. The power saving that latency was supposed to buy is
+// deferred to the phone traffic hint (measurements doc, R1), which can afford
+// it because it knows when a quiet period actually starts.
+constexpr uint16_t kConnIntervalSessionUnits = 12;     // 15 ms
+constexpr uint16_t kConnIntervalSessionMaxUnits = 12;  // 15 ms -- the permitted min == max == 15 ms
+constexpr uint16_t kConnLatencySession = 0;
 constexpr uint16_t kConnTimeoutSessionUnits = 400;  // 4 s (10 ms units)
 
 // "Idle": no session holds the screen, so nothing is going to push content to
@@ -1674,7 +1693,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // for Idle and then immediately ask again for Session as soon as the
     // handshake completes -- two negotiations per connection where one will
     // do. Asking for Session up front also means the v6 handshake and the
-    // first push run at the 330 ms cadence rather than Idle's 930 ms. A
+    // first push run at Session's full 15 ms cadence rather than Idle's 930 ms. A
     // connection that never gets a foreground session is the rare case, and
     // tick() drops it to Idle on its own.
     noteBleActivity();
