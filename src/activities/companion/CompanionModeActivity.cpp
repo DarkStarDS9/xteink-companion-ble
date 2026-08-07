@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "CompanionBatchModel.h"
 #include "CompanionBle.h"
 #include "CompanionPeerStore.h"
 #include "CompanionTestConsole.h"
@@ -93,28 +94,16 @@ void popUtf8Char(std::string& s) {
 // allocation, so the critical section only ever does a memcpy/scalar
 // assignment.
 portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
-uint8_t g_pendingTitleBuf[companionble::kMaxFieldLen];
-uint16_t g_pendingTitleLen = 0;
-volatile bool g_pendingTitleReady = false;
-uint8_t g_pendingBodyBuf[companionble::kMaxFieldLen];
-uint16_t g_pendingBodyLen = 0;
-volatile bool g_pendingBodyReady = false;
+
+// The title/body/tag-state atomic-batch state machine -- see
+// CompanionBatchModel.h. NOT thread-safe on its own; every call below runs
+// inside a g_mux critical section, exactly as the plain globals it replaced
+// did.
+CompanionBatchModel g_batchModel;
+
 uint8_t g_pendingTagId = 0;
 uint8_t g_pendingTagState = 0;
 volatile bool g_pendingStatusReady = false;
-
-// Tag state arriving as content field 0x07, so it can ride the atomic batch.
-uint8_t g_pendingTagStateBuf[1 + 2 * companionble::kMaxTags];
-uint8_t g_pendingTagStateLen = 0;
-volatile bool g_pendingTagStateReady = false;
-// Whether that pending tag state arrived *inside* a title/body batch (clients
-// push it last, under the same final flag) or on its own. Only the former is
-// bound to the batch's fate; a standalone tag push — CompanionClient.setTag /
-// CompanionDeviceService.setReadLaterTag toggling one tag with no content
-// change — must keep applying immediately even while some unrelated batch is
-// in trouble. So the discriminator is "did this tag state arrive as part of a
-// batch that got poisoned", never "is the poison flag set right now".
-volatile bool g_pendingTagStateInBatch = false;
 
 // Foreground handover and pairing requests are also host-task events. Paths and
 // names are short and fixed-length here so the critical section stays a memcpy.
@@ -136,88 +125,12 @@ uint8_t g_pendingImageContentIdLen = 0;
 uint8_t g_pendingImagePushId = 0;
 volatile bool g_pendingImageReady = false;
 
-// Set once a field's END arrives with kFinalFieldFlag set. loop() only applies
-// gotTitle/gotBody once this is true, so a multi-field push (title, then body,
-// then a final-flagged content-id) always lands on screen together instead of
-// the title updating first while body is still mid-transfer.
-volatile bool g_pendingCommitReady = false;
-
-// millis() timestamp of the first pending field of the current batch — 0 when
-// idle. Safety net for kPendingBatchTimeoutMs: if the final-flagged field's END
-// never arrives (app crash / disconnect mid-push), pending fields are applied
-// anyway rather than leaving the screen stuck on stale content indefinitely.
-uint32_t g_pendingBatchStartMs = 0;
-constexpr uint32_t kPendingBatchTimeoutMs = 3000;
-
-// Set when any title/body field of the current batch arrived as
-// FieldOutcome::Dropped — i.e. a v10 Write-Without-Response CHUNK sequence gap
-// cost us that field entirely. A batch that lost a field must fail as a whole:
-// committing the rest paints the new body under the *previous* article's title
-// (a confirmed real-world symptom), whereas discarding leaves a coherent, if
-// stale, page on screen. Cleared whenever the batch is resolved — commit,
-// timeout, or disconnect — so the next batch starts clean.
-volatile bool g_pendingBatchPoisoned = false;
-
-// The pushId of this batch, as chosen by the client. A batch is several
-// fields (title, body, maybe content-id/tag-state), each with its own END and
-// its own pushId on the wire, but the device owes exactly one RENDER_STATUS
-// per batch — so only the id riding the *final*-flagged field's END is kept;
-// every earlier field's pushId is simply not looked at (see
-// ContentFieldCallback's doc comment in CompanionBle.h). Read and cleared
-// alongside g_pendingBatchPoisoned wherever a batch resolves — commit,
-// timeout, discard, or disconnect — so it can never leak into the next batch.
-volatile uint8_t g_pendingBatchPushId = 0;
-
-// Runs on the NimBLE host task — copy into the fixed buffer and set a flag;
-// CompanionModeActivity::loop() (main loop task) does the rest.
+// Runs on the NimBLE host task — hand the field to the batch model and let
+// CompanionModeActivity::loop() (main loop task) do the rest via poll().
 void onContentField(uint8_t field, const uint8_t* data, size_t len, bool final, companionble::FieldOutcome outcome,
                     uint8_t pushId) {
-  const bool isTextField = field == companionble::kFieldTitle || field == companionble::kFieldBody;
   portENTER_CRITICAL(&g_mux);
-  // "Idle" has to include the poison flag, or a batch whose only surviving
-  // marker is the poison (first field dropped, nothing buffered yet) would look
-  // like a fresh batch to the next field and restart the timeout clock.
-  const bool wasIdle = !g_pendingTitleReady && !g_pendingBodyReady && !g_pendingBatchPoisoned;
-  // Only the final-flagged field's END names the batch — see
-  // g_pendingBatchPushId's doc comment above. This still runs on the Dropped
-  // path below: a dropped field's END still carried a real pushId, and a
-  // poisoned batch is answered with it same as a clean one (see loop()'s
-  // discard path).
-  if (final) g_pendingBatchPushId = pushId;
-  if (outcome == companionble::FieldOutcome::Dropped) {
-    // No data to copy — just poison the batch. The clock still has to start
-    // here: if this is the batch's first field and the final flag never
-    // arrives, loop()'s timeout is what clears the poison again.
-    if (isTextField) g_pendingBatchPoisoned = true;
-    if (wasIdle && isTextField) g_pendingBatchStartMs = millis();
-    if (final) g_pendingCommitReady = true;
-    portEXIT_CRITICAL(&g_mux);
-    return;
-  }
-  if (field == companionble::kFieldTitle) {
-    const size_t n = len > sizeof(g_pendingTitleBuf) ? sizeof(g_pendingTitleBuf) : len;
-    memcpy(g_pendingTitleBuf, data, n);
-    g_pendingTitleLen = static_cast<uint16_t>(n);
-    g_pendingTitleReady = true;
-  } else if (field == companionble::kFieldTagState) {
-    const size_t n = len > sizeof(g_pendingTagStateBuf) ? sizeof(g_pendingTagStateBuf) : len;
-    memcpy(g_pendingTagStateBuf, data, n);
-    g_pendingTagStateLen = static_cast<uint8_t>(n);
-    g_pendingTagStateReady = true;
-    // A title/body batch already in flight (or already poisoned) means this
-    // tag state belongs to it; an idle handoff means it is a standalone tag
-    // push and owes the batch machinery nothing.
-    g_pendingTagStateInBatch = !wasIdle;
-  } else if (field == companionble::kFieldBody) {
-    const size_t n = len > sizeof(g_pendingBodyBuf) ? sizeof(g_pendingBodyBuf) : len;
-    memcpy(g_pendingBodyBuf, data, n);
-    g_pendingBodyLen = static_cast<uint16_t>(n);
-    g_pendingBodyReady = true;
-  }
-  if (wasIdle && isTextField) {
-    g_pendingBatchStartMs = millis();
-  }
-  if (final) g_pendingCommitReady = true;
+  g_batchModel.onField(field, data, len, final, outcome, pushId, millis());
   portEXIT_CRITICAL(&g_mux);
 }
 
@@ -337,18 +250,11 @@ void CompanionModeActivity::onExit() {
   companionble::stop();
 
   portENTER_CRITICAL(&g_mux);
-  g_pendingTitleReady = false;
-  g_pendingBodyReady = false;
   g_pendingStatusReady = false;
-  g_pendingCommitReady = false;
   g_pendingForegroundReady = false;
   g_pendingPairingReady = false;
   g_pendingImageReady = false;
-  g_pendingBatchStartMs = 0;
-  g_pendingBatchPoisoned = false;
-  g_pendingBatchPushId = 0;
-  g_pendingTagStateReady = false;
-  g_pendingTagStateInBatch = false;
+  g_batchModel.reset();
   portEXIT_CRITICAL(&g_mux);
 }
 
@@ -1101,20 +1007,10 @@ void CompanionModeActivity::loop() {
         chooseIdleScreen();
       }
       portENTER_CRITICAL(&g_mux);
-      g_pendingTitleReady = false;
-      g_pendingBodyReady = false;
-      g_pendingCommitReady = false;
-      g_pendingBatchStartMs = 0;
-      g_pendingBatchPoisoned = false;
-      g_pendingBatchPushId = 0;
-      // Tag state belonging to the batch the link just killed goes with it —
-      // otherwise it would surface on the next loop as if it were a standalone
-      // tag push, marking whatever content is still on screen. A genuinely
-      // standalone pending tag push is left alone.
-      if (g_pendingTagStateInBatch) {
-        g_pendingTagStateReady = false;
-        g_pendingTagStateInBatch = false;
-      }
+      // See CompanionBatchModel::resetOnDisconnect()'s doc comment: a
+      // standalone pending tag push (not bound to the batch the link just
+      // killed) is deliberately left alone.
+      g_batchModel.resetOnDisconnect();
       portEXIT_CRITICAL(&g_mux);
     }
     // A displayed image is already on the panel and unaffected by the link
@@ -1139,7 +1035,7 @@ void CompanionModeActivity::loop() {
   uint8_t newTagStateValue = 0;
   bool gotTagState = false;
   bool tagStateWasInBatch = false;
-  uint8_t newTagStateBuf[sizeof(g_pendingTagStateBuf)] = {0};
+  uint8_t newTagStateBuf[1 + 2 * companionble::kMaxTags] = {0};
   uint8_t newTagStateLen = 0;
   char newForegroundKey[companionpeer::kPeerKeyLen] = {0};
   char newForegroundName[companionpeer::kMaxNameLen + 1] = {0};
@@ -1151,68 +1047,54 @@ void CompanionModeActivity::loop() {
   uint8_t newImagePushId = 0;
 
   portENTER_CRITICAL(&g_mux);
-  if (g_pendingTitleReady) {
-    newTitle.assign(reinterpret_cast<char*>(g_pendingTitleBuf), g_pendingTitleLen);
-    gotTitle = true;
-  }
-  if (g_pendingBodyReady) {
-    newBody.assign(reinterpret_cast<char*>(g_pendingBodyBuf), g_pendingBodyLen);
-    gotBody = true;
-  }
+  const CompanionBatchModel::PollResult batchResult = g_batchModel.poll(millis());
   bool poisoned = false;
   // Only meaningful when commit ends up true, and even then only when the
   // final-flagged field's END actually arrived (the normal case) rather than
-  // this being the kPendingBatchTimeoutMs safety net below, in which case
-  // g_pendingBatchPushId is still 0 (its cleared-at-rest value) because no
+  // the kTimeoutMs safety net inside CompanionBatchModel::poll(), in which
+  // case batchResult.pushId is still 0 (its cleared-at-rest value) because no
   // field of this batch was ever final-flagged before the timeout fired --
   // there is no client-chosen id to answer with, so 0 ("no answer wanted") is
   // the honest value here, not a bug.
   uint8_t batchPushId = 0;
-  if (g_pendingCommitReady) {
+  if (batchResult.resolution != CompanionBatchModel::Resolution::None) {
     commit = true;
-  } else if ((gotTitle || gotBody || g_pendingBatchPoisoned) && g_pendingBatchStartMs != 0 &&
-             millis() - g_pendingBatchStartMs > kPendingBatchTimeoutMs) {
-    // Safety net: the final-flagged field's END never arrived in time (e.g. the
-    // app crashed or lost the connection mid-push). Apply whatever we have
-    // rather than leaving the screen stuck on stale content indefinitely.
-    // A poisoned batch resolves here too — it still has to be *cleared*, or the
-    // poison would leak into the next batch, it is just discarded rather than
-    // applied.
-    LOG_ERR("CMA", "content batch commit flag missed after %lu ms, applying pending fields anyway",
-            static_cast<unsigned long>(kPendingBatchTimeoutMs));
-    commit = true;
-  }
-  if (commit) {
-    // How long the batch sat between its first field landing and committing.
-    // The kPendingBatchTimeoutMs branch above only shouts when it fires at
-    // 3000ms; this catches the sub-threshold waits, which are invisible today
-    // and are the part of push-to-visible time nothing else accounts for.
-    if (g_pendingBatchStartMs != 0) {
-      LOG_DBG("CMA", "content batch committed %lu ms after its first field",
-              static_cast<unsigned long>(millis() - g_pendingBatchStartMs));
+    if (batchResult.timedOut) {
+      // Safety net: the final-flagged field's END never arrived in time (e.g. the
+      // app crashed or lost the connection mid-push). Apply whatever we have
+      // rather than leaving the screen stuck on stale content indefinitely.
+      // A poisoned batch resolves here too — it still has to be *cleared*, or the
+      // poison would leak into the next batch, it is just discarded rather than
+      // applied.
+      LOG_ERR("CMA", "content batch commit flag missed after %lu ms, applying pending fields anyway",
+              static_cast<unsigned long>(CompanionBatchModel::kTimeoutMs));
     }
-    poisoned = g_pendingBatchPoisoned;
-    batchPushId = g_pendingBatchPushId;
-    g_pendingTitleReady = false;
-    g_pendingBodyReady = false;
-    g_pendingCommitReady = false;
-    g_pendingBatchStartMs = 0;
-    g_pendingBatchPoisoned = false;
-    g_pendingBatchPushId = 0;
+    // How long the batch sat between its first field landing and committing.
+    // The timedOut branch above only shouts when it fires at kTimeoutMs; this
+    // catches the sub-threshold waits, which are invisible today and are the
+    // part of push-to-visible time nothing else accounts for.
+    if (batchResult.elapsedValid) {
+      LOG_DBG("CMA", "content batch committed %lu ms after its first field",
+              static_cast<unsigned long>(batchResult.elapsedSinceFirstFieldMs));
+    }
+    poisoned = batchResult.resolution == CompanionBatchModel::Resolution::Discard;
+    batchPushId = batchResult.pushId;
+    gotTitle = batchResult.hasTitle;
+    gotBody = batchResult.hasBody;
+    if (gotTitle) newTitle.assign(reinterpret_cast<const char*>(g_batchModel.titleData()), g_batchModel.titleLen());
+    if (gotBody) newBody.assign(reinterpret_cast<const char*>(g_batchModel.bodyData()), g_batchModel.bodyLen());
+  }
+  if (batchResult.hasTagState) {
+    memcpy(newTagStateBuf, g_batchModel.tagStateData(), g_batchModel.tagStateLen());
+    newTagStateLen = g_batchModel.tagStateLen();
+    tagStateWasInBatch = batchResult.tagStateInBatch;
+    gotTagState = true;
   }
   if (g_pendingStatusReady) {
     newTagId = g_pendingTagId;
     newTagStateValue = g_pendingTagState;
     g_pendingStatusReady = false;
     gotStatus = true;
-  }
-  if (g_pendingTagStateReady) {
-    memcpy(newTagStateBuf, g_pendingTagStateBuf, g_pendingTagStateLen);
-    newTagStateLen = g_pendingTagStateLen;
-    g_pendingTagStateReady = false;
-    tagStateWasInBatch = g_pendingTagStateInBatch;
-    g_pendingTagStateInBatch = false;
-    gotTagState = true;
   }
   if (g_pendingForegroundReady) {
     memcpy(newForegroundKey, g_pendingForegroundKey, sizeof(newForegroundKey));
@@ -1251,7 +1133,8 @@ void CompanionModeActivity::loop() {
     // the worst of the three outcomes: the stale article left on screen would
     // wear the *new* article's tags, i.e. a mark that belongs to content the
     // user cannot see. Clean failure beats that, and beats a half-applied
-    // batch. A standalone tag push is untouched — see g_pendingTagStateInBatch.
+    // batch. A standalone tag push is untouched — see
+    // CompanionBatchModel::PollResult::tagStateInBatch.
     if (tagStateWasInBatch) gotTagState = false;
 
     // A discarded batch never renders, so nothing will reach the Screen::Text
