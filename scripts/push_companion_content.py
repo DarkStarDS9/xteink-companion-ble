@@ -19,6 +19,7 @@ Usage:
     python scripts/push_companion_content.py --icon icon.png        # 1-bpp sleep-screen icon (needs Pillow)
     python scripts/push_companion_content.py --listen               # stay connected, print button events
     python scripts/push_companion_content.py --forget               # drop the stored token, re-pair
+    python scripts/push_companion_content.py --await-render         # block for RENDER_STATUS, print latency
 
 The pairing token is kept in ~/.crosspoint_companion_tokens.json, keyed by the
 device id, so the second run onward needs no on-device confirmation.
@@ -48,6 +49,7 @@ from companion_protocol import (
     FIELD_TAG_STATE,
     FIELD_TITLE,
     FIELD_UI_DECL,
+    RENDER_DISPLAYED,
     RENDER_RESULTS,
     ROUTING_PAGE_NEXT,
     ROUTING_PAGE_PREV,
@@ -253,22 +255,42 @@ async def push_content(session: Session, caps: dict, args) -> None:
     require_version(caps, 10, "title/body push")
     body = Path(args.body_file).read_text(encoding="utf-8") if args.body_file else (args.body or DEFAULT_BODY)
     print("Pushing title + body + content-id as one atomic batch...")
-    # pushId 0 throughout: this script does not await a RENDER_STATUS for text
-    # (it has nothing to do with the answer), and 0 tells the device not to
-    # send one rather than notifying into the void.
-    await session.push_field(FIELD_TITLE, args.title.encode("utf-8"))
-    await session.push_field(FIELD_BODY, body.encode("utf-8"))
+    # pushId 0 by default: this script does not normally await a RENDER_STATUS
+    # for text, and 0 tells the device not to send one rather than notifying
+    # into the void. --await-render opts into a real (non-zero) pushId instead,
+    # for exactly the case this script exists to make ad hoc: "did the panel
+    # actually settle, and how long did that take."
+    push_id = 1 if args.await_render else 0
+    render = session.expect_render(push_id) if args.await_render else None
+    started = time.perf_counter()
+    await session.push_field(FIELD_TITLE, args.title.encode("utf-8"), push_id=push_id)
+    await session.push_field(FIELD_BODY, body.encode("utf-8"), push_id=push_id)
     # content-id carries the final flag: the device only commits and redraws
     # once this last field's END arrives, so title+body land together instead
     # of the headline updating first.
     if args.tag is not None:
         # Tags last, carrying the final flag: content and tag state then commit
         # in one redraw rather than the tag flipping separately.
-        await session.push_field(FIELD_CONTENT_ID, args.content_id.encode("utf-8")[:32])
-        await session.push_field(FIELD_TAG_STATE, encode_tag_state([tuple(args.tag)]), final=True)
+        await session.push_field(FIELD_CONTENT_ID, args.content_id.encode("utf-8")[:32], push_id=push_id)
+        await session.push_field(FIELD_TAG_STATE, encode_tag_state([tuple(args.tag)]), final=True, push_id=push_id)
     else:
-        await session.push_field(FIELD_CONTENT_ID, args.content_id.encode("utf-8")[:32], final=True)
-    print("  Pushed.")
+        await session.push_field(FIELD_CONTENT_ID, args.content_id.encode("utf-8")[:32], final=True, push_id=push_id)
+    wire_s = time.perf_counter() - started
+    print(f"  Pushed ({wire_s:.2f}s on the wire).")
+
+    if args.await_render:
+        print(f"  Waiting up to {args.render_timeout:.0f}s for RENDER_STATUS...")
+        try:
+            result = await asyncio.wait_for(render, timeout=args.render_timeout)
+        except asyncio.TimeoutError:
+            raise SystemExit(
+                f"TIMEOUT: no RENDER_STATUS for pushId {push_id:#04x} within {args.render_timeout:.0f}s "
+                "-- the screen may have updated but nothing told this client"
+            )
+        settle_s = time.perf_counter() - started - wire_s
+        print(f"  RENDER_STATUS: {RENDER_RESULTS.get(result, result)} ({settle_s:.2f}s after the wire finished)")
+        if result != RENDER_DISPLAYED:
+            raise SystemExit(f"render did not succeed: {RENDER_RESULTS.get(result, result)}")
 
 
 # --------------------------------------------------------------------------- #
@@ -397,6 +419,15 @@ def main() -> None:
     )
     parser.add_argument("--listen", action="store_true", help="Stay connected and print button events")
     parser.add_argument("--forget", action="store_true", help="Present no token, forcing a fresh pairing prompt")
+    parser.add_argument(
+        "--await-render", action="store_true",
+        help="After a text push, block for RENDER_STATUS and print the result and latency "
+        "(image pushes already do this unconditionally)",
+    )
+    parser.add_argument(
+        "--render-timeout", type=float, default=10.0,
+        help="Seconds to wait for RENDER_STATUS when --await-render is set (default: 10)",
+    )
     args = parser.parse_args()
 
     try:

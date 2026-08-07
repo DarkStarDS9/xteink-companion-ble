@@ -23,6 +23,9 @@ Then:
     python scripts/companion_e2e_test.py --port /dev/cu.usbmodem21201
     python scripts/companion_e2e_test.py --port ... --only enrollment,preemption
     python scripts/companion_e2e_test.py --port ... --keep-peers   # skip the CRESET
+    python scripts/companion_e2e_test.py --port ... --only enrollment,buttonmap,spokenfeeds \
+        --articles 5 --render-timeout 10
+    python scripts/companion_e2e_test.py --port ... --soak 2       # connection-survival soak
 
 Requires `bleak` and `pyserial` (see scripts/requirements.txt). On macOS the
 process running this needs Bluetooth permission — a sandboxed or automated shell
@@ -38,6 +41,16 @@ Covered:
   preemption   two sessions on one link, last-requester-wins, in-flight discard
   image        raw packed 2bpp full-screen push, chunk acks, and the decode verdict
   tags         app-declared tags: atomic with content, and state-only writes
+  spokenfeeds  mimics a real consumer app: push a batch, then BLOCK for RENDER_STATUS
+               before doing anything else, same as SpokenFeeds waiting on it before
+               starting audio. A timeout here is "the screen updated but the phone
+               heard nothing" -- a distinct failure from a wrong RENDER_STATUS result.
+
+--soak MINUTES runs a separate mode instead of the scenario groups above: one
+connection, held open for the whole window with light periodic activity, to catch
+the class of bug where the *link itself* dies rather than any one push failing.
+The DLE regression fixed in d1dfd80e killed every connection at exactly ~40s, so
+even `--soak 2` is diagnostic.
 
 A note on write types. v9/v10 moved image and title/body CHUNKs to Write
 Without Response for throughput, and the sequence numbers this harness sends
@@ -66,6 +79,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import queue
+import random
 import sys
 import threading
 import time
@@ -584,6 +598,47 @@ class Results:
         return 1 if self.failed else 0
 
 
+# --------------------------------------------------------------------------- #
+# SpokenFeeds-behaviour payload generation
+#
+# Not lorem ipsum -- word-boundary text of a realistic *shape*, because the
+# point of this scenario is timing a batch that looks like an actual article,
+# not the smallest or largest thing the wire format tolerates.
+# --------------------------------------------------------------------------- #
+
+_WORDS = (
+    "the quick brown fox jumps over a lazy dog while the news reader waits "
+    "for its next article to arrive over bluetooth and render on the panel"
+).split()
+
+
+def _word_salad(rng: random.Random, min_len: int, max_len: int) -> bytes:
+    target = rng.randint(min_len, max_len)
+    words: list[str] = []
+    length = 0
+    while length < target:
+        word = rng.choice(_WORDS)
+        words.append(word)
+        length += len(word) + 1
+    text = " ".join(words)
+    return text[:target].encode("utf-8")
+
+
+async def push_field_timed(session: Session, field_id: int, data: bytes, final: bool = False,
+                            push_id: int = 0) -> float:
+    """push_field(), printing the same shape of line CompanionBle.cpp logs for a text field.
+
+    See `LOG_DBG("CBLE", "text field 0x%02x: %u bytes in %u ms%s", ...)` in
+    src/CompanionBle.cpp -- this is the wire-side half of that same number, so
+    a firmware serial log and this harness's stdout can be diffed side by side.
+    """
+    start = time.perf_counter()
+    await session.push_field(field_id, data, final=final, push_id=push_id)
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    print(f"  text field {field_id:#04x}: {len(data)} bytes in {elapsed_ms:.0f} ms")
+    return elapsed_ms
+
+
 async def no_render_status_arrives(link: Link, marker: int, window: float) -> list:
     """Waits `window` seconds and returns any RENDER_STATUS seen since `marker`.
 
@@ -937,6 +992,63 @@ async def run_tests(args, console: Console, results: Results) -> None:
             await asyncio.sleep(1.5)
             check_no_errors(console, results, "tags")
 
+        # --- spokenfeeds: push-then-block, like the real app ----------------- #
+        if enabled("spokenfeeds") and session_a.session_id:
+            print(
+                f"\n[spokenfeeds] {args.articles} article push(es), mimicking a consumer app that "
+                f"pushes a batch and then BLOCKS on RENDER_STATUS before doing anything else "
+                f"(render timeout {args.render_timeout}s)"
+            )
+            rng = random.Random(0xF3ED)
+            commit_to_render_ms: list[float] = []
+            for i in range(args.articles):
+                title = _word_salad(rng, 20, 90)
+                body = _word_salad(rng, 200, 600)
+                # Distinct, non-zero pushId per run so a late answer from a
+                # previous run can never be mistaken for this one's.
+                push_id = ((0x40 + i) & 0x7F) or 1
+
+                render = session_a.expect_render(push_id)
+                await push_field_timed(session_a, FIELD_TITLE, title, push_id=push_id)
+                await push_field_timed(session_a, FIELD_BODY, body, final=True, push_id=push_id)
+                commit_time = time.perf_counter()
+
+                try:
+                    result = await asyncio.wait_for(render, timeout=args.render_timeout)
+                except asyncio.TimeoutError:
+                    # Exactly the "screen updated but the phone heard nothing" defect
+                    # class -- a distinct failure from a wrong RENDER_STATUS result,
+                    # so it gets its own message rather than folding into the check below.
+                    results.check(
+                        f"spokenfeeds run {i + 1}/{args.articles}: RENDER_STATUS arrived "
+                        f"within {args.render_timeout}s",
+                        False,
+                        f"TIMEOUT waiting for pushId {push_id:#04x} -- no RENDER_STATUS arrived; "
+                        f"the panel may have updated with nobody told. Seen so far: "
+                        f"{session_a.render_statuses}",
+                    )
+                    continue
+
+                elapsed_ms = (time.perf_counter() - commit_time) * 1000
+                commit_to_render_ms.append(elapsed_ms)
+                print(f"  batch commit->RENDER_STATUS: {elapsed_ms:.0f} ms")
+                results.check(
+                    f"spokenfeeds run {i + 1}/{args.articles}: Displayed with the echoed pushId",
+                    result == RENDER_DISPLAYED and (result, push_id) in session_a.render_statuses,
+                    f"result {RENDER_RESULTS.get(result, result)}",
+                )
+
+            if commit_to_render_ms:
+                ordered = sorted(commit_to_render_ms)
+                mid = len(ordered) // 2
+                median_ms = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+                per_run = ", ".join(f"{v:.0f}ms" for v in commit_to_render_ms)
+                print(
+                    f"  spokenfeeds: {len(commit_to_render_ms)}/{args.articles} answered; "
+                    f"per-run [{per_run}], median {median_ms:.0f} ms"
+                )
+            check_no_errors(console, results, "spokenfeeds")
+
     # --- reconnect with the stored token ------------------------------------ #
     if enabled("reconnect") and session_a.token:
         print("\n[reconnect] stored token, no prompt")
@@ -1118,11 +1230,134 @@ async def run_tests(args, console: Console, results: Results) -> None:
                     check_no_errors(console, results, "image seqgap", allowed=("CHUNK sequence gap",))
 
 
+# --------------------------------------------------------------------------- #
+# --soak: connection-survival, not scenario correctness
+#
+# The DLE regression fixed in d1dfd80e killed every connection at exactly
+# ~40s -- no scenario above would have caught that, because every one of them
+# either finishes well inside 40s or (image) is slow for reasons that have
+# nothing to do with the link itself dying out from under a healthy transfer.
+# This mode exists to answer one question only: does a connection survive
+# being held open, with light activity, for as long as a real reading session
+# would need it to.
+# --------------------------------------------------------------------------- #
+
+
+async def run_soak(args, console: Console, results: Results) -> None:
+    print(f"\n[soak] holding one connection open for {args.soak:.1f} minute(s)")
+    print("Scanning for the device...")
+    devices = await BleakScanner.discover(timeout=8.0, service_uuids=[SERVICE_UUID])
+    if not devices:
+        sys.exit("No companion device advertising. Is it awake and not already connected?")
+    device = devices[0]
+    print(f"Found {device.name} ({device.address})")
+
+    disconnected = asyncio.Event()
+    disconnect_at: list[float] = []
+
+    def on_disconnect(_client: BleakClient) -> None:
+        disconnect_at.append(time.time())
+        disconnected.set()
+
+    session = Session(APP_A, "Soak Harness")
+    start = time.time()
+
+    async with BleakClient(device.address, disconnected_callback=on_disconnect) as client:
+        caps = parse_capabilities(
+            bytes(await client.read_gatt_char(CAPABILITY_CHAR_UUID)),
+            minimum_version=PROTOCOL_VERSION,
+            who="the soak harness",
+        )
+        link = Link(client, caps)
+        await link.start_notify()
+        link.attach(session)
+
+        # Complete the handshake so a Session actually holds the screen for
+        # the duration -- a bare connection with no session is a weaker test,
+        # since some of what the DLE bug broke was specific to a link doing
+        # session-carrying traffic, not an idle GATT connection.
+        await session.send_hello()
+        try:
+            await asyncio.wait_for(asyncio.shield(session.pending_future()), timeout=5.0)
+            console.press(BTN_CONFIRM)
+        except asyncio.TimeoutError:
+            pass
+        reply = await session.wait_hello(timeout=15.0)
+        if not results.check("soak: handshake completed (HELLO_OK)", reply.ok,
+                              "" if reply.ok else reply.reason_text):
+            return
+
+        ui = encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS)
+        if session.asset_tags.get(FIELD_UI_DECL) != ui[:4]:
+            await session.push_asset(FIELD_UI_DECL, ui)
+        outcome = await session.acquire()
+        results.check("soak: session holds the screen (foreground)", outcome[0] == "foreground", str(outcome))
+
+        deadline = start + args.soak * 60.0
+        next_heartbeat = start + 60.0
+        next_activity = start + 60.0
+        activity_count = 0
+
+        while time.time() < deadline and not disconnected.is_set():
+            now = time.time()
+            if now >= next_heartbeat:
+                print(f"  [soak] heartbeat: uptime {(now - start) / 60:.1f} min, link alive")
+                next_heartbeat += 60.0
+            if now >= next_activity:
+                # Light periodic activity, not a stress load -- a single small
+                # push, same shape as a reader idling between articles rather
+                # than one that is actively transferring.
+                activity_count += 1
+                await session.push_field(
+                    FIELD_TITLE, f"soak heartbeat {activity_count}".encode(), final=True
+                )
+                next_activity += 60.0
+            try:
+                await asyncio.wait_for(disconnected.wait(), timeout=max(0.1, min(1.0, deadline - time.time())))
+            except asyncio.TimeoutError:
+                pass
+
+        survived = not disconnected.is_set()
+        end_time = disconnect_at[0] if disconnect_at else time.time()
+        uptime_s = end_time - start
+
+        if survived:
+            results.check(
+                f"soak: connection survived the full {args.soak:.1f} minute window", True
+            )
+            print(f"  [soak] completed: uptime {uptime_s / 60:.1f} min, {activity_count} activity round(s) sent")
+        else:
+            # bleak has no cross-platform surface for the HCI disconnect reason
+            # (disconnected_callback's signature is `(client) -> None`; the
+            # underlying NSError/HCI code is not forwarded on any backend as of
+            # bleak 0.22). Reporting that honestly beats inventing a reason.
+            results.check(
+                f"soak: connection survived the full {args.soak:.1f} minute window",
+                False,
+                f"disconnected after {uptime_s:.1f}s ({uptime_s / 60:.2f} min) of "
+                f"{args.soak:.1f} requested -- no HCI disconnect reason is exposed by this "
+                "BLE stack; check the device's own serial log for the reason it saw",
+            )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--port", required=True, help="Serial port of a firmware built with -e test")
     parser.add_argument("--only", default=None, help="Comma-separated subset of test groups to run")
     parser.add_argument("--keep-peers", action="store_true", help="Skip the CRESET that starts from unpaired")
+    parser.add_argument(
+        "--articles", type=int, default=3,
+        help="[spokenfeeds] number of article pushes to run, each timed and awaited (default: 3)",
+    )
+    parser.add_argument(
+        "--render-timeout", type=float, default=10.0,
+        help="[spokenfeeds] seconds to block for RENDER_STATUS before failing a push (default: 10)",
+    )
+    parser.add_argument(
+        "--soak", type=float, default=None, metavar="MINUTES",
+        help="Run the connection-survival soak instead of the scenario groups: hold one "
+        "connection open for MINUTES with light periodic activity and assert it survives",
+    )
     args = parser.parse_args()
 
     console = Console(args.port)
@@ -1150,7 +1385,10 @@ def main() -> None:
 
     results = Results()
     try:
-        asyncio.run(run_tests(args, console, results))
+        if args.soak is not None:
+            asyncio.run(run_soak(args, console, results))
+        else:
+            asyncio.run(run_tests(args, console, results))
     except KeyboardInterrupt:
         pass
     finally:
