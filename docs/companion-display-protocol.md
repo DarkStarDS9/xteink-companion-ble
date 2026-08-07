@@ -92,24 +92,134 @@ implements it, never after.
 >
 > The rule to take away: **only one LLCP procedure may be pending on a connection
 > at a time** (Core Spec Vol 6 Part B §5.3), so `onConnect()` — where the central
-> is still running its own setup exchange — is the wrong place to start one.
-> Data Length Extension is now requested **nowhere at all**. A controller-default
-> request in `ensureStarted()` was tried as a supposedly safe way to keep the
-> capability and brought the disconnect straight back on iOS: however the DLE
-> procedure gets started around connection setup, it lands in the same crowded
-> window and dies the same way, so any DLE on this link is treated as unsafe
-> until a *serialized* variant — one procedure at a time, well after connect
-> settles — survives a harness soak. On 2026-08-07 the macOS central
-> reproduced the collision exactly: a DLE-carrying build died at 39996 ms
-> with HCI `0x22` (TPRT), request present, against
+> is still running its own setup exchange — is the wrong place to start one. On
+> 2026-08-07 the macOS central reproduced the collision exactly: a DLE-carrying
+> build died at 39996 ms with HCI `0x22` (TPRT), request present, against
 > `scripts/companion_e2e_test.py`; the same harness with the request absent
 > then survived a 3-minute soak (`--soak 3`, session held foreground, two
-> content-push rounds). The fix is host-A/B-provable after all, and was
-> proven that way -- the earlier claim that a macOS harness "cannot show
-> this" (macOS was assumed to self-negotiate DLE harmlessly) was wrong.
-> Anything added to `onConnect()` in future
-> needs checking against that rule; `updatePhy()` is still there and is already
-> one procedure more than is comfortable.
+> content-push rounds). The fix is host-A/B-provable after all, and was proven
+> that way -- the earlier claim that a macOS harness "cannot show this" (macOS
+> was assumed to self-negotiate DLE harmlessly) was wrong.
+>
+> **Same day, second pass: DLE is back, serialized.** `onConnect()` now starts
+> only the conn-param procedure. `onConnParamsUpdate()` starts PHY, but only
+> once `CompanionConnPolicy::inFlight()` reports the conn-param request itself
+> matched and settled (not just *any* conn-param event — the central's own
+> opening announcement fires this callback too, without matching, and
+> correctly does not trip it). `onPhyUpdate()` then starts DLE
+> (`setDataLen(251)`), gated on PHY's own callback having fired. Each step
+> fires exactly once per connection. This is single-shot with no automatic
+> retry on refusal: neither the Core Spec nor Apple's/Nordic's public guidance
+> mandates a backoff-and-retry for a rejected LL Control Procedure, and
+> NimBLE-Arduino's GAP event dispatcher (`NimBLEServer.cpp`'s
+> `gapEventHandler`) never forwards `BLE_GAP_EVENT_DATA_LEN_CHG` in the first
+> place, so there is no signal to retry against even if that were the policy —
+> DLE's own completion is unconfirmable through this dependency as vendored.
+> Proven on hardware: a 3-minute **and** a 5-minute soak (`--soak 3`,
+> `--soak 5`) both survived cleanly with this chain in place — past the 40 s
+> TPRT window 4-9× over with no `0x22`.
+>
+> **First A/B attempt was measured on the wrong path, and said so misleadingly.**
+> `scripts/companion_e2e_test.py`'s image scenario deliberately pushes the
+> image over Write *With* Response (its own docstring explains why: bleak has
+> no cross-platform equivalent of CoreBluetooth's `canSendWriteWithoutResponse`
+> flow control), which is the pre-v9 transport this codebase moved *away* from
+> for exactly this reason (`3d2aec31`: 24.65 s → 1.83 s switching images to
+> Write Without Response). Measuring a DLE A/B on that harness produced
+> 19.9–20.1 s in both conditions — a real number, but for a transport no real
+> client uses for images, dominated by the ~120 ms write-with-response round
+> trip per chunk regardless of fragmentation.
+>
+> **Corrected measurement, same day: `companion-bench`** (the macOS-native
+> harness in `CompanionKit`, https://github.com/DarkStarDS9/CompanionKit,
+> `Sources/companion-bench` — built with `swift build -c release --product
+> companion-bench`) drives the exact CoreBluetooth/Write-Without-Response path
+> a real consumer app uses. Same 528×792/104,544-byte image, three runs each:
+> **without DLE**, BLE transfer 1.87 / 2.66 / 2.64 s; **with the serialized DLE
+> chain above**, 1.83 / 2.70 / 2.78 s. These match the historical figure
+> (`3d2aec31`: 1.83 s) and disagree sharply with the Python-harness numbers —
+> confirming those were a harness artifact, not the real transport's
+> behaviour. Run-to-run variance (1.83–2.78 s) is larger than any gap between
+> conditions: **DLE makes no measurable difference on the real client path
+> either**, at this image size and the current 15 ms Session profile.
+>
+> **DLE's actual grant was independently confirmed — and that confirmation
+> overturned the premise of the whole A/B.** A Sniffle capture
+> (`sniff_receiver.py -s /dev/cu.usbserial-21230 -m <READER_MAC> -o out.pcap`
+> — the `-S <name-substring>` filter documented below did **not** work here,
+> it never matched despite the name being present in the device's
+> `SCAN_RSP`; use `-m` with the MAC read from an unfiltered `-a` capture if
+> the device's MAC is unknown) during a `companion-bench` run shows
+> `LL_LENGTH_REQ`/`LL_LENGTH_RSP` completing with 251/251 octets granted, not
+> once but twice in the same connection (once per PHY). Decoded with
+> `Sniffle/python_cli/pcap_decoder.py` from Sniffle's own bundled `sniffle`
+> package — no scapy or tshark needed, contrary to this investigation's first
+> assumption.
+>
+> **Then the same capture was taken against the *DLE-free* build — the one
+> whose `onConnect()` requests nothing — and it shows the exact same 251/251
+> grant.** macOS's own CoreBluetooth central negotiates Data Length Extension
+> on its own initiative, independent of whether this firmware ever asks for
+> it. Every companion-bench A/B in this investigation was therefore comparing
+> DLE-on against DLE-on — there was never a real DLE-off condition tested
+> against this central, which is the actual reason no throughput difference
+> ever showed up. (This is consistent with the 2026-08-06 sniffer capture
+> noted above of iOS completing `LL_LENGTH_REQ → RSP` on its own on a calm
+> connection — that was never a counterexample to "iOS/macOS never answers,"
+> it was a preview of this: the central does this by itself.)
+>
+> This reframes the original 40 s TPRT bug too: it was very likely never
+> "DLE is unsafe to request" in the abstract, but specifically **our own
+> redundant request colliding with the central's own already-in-flight one**
+> — both captures (DLE-on and DLE-free builds) show a benign
+> `LL_REJECT_EXT_IND` collision near connect (error `0x2A`, Different
+> Transaction Collision, rejecting a `LL_CONNECTION_PARAM_REQ` in one capture
+> and a `LL_PHY_REQ` in the other) that self-resolves immediately with no
+> disconnect — proving collisions near connect are routine on this link and
+> normally harmless. The fatal case was specifically `LL_LENGTH_REQ` going
+> *unanswered* rather than cleanly rejected; whether that is a controller-
+> specific mishandling of that one collision shape, or something else, is not
+> established by anything captured so far.
+> (Both captures' own `Dir: C->P`/`P->C` labels look unreliable — every
+> `LL_CONTROL` packet, including responses, was tagged the same direction,
+> which cannot be correct — so which side originated which colliding
+> procedure was not reliably determined this way; the octet counts, which do
+> not depend on that field, are what proves the DLE grant itself.)
+>
+> **The periodic stalls that actually dominate transfer time are unrelated to
+> DLE**, and present nearly identically in both builds: of ~600 back-to-back
+> 189-byte chunk PDUs, most land ~1.14 ms apart (near the 2M-PHY radio-time
+> floor), but roughly 1 in 5-6 is followed by a 9–30 ms gap instead — that
+> gap, not per-packet fragmentation, is most of the wall-clock. The likely
+> cause is this firmware's own `enqueueImageWork()` (`src/CompanionBle.cpp`):
+> its 10-deep queue backpressures (briefly blocks) the BLE host task's
+> `onWrite()` when the writer task's SD-card staging falls behind — a
+> deliberate, documented design (see that function's and
+> `kImageWriteQueueLen`'s comments) that trades a small, safe stall for never
+> blocking the BLE radio task on SD I/O directly. `CONFIG_BT_NIMBLE_ACL_BUF_COUNT=12`
+> (`sdkconfig.test`) is the matching controller-side buffer ceiling. CoreBluetooth
+> is documented (Apple developer forum threads) to apply its own opaque
+> internal batching/throttling to Write Without Response independent of
+> anything the peripheral does, which may compound with the above; no source
+> gives a queue depth or period for it, so it isn't confirmed as the dominant
+> term here. Neither of these is instrumented yet — the numbers above are
+> read directly from the Sniffle capture's packet timing, not from firmware
+> or host-side counters.
+>
+> Net: the serialized chain is proven safe (soak) and its DLE step is proven
+> to land (Sniffle) — but so does the DLE-free build's, from the central's
+> own initiative, so **this firmware's own DLE request changes nothing
+> observable**: not the grant (happens either way), not the throughput
+> (identical either way, and the real bottleneck is the SD-write queue, not
+> fragmentation). The strongest argument for keeping the serialized re-add
+> at all is symmetry/documentation value (it makes this firmware's own
+> intent explicit rather than silently free-riding on the central), against
+> which it reintroduces one more procedure into the connect-time collision
+> surface for a benefit that cannot currently be measured. Whether to keep it,
+> simplify it away, or leave the decision open is not settled by this
+> investigation. Anything added to `onConnect()` in future needs checking
+> against the one-procedure-at-a-time rule regardless; `updatePhy()` is no
+> longer there either now.
 
 This is a **BLE peripheral/GATT-server role**, not something upstream
 CrossPoint or this fork's `feat-bluetooth` branch already has — that branch's

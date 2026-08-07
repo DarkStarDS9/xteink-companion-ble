@@ -197,6 +197,15 @@ uint32_t g_lastBleActivityMs = 0;
 uint32_t g_connectMs = 0;
 uint32_t connUptimeMs() { return g_connectMs == 0 ? 0 : millis() - g_connectMs; }
 
+// Serialization state for the connect-time procedure chain: conn params,
+// then PHY, then Data Length Extension, one LLCP procedure at a time (Core
+// Spec Vol 6 Part B §5.3) -- see onConnect()/onConnParamsUpdate()/
+// onPhyUpdate() below, and ca5e518a for what firing these concurrently used
+// to cost. Reset at the top of every onConnect(); read only within that same
+// connection's lifetime.
+bool g_phyRequestedThisConn = false;
+bool g_dleRequestedThisConn = false;
+
 // Issues g_connPolicy's pending request, if any, against the live link.
 // Safe and cheap to call repeatedly -- tick() does exactly that, which is
 // what turns a deferred request (one CompanionConnPolicy::step() held back
@@ -1463,7 +1472,7 @@ const char* disconnectReasonName(int reason) {
 }
 
 class ServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
+  void onConnect(NimBLEServer* /*server*/, NimBLEConnInfo& /*connInfo*/) override {
     g_connectMs = millis();
     LOG_DBG("CBLE", "central connected");
     // Negotiate the connection params once, right here, rather than waiting
@@ -1472,23 +1481,19 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // inclusion). g_connPolicy.onConnect() forces Session immediately and
     // starts the Idle holdoff clock -- see its doc comment for why that must
     // happen here rather than through the ordinary session-state path.
+    //
+    // This is deliberately the ONLY procedure started here. PHY and Data
+    // Length Extension used to fire from this same block, back-to-back with
+    // this one -- three LLCP procedures racing each other and the central's
+    // own setup exchange, which produced every 40 s HCI 0x22 (TPRT)
+    // disconnect this link ever had (ca5e518a). Core Spec Vol 6 Part B §5.3
+    // allows only one LLCP procedure pending on a connection at a time.
+    // onConnParamsUpdate() below starts PHY once this procedure is confirmed
+    // settled, and onPhyUpdate() starts DLE once PHY is.
     noteBleActivity();
+    g_phyRequestedThisConn = false;
+    g_dleRequestedThisConn = false;
     applyConnPolicyRequest(g_connPolicy.onConnect(millis()));
-    // 2M PHY halves on-air time per packet versus the 1M PHY default. Purely
-    // a request -- the central (iOS) grants or ignores it, same as
-    // updateConnParams above -- and iOS decides silently, so onPhyUpdate()
-    // below is the only way to know what actually landed.
-    if (server) {
-      server->updatePhy(connInfo.getConnHandle(), BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK, 0);
-      // Deliberately no Data Length Extension request here. Requesting it
-      // made every affected connection die at exactly TPRT (40 s) with HCI
-      // 0x22: LL_LENGTH_REQ can complete fine on a calm connection, but
-      // racing it against the conn-param and PHY requests fired above
-      // sometimes collides, and a collided LL procedure times out at exactly
-      // 40 s. The road back, if image throughput ever demands it, is a
-      // serialized request well after connect settles, proven by a harness
-      // soak -- never a re-add here.
-    }
   }
   void onConnParamsUpdate(NimBLEConnInfo& connInfo) override {
     // Confirms what the central actually granted -- the request side only
@@ -1522,11 +1527,41 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     g_lastGrantedIntervalUnits = connInfo.getConnInterval();
     g_lastGrantedLatency = connInfo.getConnLatency();
     g_lastGrantedTimeoutUnits = connInfo.getConnTimeout();
+    // Serialized chain, step 2: start PHY only once conn params are
+    // confirmed settled -- g_connPolicy.inFlight() is false only after a
+    // *matching* grant lands (onGrant()'s doc comment above), not on just any
+    // conn-param event. The central's own opening announcement fires this
+    // callback too (see the DIAGNOSTIC comment above) but doesn't match and
+    // leaves the request outstanding, so it correctly does not trip this.
+    // g_phyRequestedThisConn guards against a later Session<->Idle
+    // renegotiation mid-connection re-firing PHY.
+    if (!g_phyRequestedThisConn && !g_connPolicy.inFlight() && g_server) {
+      g_phyRequestedThisConn = true;
+      g_server->updatePhy(connInfo.getConnHandle(), BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK, 0);
+      LOG_DBG("CBLE", "t=+%lums requested 2M PHY", static_cast<unsigned long>(connUptimeMs()));
+    }
   }
-  void onPhyUpdate(NimBLEConnInfo& /*connInfo*/, uint8_t txPhy, uint8_t rxPhy) override {
+  void onPhyUpdate(NimBLEConnInfo& connInfo, uint8_t txPhy, uint8_t rxPhy) override {
     g_lastPhyTx = phyName(txPhy);
     g_lastPhyRx = phyName(rxPhy);
     LOG_DBG("CBLE", "PHY update: tx=%s rx=%s", g_lastPhyTx, g_lastPhyRx);
+    // Serialized chain, step 3: Data Length Extension, started only once
+    // PHY's own procedure has completed -- this callback firing at all is
+    // that signal. Single-shot, no retry on refusal: neither the Core Spec
+    // nor Apple's/Nordic's public guidance mandates a backoff-and-retry for a
+    // rejected LL Control Procedure, and NimBLE-Arduino's GAP dispatcher
+    // (NimBLEServer.cpp's gapEventHandler) never forwards
+    // BLE_GAP_EVENT_DATA_LEN_CHG, so there is no way to confirm DLE actually
+    // landed even if we wanted to retry on failure -- and nothing is
+    // requested after it in this chain, so that blind spot doesn't matter
+    // here. This used to fire from onConnect(), racing conn params and PHY;
+    // see ca5e518a for what that cost (every connection dying at 40 s, HCI
+    // 0x22/TPRT) and this class's own comment for the full chain reasoning.
+    if (!g_dleRequestedThisConn && g_server) {
+      g_dleRequestedThisConn = true;
+      g_server->setDataLen(connInfo.getConnHandle(), 251);
+      LOG_DBG("CBLE", "t=+%lums requested DLE (251 octets)", static_cast<unsigned long>(connUptimeMs()));
+    }
   }
   void onDisconnect(NimBLEServer* server, NimBLEConnInfo& /*connInfo*/, int reason) override {
     // DIAGNOSTIC: the reason code was previously discarded, which left every
