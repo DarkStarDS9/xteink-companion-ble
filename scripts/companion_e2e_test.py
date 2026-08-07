@@ -45,6 +45,10 @@ Covered:
                before doing anything else, same as SpokenFeeds waiting on it before
                starting audio. A timeout here is "the screen updated but the phone
                heard nothing" -- a distinct failure from a wrong RENDER_STATUS result.
+               Self-sufficient: if the session isn't already foreground (e.g. run
+               standalone without buttonmap), it pushes a UI declaration and
+               ACQUIREs first, so a failure to get the screen fails fast with one
+               clear message instead of every push timing out mysteriously.
 
 --soak MINUTES runs a separate mode instead of the scenario groups above: one
 connection, held open for the whole window with light periodic activity, to catch
@@ -999,9 +1003,28 @@ async def run_tests(args, console: Console, results: Results) -> None:
                 f"pushes a batch and then BLOCKS on RENDER_STATUS before doing anything else "
                 f"(render timeout {args.render_timeout}s)"
             )
+
+            # A real app can't assume some earlier session already holds the
+            # screen. If buttonmap ran first in this process, session_a is
+            # already foreground and this is a no-op; run standalone (e.g.
+            # --only enrollment,spokenfeeds) and, without this, every push
+            # below times out with no clue why -- RENDER_STATUS is
+            # deliberately silent for non-foreground sessions.
+            group_ready = True
+            if console.state().get("foreground") != str(session_a.session_id):
+                print("  [spokenfeeds] session is not foreground -- pushing a UI declaration and acquiring")
+                button_map = encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS)
+                await session_a.push_asset(FIELD_UI_DECL, button_map)
+                outcome = await session_a.acquire()
+                group_ready = results.check(
+                    "spokenfeeds: session holds the screen (foreground)",
+                    outcome[0] == "foreground",
+                    f"spokenfeeds needs the screen; ACQUIRE failed: got {outcome}",
+                )
+
             rng = random.Random(0xF3ED)
             commit_to_render_ms: list[float] = []
-            for i in range(args.articles):
+            for i in range(args.articles if group_ready else 0):
                 title = _word_salad(rng, 20, 90)
                 body = _word_salad(rng, 200, 600)
                 # Distinct, non-zero pushId per run so a late answer from a
