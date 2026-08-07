@@ -13,22 +13,23 @@ most expensive kind of knowledge to re-acquire.
 
 # CURRENT STATE — read this first
 
-**As of 2026-08-07, consolidated.** This section is the handoff, and it tracks **every live line,
-not just the one you are sitting in** — a session that updates only its own line recreates the
-cross-worktree amnesia the 2026-08-07 consolidation had to undo. Cross-repo sessions (e.g. run
-from a SpokenFeeds checkout) that touch firmware must update this section too. Before analyzing
-anything, run `git worktree list` and `git cherry companion <branch>` for every listed branch.
+**As of 2026-08-07, consolidated (second pass, same day).** This section is the handoff, and it
+tracks **every live line, not just the one you are sitting in** — a session that updates only its
+own line recreates the cross-worktree amnesia the earlier 2026-08-07 consolidation had to undo.
+Cross-repo sessions (e.g. run from a SpokenFeeds checkout) that touch firmware must update this
+section too. Before analyzing anything, run `git worktree list` and `git cherry companion <branch>`
+for every listed branch.
 
 ## Where the code is
 
-| Line | State |
-|---|---|
-| `companion` | Consolidated trunk: parameter fixes, render instrumentation, the 2026-08-04 DLE root-cause (DLE requested nowhere), disconnected-page-buttons fix, 2026-08-04 docs. |
-| `worktree-bridge-cse_01AXp4…` | 2 unlanded: `81f0947c` (Idle holdoff) + `bee97fe1` (latency 0 while a session holds the screen). n=1 verified (reader_serial7.log: latency=0 granted once, 30 ms fields, 242 ms batch commit, no safety net). Land after the harness reproduces it. `f1c261a2`/`801ca7fd` are a cancelling pair — intentionally unlanded forever. |
-| formerly `worktree-…01Fh3y` | The 2026-08-04 DLE line — fully landed by the consolidation. |
+No unlanded lines remain. `companion` (this commit) is the consolidated trunk: parameter fixes,
+render instrumentation, the 2026-08-04 DLE root-cause (DLE requested nowhere), the
+disconnected-page-buttons fix, `worktree-bridge-cse_01AXp4…`'s pair (`81f0947c` Idle holdoff +
+`bee97fe1` latency-0-while-foreground), `CompanionBatchModel` + `CompanionConnPolicy` host suites
+(149/149), the e2e harness's spokenfeeds/soak modes, and today's DLE A/B proof.
 
-**The reader currently runs `bee97fe1`, an unlanded build.** A trunk flash before `81f0947c` +
-`bee97fe1` land would lose the latency-0 behaviour (but now keeps the DLE fix and button fix).
+**The reader currently runs the trunk TEST build** (`pio run -e test`, serial console active) —
+not a stale unlanded build; a reflash from trunk changes nothing behavioural.
 
 ## What is proven
 
@@ -48,6 +49,15 @@ anything, run `git worktree list` and `git cherry companion <branch>` for every 
   batch safety net a coin flip. Latency belongs to `Idle` only.
 - The sleep-inhibit fix `fefd310d` is hardware-verified (user, 2026-08-07, including physical
   unplug).
+- The commit→`RENDER_STATUS` latency measurement now has n=2, not n=1: the iPhone
+  (`reader_serial7.log`) and the macOS e2e harness (21/21 pushes, wire times 56–74 ms,
+  commit→`RENDER_STATUS` medians ~1.2 s) independently land in the same range.
+- **The DLE fix is host-A/B-provable, and was proven that way, on 2026-08-07.** Same Mac central,
+  same day, same harness: a DLE-carrying build died at 39996 ms with HCI `0x22` (TPRT); the same
+  build with the request removed then survived a 3-minute soak (`--soak 3`, session held
+  foreground, two content-push rounds). This closes Q1/N3-class doubt and disproves the standing
+  claim that a macOS harness cannot show DLE behaviour — macOS was assumed to self-negotiate DLE
+  harmlessly and does not.
 
 ## Known open defects
 
@@ -55,7 +65,8 @@ anything, run `git worktree list` and `git cherry companion <branch>` for every 
    Cheap fix, not a protocol change: every field's END already carries the batch's pushId on the
    wire — latch it from the batch's *first* END and answer late instead of never. Separately, 3 s
    is tuned like a slow-link timeout when its real job is "the phone died" — reconsider value and
-   trigger (link-idle, not wall time).
+   trigger (link-idle, not wall time). Now fixable red-first against `CompanionBatchModel` — the
+   seam already exists, use it.
 2. **SpokenFeeds gates audio on the render ack** — app-side; converts any firmware hiccup into
    user-audible silence.
 3. Three notifications per plain button tap (the middle hold-tick is redundant for a tap).
@@ -66,14 +77,14 @@ anything, run `git worktree list` and `git cherry companion <branch>` for every 
 
 ## What to do next, in order
 
-1. **Harness** (phase 1b): SpokenFeeds-behaviour mode (push batch → block on `RENDER_STATUS`,
-   per-field wire times in the serial log's shape), soak mode (assert no disconnect ≥ N min,
-   report HCI reason), single entry point. Plain terminal, not tmux (TCC).
-2. **Verified landings** (1c): soak a trunk build (expect it to outlive 40 s now); reproduce the
-   latency-0 result; land `81f0947c` + `bee97fe1`; reflash the reader from trunk.
-3. **TDD extractions**: `CompanionBatchModel` + `CompanionConnPolicy` host suites; the "Every fix
-   starts red" rule.
-4. **Q5, the battery A/B discharge** — gates all remaining power work (including R1 and Idle's
+1. **Safety-net fix, red-first** against `CompanionBatchModel` (defect 1 above) — the extraction
+   makes this a host-test-first fix rather than another hardware-only guess.
+2. **SpokenFeeds audio coupling** (defect 2) + a reconnect-reACQUIRE check: a session that pushes
+   without holding foreground gets silence by design (`RENDER_STATUS` is withheld for non-foreground
+   sessions), which is worth an app-side audit — it is easy to trip into from the app side without
+   noticing, as today's harness gap (spokenfeeds silently depending on buttonmap having run first)
+   showed on the firmware side.
+3. **Q5, the battery A/B discharge** — gates all remaining power work (including R1 and Idle's
    latency value). Do not start power work before it.
 
 ## How this went wrong, so it does not repeat
@@ -90,6 +101,36 @@ re-investigated the same bug and reached a weaker conclusion. Hence the rules at
 section.
 
 ---
+
+## Session 5 — 2026-08-07, consolidation: DLE A/B proof, landings, harness fix, kit extraction
+
+### Proved
+
+- The DLE fix is host-A/B-provable from the Mac alone: a DLE-carrying build died at 39996 ms
+  (HCI `0x22`, TPRT) against the macOS central via `scripts/companion_e2e_test.py`; the same
+  harness against DLE-free trunk then survived a 3-minute soak (`--soak 3`, session held
+  foreground, two content-push rounds). Same Mac, same day, same harness — the only variable was
+  the DLE request. This closes Q1/N3-class doubt.
+
+### Disproved
+
+- The standing claim that "a macOS harness cannot show this [DLE]" — macOS was assumed to
+  self-negotiate DLE harmlessly, so it would neither benefit nor fail either way. It does fail,
+  identically to the original iPhone failure mode, when the request is present.
+
+### Other work landed today
+
+- `worktree-bridge-cse_01AXp4…`'s pair (`81f0947c` Idle holdoff, `bee97fe1` latency-0-while-foreground)
+  landed on `companion` — no unlanded lines remain (see "Where the code is" above).
+- `CompanionBatchModel` + `CompanionConnPolicy` host suites reached 149/149.
+- Found and fixed a harness bug: the spokenfeeds e2e group silently depended on the buttonmap
+  group having run first (it needs the session to hold the screen; `RENDER_STATUS` is deliberately
+  silent for non-foreground sessions). Running `--only enrollment,spokenfeeds` produced three
+  misleading timeout FAILs. spokenfeeds now checks foreground and arranges its own if buttonmap
+  didn't run first, failing fast with one clear message if it can't get the screen.
+- CompanionKit (the Swift reference client) extracted with full history to its own repo,
+  https://github.com/DarkStarDS9/CompanionKit (tag `11.0.0`); both consumer apps now depend on it
+  via SPM instead of a vendored copy under `clients/swift/CompanionKit`.
 
 ---
 
@@ -416,9 +457,11 @@ the reader first, which makes the hint scheme more reliable, not less.
 
 ## Open questions, in priority order
 
-**Q1. Does the `0x22` still occur at all under compliant parameters?**
-600 s clean is suggestive, not proof — the historic failure was intermittent. Needs a long soak
-(30+ min) with real playback traffic, serial only, no sniffer required.
+**Q1. ~~Does the `0x22` still occur at all under compliant parameters?~~ CLOSED 2026-08-07.**
+The macOS A/B (Session 5) reproduced the collision on demand with the DLE request present and
+showed a clean 3-minute soak with it absent, same build otherwise. That is the causal proof this
+question was waiting on — a longer real-traffic soak (30+ min) is still worth doing before power
+work, but as confidence-building, not to establish causation.
 
 **Q2. ~~Is the 373 ms ramp worth paying on every article?~~ RESOLVED — the ramp is gone.**
 The question assumed the interval had to move. It does not: peripheral latency delivers the same

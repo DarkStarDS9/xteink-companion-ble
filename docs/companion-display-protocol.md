@@ -99,8 +99,15 @@ implements it, never after.
 > procedure gets started around connection setup, it lands in the same crowded
 > window and dies the same way, so any DLE on this link is treated as unsafe
 > until a *serialized* variant — one procedure at a time, well after connect
-> settles — survives a harness soak. Note that a macOS harness cannot show
-> this -- macOS self-negotiates DLE, so it neither benefits nor fails. Anything added to `onConnect()` in future
+> settles — survives a harness soak. On 2026-08-07 the macOS central
+> reproduced the collision exactly: a DLE-carrying build died at 39996 ms
+> with HCI `0x22` (TPRT), request present, against
+> `scripts/companion_e2e_test.py`; the same harness with the request absent
+> then survived a 3-minute soak (`--soak 3`, session held foreground, two
+> content-push rounds). The fix is host-A/B-provable after all, and was
+> proven that way -- the earlier claim that a macOS harness "cannot show
+> this" (macOS was assumed to self-negotiate DLE harmlessly) was wrong.
+> Anything added to `onConnect()` in future
 > needs checking against that rule; `updatePhy()` is still there and is already
 > one procedure more than is comfortable.
 
