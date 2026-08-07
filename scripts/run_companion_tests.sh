@@ -98,7 +98,12 @@ EOF
     note_fail "BLE harness (refused: running under tmux)"
   else
     echo "== companion_e2e_test.py ${BLE_ARGS[*]:-} =="
-    if python3 scripts/companion_e2e_test.py "${BLE_ARGS[@]}"; then
+    # .venv is this repo's gitignored one-time setup for bleak/pyserial (see
+    # scripts/companion_e2e_test.py's own docstring); fall back to system
+    # python3 if it was never created.
+    PY3="python3"
+    [ -x ".venv/bin/python3" ] && PY3=".venv/bin/python3"
+    if "$PY3" scripts/companion_e2e_test.py "${BLE_ARGS[@]}"; then
       note_pass "BLE harness"
     else
       note_fail "BLE harness"

@@ -32,6 +32,12 @@ process running this needs Bluetooth permission — a sandboxed or automated she
 will be refused with BleakBluetoothNotAvailableError, so run it from a terminal
 that has been granted access.
 
+One-time setup (`.venv` at repo root is gitignored, see .gitignore):
+
+    python3 -m venv .venv
+    .venv/bin/pip install -r scripts/requirements.txt
+    .venv/bin/python3 scripts/companion_e2e_test.py --port /dev/cu.usbmodem21201
+
 Covered:
   enrollment   first contact, on-device confirm, token issued
   reconnect    stored token, silent reconnect, asset digests reported
