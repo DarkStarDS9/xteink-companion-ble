@@ -53,6 +53,52 @@ TEST(CompanionBatchModel, FinalNeverArrivesTimesOutWithZeroPushId) {
   EXPECT_TRUE(result.hasTitle);
 }
 
+TEST(CompanionBatchModel, SlowButSteadyBatchDoesNotTimeOut) {
+  // Total span exceeds kTimeoutMs, but each field lands well within
+  // kTimeoutMs of the previous one -- a live, if slow, client must not be
+  // punished by the same budget as one that has gone silent.
+  CompanionBatchModel model;
+  model.onField(companionble::kFieldTitle, bytesOf("Title"), 5, /*final=*/false, companionble::FieldOutcome::Complete,
+                /*pushId=*/0, /*nowMs=*/1000);
+
+  // This poll lands after the first field's own kTimeoutMs window, but the
+  // second field arrives before this check -- so it must not resolve yet.
+  model.onField(companionble::kFieldBody, bytesOf("Body"), 4, /*final=*/true, companionble::FieldOutcome::Complete,
+                /*pushId=*/88, /*nowMs=*/1000 + CompanionBatchModel::kTimeoutMs - 100);
+
+  const auto result = model.poll(1000 + CompanionBatchModel::kTimeoutMs + 500);
+
+  EXPECT_EQ(result.resolution, Resolution::Commit);
+  EXPECT_FALSE(result.timedOut);
+  EXPECT_EQ(result.pushId, 88);
+  EXPECT_TRUE(result.hasTitle);
+  EXPECT_TRUE(result.hasBody);
+  // Diagnostic elapsed time still measures from the batch's first field to
+  // resolution, even though the timeout itself no longer does.
+  EXPECT_TRUE(result.elapsedValid);
+  EXPECT_EQ(result.elapsedSinceFirstFieldMs, CompanionBatchModel::kTimeoutMs + 500);
+}
+
+TEST(CompanionBatchModel, TimesOutAfterSilenceSinceLastFieldNotFirst) {
+  // The batch's first field is well inside the window on its own, but the
+  // client then goes silent for kTimeoutMs after its *second* field -- the
+  // clock must be judged against that second field, not the first.
+  CompanionBatchModel model;
+  model.onField(companionble::kFieldTitle, bytesOf("Title"), 5, /*final=*/false, companionble::FieldOutcome::Complete,
+                /*pushId=*/0, /*nowMs=*/1000);
+  model.onField(companionble::kFieldBody, bytesOf("Body"), 4, /*final=*/false, companionble::FieldOutcome::Complete,
+                /*pushId=*/0, /*nowMs=*/1500);
+
+  // Not yet kTimeoutMs since the body field.
+  EXPECT_EQ(model.poll(1500 + CompanionBatchModel::kTimeoutMs).resolution, Resolution::None);
+
+  const auto result = model.poll(1500 + CompanionBatchModel::kTimeoutMs + 1);
+  EXPECT_EQ(result.resolution, Resolution::Commit);
+  EXPECT_TRUE(result.timedOut);
+  EXPECT_TRUE(result.hasTitle);
+  EXPECT_TRUE(result.hasBody);
+}
+
 TEST(CompanionBatchModel, PoisonDoesNotLeakIntoTheNextBatch) {
   CompanionBatchModel model;
   // First field of the batch is dropped -- poisons it and still starts the clock.

@@ -20,6 +20,10 @@ void CompanionBatchModel::onField(uint8_t field, const uint8_t* data, size_t len
     // arrives, poll()'s timeout is what clears the poison again.
     if (isTextField) poisoned_ = true;
     if (wasIdle && isTextField) batchStartMs_ = nowMs;
+    // A dropped field's END still reached us -- the client is alive and
+    // sending, it just lost a chunk sequence. That counts as activity for
+    // the between-fields timeout same as a clean field.
+    if (isTextField || (field == companionble::kFieldTagState && !wasIdle)) lastFieldMs_ = nowMs;
     if (final) commitReady_ = true;
     return;
   }
@@ -46,6 +50,9 @@ void CompanionBatchModel::onField(uint8_t field, const uint8_t* data, size_t len
   if (wasIdle && isTextField) {
     batchStartMs_ = nowMs;
   }
+  if (isTextField || (field == companionble::kFieldTagState && !wasIdle)) {
+    lastFieldMs_ = nowMs;
+  }
   if (final) commitReady_ = true;
 }
 
@@ -54,13 +61,17 @@ CompanionBatchModel::PollResult CompanionBatchModel::poll(uint32_t nowMs) {
 
   if (commitReady_) {
     result.resolution = Resolution::Commit;
-  } else if ((titleReady_ || bodyReady_ || poisoned_) && batchStartMs_ != 0 && nowMs - batchStartMs_ > kTimeoutMs) {
-    // Safety net: the final-flagged field's END never arrived in time (e.g.
-    // the app crashed or lost the connection mid-push). Apply whatever we
-    // have rather than leaving the screen stuck on stale content
-    // indefinitely. A poisoned batch resolves here too -- it still has to be
-    // *cleared*, or the poison would leak into the next batch; it is just
-    // discarded rather than applied (see the poisoned_ handling below).
+  } else if ((titleReady_ || bodyReady_ || poisoned_) && lastFieldMs_ != 0 && nowMs - lastFieldMs_ > kTimeoutMs) {
+    // Safety net: no new field has landed in kTimeoutMs (e.g. the app
+    // crashed or lost the connection mid-push). Apply whatever we have
+    // rather than leaving the screen stuck on stale content indefinitely.
+    // Judged against lastFieldMs_ (most recent field), not batchStartMs_
+    // (first field) -- a batch whose fields keep arriving, just slowly, is a
+    // live client and must not be judged against the same 3s budget as one
+    // that has gone silent. A poisoned batch resolves here too -- it still
+    // has to be *cleared*, or the poison would leak into the next batch; it
+    // is just discarded rather than applied (see the poisoned_ handling
+    // below).
     result.resolution = Resolution::Commit;
     result.timedOut = true;
   }
@@ -84,6 +95,7 @@ CompanionBatchModel::PollResult CompanionBatchModel::poll(uint32_t nowMs) {
     bodyReady_ = false;
     commitReady_ = false;
     batchStartMs_ = 0;
+    lastFieldMs_ = 0;
     poisoned_ = false;
     batchPushId_ = 0;
   }
@@ -114,6 +126,7 @@ void CompanionBatchModel::reset() {
   bodyReady_ = false;
   commitReady_ = false;
   batchStartMs_ = 0;
+  lastFieldMs_ = 0;
   poisoned_ = false;
   batchPushId_ = 0;
   tagStateReady_ = false;
@@ -125,6 +138,7 @@ void CompanionBatchModel::resetOnDisconnect() {
   bodyReady_ = false;
   commitReady_ = false;
   batchStartMs_ = 0;
+  lastFieldMs_ = 0;
   poisoned_ = false;
   batchPushId_ = 0;
   // Tag state belonging to the batch the link just killed goes with it —

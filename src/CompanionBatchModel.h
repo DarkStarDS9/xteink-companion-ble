@@ -20,13 +20,17 @@
 // single kFinalFieldFlag-marked END. The device owes exactly one commit/discard
 // resolution per batch, decided the moment the final-flagged field's END
 // arrives (onField(..., final=true, ...)) or, failing that, kTimeoutMs after
-// the batch's first field -- see poll()'s doc comment.
+// the batch's most recently arrived field -- see poll()'s doc comment.
 class CompanionBatchModel {
  public:
-  // How long a batch is allowed to sit with a field pending and no
-  // final-flagged END before poll() gives up waiting and applies/discards
-  // whatever arrived anyway. Safety net for an app crash or a disconnect
-  // mid-push that leaves the screen stuck on stale content indefinitely.
+  // How long a batch is allowed to go without a new field arriving before
+  // poll() gives up waiting and applies/discards whatever arrived anyway.
+  // Safety net for an app crash or a disconnect mid-push that leaves the
+  // screen stuck on stale content indefinitely. This clock resets on every
+  // field the batch receives (title/body, or tag-state riding an in-flight
+  // batch) rather than running once from the batch's first field -- a batch
+  // whose fields keep arriving, just slowly, is a live client and should not
+  // be judged against the same 3s budget as a client that has gone silent.
   static constexpr uint32_t kTimeoutMs = 3000;
 
   enum class Resolution : uint8_t {
@@ -123,8 +127,18 @@ class CompanionBatchModel {
   bool tagStateInBatch_ = false;
 
   // millis()-equivalent timestamp (caller-supplied nowMs) of the first pending
-  // field of the current batch; 0 when idle.
+  // field of the current batch; 0 when idle. Diagnostic only
+  // (elapsedSinceFirstFieldMs) -- the timeout itself is judged against
+  // lastFieldMs_ below.
   uint32_t batchStartMs_ = 0;
+
+  // millis()-equivalent timestamp of the most recently arrived field of the
+  // current batch (title/body, or tag-state riding one already in flight);
+  // 0 when idle. This is what poll()'s kTimeoutMs safety net measures against
+  // -- a batch stays alive as long as fields keep landing within kTimeoutMs
+  // of each other, even if the batch as a whole takes far longer than
+  // kTimeoutMs to complete.
+  uint32_t lastFieldMs_ = 0;
 
   // Set when any title/body field of the current batch arrived as
   // FieldOutcome::Dropped. A batch that lost a field fails as a whole --
