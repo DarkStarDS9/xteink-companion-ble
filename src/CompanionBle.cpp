@@ -12,8 +12,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <vector>
 
+#include "CompanionConnPolicy.h"
 #include "CompanionPeerStore.h"
 #include "Epub/converters/RawBitmapToFramebufferConverter.h"
 #include "Memory.h"
@@ -153,149 +155,38 @@ ImageStagedCallback g_imageStagedCb = nullptr;
 // Connection interval / peripheral latency
 // ---------------------------------------------------------------------------
 //
-// Two link-layer profiles, requested via NimBLEServer::updateConnParams (a
-// peripheral can only ever *request* new parameters -- the central, iOS here,
-// grants or ignores it). This is transport tuning, not a protocol change: no
-// wire field, byte layout, or characteristic is affected, so it carries no
-// version bump.
+// The profile decision itself -- Session vs Idle, the Idle holdoff, grant
+// matching (a grant anywhere inside the requested min/max range counts as
+// compliance), deferred-request retry after kConnParamsGraceMs -- lives in
+// CompanionConnPolicy; see that header for the full envelope reasoning
+// (Apple accessory-design-guidelines checks, the bursty-traffic latency
+// measurement that reverted Session off latency 10, the dropped-request
+// history that split desired/current/requested into three variables). This
+// file just wires it to NimBLE: forward the ParamRequest from step()/
+// onConnect() to NimBLEServer::updateConnParams(), and feed onGrant() from
+// NimBLEServerCallbacks::onConnParamsUpdate().
 //
-// Units match the BLE spec directly (updateConnParams forwards them straight
-// into ble_gap_upd_params): interval in 1.25 ms units, latency as a skipped-
-// event count, supervision timeout in 10 ms units.
-//
-// Chosen by SESSION STATE, not by an activity timer. An earlier design (see
-// git history: the Busy/Near/Deep ladder) renegotiated the *interval* itself
-// on every button press or content write, on the assumption that a tighter
-// interval was needed while "busy" and could be relaxed after a quiet
-// timeout. That assumption was measured wrong: a negotiated parameter change
-// does not take effect when requested -- it takes effect at an "instant"
-// roughly 6 connection events out, counted at the OLD, slower interval. So
-// ramping back from the relaxed stages cost ~360 ms (from the old Near) and
-// ~900 ms (from the old Deep), paid on the first field of every article
-// (measured title wire times of 298 ms and 598 ms, versus 30 ms when the
-// link was already fast). Worse, the renegotiation churn itself caused a
-// traced failure: a relax request and a tighten request overlapped -- only
-// one connection-parameter procedure may be in flight at a time (see
-// pumpConnParams()) -- the tighten request was silently dropped, and a push
-// took ~6 s to reach the panel.
-//
-// Peripheral LATENCY is the right knob instead, and this was verified on
-// real hardware with a BLE sniffer (2026-08-06): with latency 30 negotiated,
-// the peripheral attended only 562 of 3724 connection events (dominant idle
-// gap exactly 31 = latency+1 -- it really does skip almost everything when
-// idle), yet all 56 notifications queued during that capture reached the air
-// within 0-4 connection events of being queued. NimBLE's peripheral-latency
-// implementation on this hardware is a genuine "skip when idle, wake on
-// demand" behaviour, not a rigid low-power mode that only serves data at the
-// latency-extended anchor point. So the interval never needs to move at all:
-// negotiate it once per connection and leave it alone. The peripheral's own
-// wakefulness does the power management for free, with none of the
-// renegotiation-churn cost above.
-//
-// One consequence worth stating plainly: button latency is UNAFFECTED by
-// peripheral latency. The peripheral wakes on demand to transmit, so an
-// outgoing button notify is bounded by one connection interval (~30 ms),
-// regardless of which profile is active. The cost of a high latency value
-// falls only on the FIRST packet of a *central-to-peripheral* push -- up to
-// latency * interval, while the link is genuinely idle and the central has
-// to wait for the next anchor point it is not skipping. Once packets are
-// flowing the peripheral is not skipping connection events at all, so bulk
-// transfers (image/title/body chunks) are unaffected either way.
-//
-// Both profiles below share the same interval, 15-30 ms (12-24 units): iOS
-// is MEASURED to grant Interval Max, so the link runs at 30 ms in practice
-// (this was true of the old ladder's Near/Deep stages too -- see git history
-// for that measurement); the 15 ms min exists only to satisfy the required
-// 15 ms spread (min + 15 ms == max), not because 15 ms is ever actually
-// granted. Only latency differs between the two profiles:
-//
-// "Session": a session currently holds the screen -- the normal case -- so a
-// push is likely at any moment and the link must be fully responsive. No
-// skipping at all: effective cadence == the 15 ms interval.
-// Checks (Apple accessory-design-guidelines envelope: peripheral latency
-// <= 30 intervals; interval >= 15 ms in 15 ms multiples; maxInterval *
-// (latency+1) <= 2 s; timeout(ms) > maxInterval(ms) * (latency+1) * 3):
-// 15 ms is a multiple of 15 ms and at the floor; min == max == 15 ms is the
-// one equality the rules permit (some devices scale it to 30 ms, which is
-// fine); latency 0 <= 30; 15 ms * 1 = 15 ms <= 2 s; timeout 4000 ms >
-// 15 ms * 3 = 45 ms.
-// Latency 10 at a 30 ms interval was tried and reverted (2026-08-07). The
-// reasoning behind it -- "latency is self-cancelling during traffic, because a
-// peripheral with packets flowing is not skipping anyway" -- is only true of a
-// *continuous* stream. This protocol is bursty: START / chunks / END per field,
-// several of them Write-With-Response round trips, with a gap after each one
-// long enough for the controller to resume skipping. Every gap then costs up to
-// latency x interval on the next packet. Measured: text fields at 360-390 ms
-// each (about one 300 ms latency window), batch commits at a 2919 ms median
-// against 634 ms before, and the 3 s batch safety net firing on 4 of 11
-// pushes. Worse, a batch resolved by that safety net carries no pushId, so no
-// RENDER_STATUS is sent at all -- the panel updates and the phone waits out its
-// own render timeout, which in SpokenFeeds delays the *audio*.
-//
-// So: no latency while an app holds the screen. Interval min == max == 15 ms is
-// the one equality Apple's rules permit, and it is what the old Busy profile
-// used, proven fast. The power saving that latency was supposed to buy is
-// deferred to the phone traffic hint (measurements doc, R1), which can afford
-// it because it knows when a quiet period actually starts.
-constexpr uint16_t kConnIntervalSessionUnits = 12;     // 15 ms
-constexpr uint16_t kConnIntervalSessionMaxUnits = 12;  // 15 ms -- the permitted min == max == 15 ms
-constexpr uint16_t kConnLatencySession = 0;
-constexpr uint16_t kConnTimeoutSessionUnits = 400;  // 4 s (10 ms units)
+// This is transport tuning, not a protocol change: no wire field, byte
+// layout, or characteristic is affected, so it carries no version bump.
+CompanionConnPolicy g_connPolicy;
 
-// "Idle": no session holds the screen, so nothing is going to push content to
-// a screen no app owns -- skip aggressively. Effective idle cadence
-// 30 ms * (30+1) = 930 ms.
-// Checks: min/max/spread identical to Session above; latency 30 <= the
-// 30-interval cap (Apple's maximum); 30 ms * (30+1) = 930 ms <= 2 s;
-// timeout 4000 ms > 930 ms * 3 = 2790 ms < 4000 ms.
-constexpr uint16_t kConnIntervalIdleUnits = 12;     // 15 ms
-constexpr uint16_t kConnIntervalIdleMaxUnits = 24;  // 30 ms
-constexpr uint16_t kConnLatencyIdle = 30;
-constexpr uint16_t kConnTimeoutIdleUnits = 400;  // 4 s
-
-// Two discrete link stages rather than a bool: the transition rules below
-// depend on *which* stage is wanted, and an exhaustive switch keeps the
-// parameter pairs from drifting apart (see .skills control-flow-clarity).
-enum class ConnProfile : uint8_t { Session, Idle };
-
-const char* connProfileName(ConnProfile profile) {
+const char* connProfileName(CompanionConnPolicy::ConnProfile profile) {
   switch (profile) {
-    case ConnProfile::Session:
+    case CompanionConnPolicy::ConnProfile::Session:
       return "session";
-    case ConnProfile::Idle:
+    case CompanionConnPolicy::ConnProfile::Idle:
       return "idle";
   }
   return "?";
 }
 
 // millis() of the last write/notify "activity" edge. No longer drives any
-// profile decision (see noteBleActivity() below) -- kept because five call
-// sites already mark this edge and a future feature may want "time since
-// last BLE write". Nothing currently reads it; the only reader was the old
-// Busy/Near/Deep ladder's idle-relax timer in tick(), which this change
-// deleted along with the ladder itself.
+// profile decision -- kept because five call sites already mark this edge and
+// a future feature may want "time since last BLE write". Nothing currently
+// reads it; the only reader was the old Busy/Near/Deep ladder's idle-relax
+// timer in tick(), which a much earlier change deleted along with the ladder
+// itself.
 uint32_t g_lastBleActivityMs = 0;
-// Tracks which profile was last requested, so tick() and requestConnParams()
-// don't spam updateConnParams() every call once already in the right state.
-// Starts at Idle, matching the no-session state a fresh connection begins
-// in -- the first tick() after onConnect() picks up Session as soon as some
-// app's HELLO/ACQUIRE claims the foreground (see setForeground()).
-ConnProfile g_connProfile = ConnProfile::Idle;
-// What we *want* the link to be, as distinct from what it is. These were one
-// variable until a capture (2026-08-06) showed why they cannot be: tick()
-// requested one profile, a push arrived while that procedure was still
-// outstanding and requested the other, and the second request was dropped on
-// the floor -- only one connection-parameter procedure may be in flight at a
-// time. The old code latched the profile at *request* time, so the firmware
-// believed the link was where it had asked for while the link itself sat on
-// the earlier profile's params, and nothing ever retried. The push that
-// followed missed its batch window and took several seconds to reach the
-// panel.
-ConnProfile g_desiredProfile = ConnProfile::Idle;
-// The profile of the request currently outstanding, for logging only.
-ConnProfile g_requestedProfile = ConnProfile::Idle;
-// True between issuing a parameter request and the central answering it.
-bool g_connParamsInFlight = false;
 
 // DIAGNOSTIC (2026-08-03 link-robustness investigation): millis() at the last
 // onConnect, so every link-layer log line can carry "t=+Nms into this
@@ -306,110 +197,36 @@ bool g_connParamsInFlight = false;
 uint32_t g_connectMs = 0;
 uint32_t connUptimeMs() { return g_connectMs == 0 ? 0 : millis() - g_connectMs; }
 
-// DIAGNOSTIC: what requestConnParams() last asked for, so onConnParamsUpdate()
-// can say whether the central actually granted it. requestConnParams() latches
-// g_connProfile on the *request*; if iOS silently ignores or alters it, the
-// firmware otherwise carries on believing the link is tight.
-uint16_t g_reqIntervalUnits = 0;
-// The request is a *range* now that the profiles carry the guidelines' required
-// min/max spread, so a grant anywhere inside it is compliance, not divergence.
-// Comparing against the min alone would report every legitimately-granted
-// interval as a mismatch.
-uint16_t g_reqIntervalMaxUnits = 0;
-uint16_t g_reqLatency = 0;
-uint16_t g_reqTimeoutUnits = 0;
-// millis() of the last requestConnParams() call, and whether the most recent
-// update event matched what it asked for. Together these let tick() report a
-// request the central never honoured, without mistaking the link's own opening
-// parameters for a refusal -- see onConnParamsUpdate() for why that distinction
-// cost a false ERR on every connection before it existed.
-uint32_t g_connParamsRequestedMs = 0;
-bool g_connParamsMatchedRequest = true;
-bool g_connParamsDivergenceLogged = false;
+// Issues g_connPolicy's pending request, if any, against the live link.
+// Safe and cheap to call repeatedly -- tick() does exactly that, which is
+// what turns a deferred request (one CompanionConnPolicy::step() held back
+// because another was still in flight) into a retried one.
+void applyConnPolicyRequest(const std::optional<CompanionConnPolicy::ParamRequest>& request) {
+  if (!request || !g_server || g_server->getConnectedCount() == 0) return;
+  const auto peer = g_server->getPeerInfo(0);
+  g_server->updateConnParams(peer.getConnHandle(), request->intervalUnits, request->intervalMaxUnits,
+                              request->latencyUnits, request->timeoutUnits);
+  LOG_DBG("CBLE", "t=+%lums requested %s conn params (interval=%u-%u latency=%u timeout=%u)",
+          static_cast<unsigned long>(connUptimeMs()), connProfileName(request->profile),
+          static_cast<unsigned>(request->intervalUnits), static_cast<unsigned>(request->intervalMaxUnits),
+          static_cast<unsigned>(request->latencyUnits), static_cast<unsigned>(request->timeoutUnits));
+}
+
+// DIAGNOSTIC: the last parameters the central actually granted, independent
+// of whether they matched a request -- CompanionConnPolicy::divergenceDue()'s
+// log line wants "what the link is actually at", and by the time that fires
+// the NimBLEConnInfo that reported it is long gone.
 uint16_t g_lastGrantedIntervalUnits = 0;
 uint16_t g_lastGrantedLatency = 0;
 uint16_t g_lastGrantedTimeoutUnits = 0;
-// How long the central gets to honour a parameter request before the mismatch
-// is reported. A connection-parameter update takes effect at an instant several
-// connection events out, and the measured round trip on real hardware is
-// ~150-550 ms; 3 s is far past any legitimate negotiation without letting a
-// genuinely ignored request go unnoticed for long.
-constexpr uint32_t kConnParamsGraceMs = 3000;
-
-// Issues the request for g_desiredProfile if the link is not already there and
-// no procedure is outstanding. Safe and cheap to call repeatedly -- tick() does
-// exactly that, which is what turns a deferred request into a retried one.
-void pumpConnParams() {
-  if (!g_server || g_server->getConnectedCount() == 0) return;
-
-  if (g_connParamsInFlight) {
-    // Still inside the window the central is allowed to take. Do not start a
-    // second procedure: it would be the one that gets dropped.
-    if (millis() - g_connParamsRequestedMs <= kConnParamsGraceMs) return;
-    // The grace expired with no matching update. Either the central ignored
-    // the request or the answer never came; either way the procedure is no
-    // longer usefully outstanding, so allow a fresh attempt rather than
-    // wedging here for the rest of the connection.
-    LOG_DBG("CBLE", "conn params request for %s unanswered after %lums, retrying", connProfileName(g_requestedProfile),
-            static_cast<unsigned long>(kConnParamsGraceMs));
-    g_connParamsInFlight = false;
-  }
-
-  if (g_desiredProfile == g_connProfile) return;
-
-  const ConnProfile profile = g_desiredProfile;
-  uint16_t interval = kConnIntervalSessionUnits;
-  uint16_t intervalMax = kConnIntervalSessionMaxUnits;
-  uint16_t latency = kConnLatencySession;
-  uint16_t timeout = kConnTimeoutSessionUnits;
-  switch (profile) {
-    case ConnProfile::Session:
-      interval = kConnIntervalSessionUnits;
-      intervalMax = kConnIntervalSessionMaxUnits;
-      latency = kConnLatencySession;
-      timeout = kConnTimeoutSessionUnits;
-      break;
-    case ConnProfile::Idle:
-      interval = kConnIntervalIdleUnits;
-      intervalMax = kConnIntervalIdleMaxUnits;
-      latency = kConnLatencyIdle;
-      timeout = kConnTimeoutIdleUnits;
-      break;
-  }
-  const auto peer = g_server->getPeerInfo(0);
-  g_server->updateConnParams(peer.getConnHandle(), interval, intervalMax, latency, timeout);
-  // Deliberately NOT g_connProfile: that only moves when the central actually
-  // grants the request (see onConnParamsUpdate). Latching it here is what made
-  // the firmware believe a dropped request had taken effect.
-  g_requestedProfile = profile;
-  g_connParamsInFlight = true;
-  g_reqIntervalUnits = interval;
-  g_reqIntervalMaxUnits = intervalMax;
-  g_reqLatency = latency;
-  g_reqTimeoutUnits = timeout;
-  g_connParamsRequestedMs = millis();
-  g_connParamsMatchedRequest = false;  // until an update event says otherwise
-  g_connParamsDivergenceLogged = false;
-  LOG_DBG("CBLE", "t=+%lums requested %s conn params (interval=%u-%u latency=%u timeout=%u)",
-          static_cast<unsigned long>(connUptimeMs()), connProfileName(profile), static_cast<unsigned>(interval),
-          static_cast<unsigned>(intervalMax), static_cast<unsigned>(latency), static_cast<unsigned>(timeout));
-}
-
-// Records the profile the link should be in. The request itself may go out now
-// or be deferred behind an outstanding procedure -- either way tick() keeps
-// trying until the link actually gets there.
-void requestConnParams(ConnProfile profile) {
-  g_desiredProfile = profile;
-  pumpConnParams();
-}
 
 // Called from every characteristic write and outgoing notify -- i.e. anything
 // that means a phone app is actively driving the link right now. Used to
 // force the link to the Session profile on this edge; no longer does, now
-// that the profile is chosen purely by session state (see the comment above
-// ConnProfile) and never renegotiated on a per-write/per-notify basis. Left
-// as a timestamp store only -- see g_lastBleActivityMs's own comment for why
-// it is kept despite having no current reader.
+// that the profile is chosen purely by session state (see
+// CompanionConnPolicy) and never renegotiated on a per-write/per-notify
+// basis. Left as a timestamp store only -- see g_lastBleActivityMs's own
+// comment for why it is kept despite having no current reader.
 void noteBleActivity() { g_lastBleActivityMs = millis(); }
 
 // ---------------------------------------------------------------------------
@@ -433,46 +250,15 @@ struct Session {
 Session g_sessions[kMaxSessions];
 uint8_t g_foreground = kNoSession;
 
-// The only place that decides which of the two ConnProfiles the link should
-// be in: Session while some app holds the screen, Idle otherwise. Cheap and
-// idempotent -- requestConnParams()/pumpConnParams() no-op once the link is
-// already at the desired profile -- so tick() can simply call this every
-// time rather than needing an edge-triggered hook at every g_foreground
-// writer (setForeground(), dropSession(), onConnect(), onDisconnect()).
-// Given how rarely g_foreground itself changes, this produces at most a
-// couple of real updateConnParams() calls per connection, never one per
-// article -- see the comment above the ConnProfile constants for why that
-// matters.
-// How long the link must go with nobody holding the screen before it drops to
-// Idle's deep latency. Not a power tuning knob -- it exists because "has a
-// foreground session" is false for the first couple of seconds of *every*
-// connection, while the v6 handshake is still running, and briefly whenever an
-// app hands the screen over. Measured 2026-08-07 without it: every connection
-// went Session (at connect) -> Idle (+563 ms, handshake not finished yet) ->
-// Session (+2316 ms), and because a duplicate grant confused the match check
-// the link then sat at Idle's 930 ms effective interval until +6552 ms -- right
-// through the first pushes. Median batch commit went 634 ms -> 2916 ms, i.e.
-// most pushes hit the 3 s batch safety net. Idle is worth having, but only for
-// a link that is genuinely unattended, never for one mid-handshake.
-constexpr uint32_t kIdleHoldoffMs = 10000;
-
-// millis() since nobody has held the screen; 0 while some session does. Set at
-// connect so a fresh connection starts the holdoff rather than counting as
-// long-unattended from the first tick().
-uint32_t g_noForegroundSinceMs = 0;
-
-void requestConnParamsForSessionState() {
-  if (g_foreground != kNoSession) {
-    g_noForegroundSinceMs = 0;
-    requestConnParams(ConnProfile::Session);
-    return;
-  }
-  if (g_noForegroundSinceMs == 0) g_noForegroundSinceMs = millis();
-  // Stay on Session through the handshake window and any brief handover; only a
-  // sustained absence earns Idle.
-  const bool unattended = millis() - g_noForegroundSinceMs >= kIdleHoldoffMs;
-  requestConnParams(unattended ? ConnProfile::Idle : ConnProfile::Session);
-}
+// Feeds g_connPolicy the one thing it needs from session state: whether some
+// app currently holds the screen. Level-triggered (see
+// CompanionConnPolicy::setForegroundActive()'s doc comment) so tick() can
+// simply call this every time rather than needing an edge-triggered hook at
+// every g_foreground writer (setForeground(), dropSession(), onConnect(),
+// onDisconnect()). Given how rarely g_foreground itself changes, the policy
+// ends up issuing at most a couple of real updateConnParams() calls per
+// connection, never one per article.
+void syncConnPolicyForegroundState() { g_connPolicy.setForegroundActive(g_foreground != kNoSession, millis()); }
 
 // Pending on-screen pairing prompt. Exactly one at a time — a second prompt
 // stacked behind the first would leave the user confirming an app they can no
@@ -1679,25 +1465,15 @@ const char* disconnectReasonName(int reason) {
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
     g_connectMs = millis();
-    // Start the Idle holdoff now, so tick()'s first call during the handshake
-    // -- when no session holds the screen yet -- does not immediately undo the
-    // Session request below (see kIdleHoldoffMs).
-    g_noForegroundSinceMs = millis();
     LOG_DBG("CBLE", "central connected");
     // Negotiate the connection params once, right here, rather than waiting
     // for tick()'s next call to notice -- "negotiate once per connection,
-    // then never again" (see the comment above the ConnProfile constants).
-    //
-    // Deliberately Session, not requestConnParamsForSessionState(): no app has
-    // claimed the foreground this early, so asking by session state would ask
-    // for Idle and then immediately ask again for Session as soon as the
-    // handshake completes -- two negotiations per connection where one will
-    // do. Asking for Session up front also means the v6 handshake and the
-    // first push run at Session's full 15 ms cadence rather than Idle's 930 ms. A
-    // connection that never gets a foreground session is the rare case, and
-    // tick() drops it to Idle on its own.
+    // then never again" (see the comment above CompanionConnPolicy's
+    // inclusion). g_connPolicy.onConnect() forces Session immediately and
+    // starts the Idle holdoff clock -- see its doc comment for why that must
+    // happen here rather than through the ordinary session-state path.
     noteBleActivity();
-    requestConnParams(ConnProfile::Session);
+    applyConnPolicyRequest(g_connPolicy.onConnect(millis()));
     // 2M PHY halves on-air time per packet versus the 1M PHY default. Purely
     // a request -- the central (iOS) grants or ignores it, same as
     // updateConnParams above -- and iOS decides silently, so onPhyUpdate()
@@ -1715,9 +1491,9 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     }
   }
   void onConnParamsUpdate(NimBLEConnInfo& connInfo) override {
-    // Confirms what the central actually granted -- requestConnParams() above
-    // only logs what was asked for; a peripheral request can be silently
-    // ignored, leaving the previous interval in place.
+    // Confirms what the central actually granted -- the request side only
+    // logs what was asked for; a peripheral request can be silently ignored,
+    // leaving the previous interval in place.
     g_lastConnIntervalMs = connInfo.getConnInterval() * 1.25f;
     g_lastConnLatency = connInfo.getConnLatency();
     g_lastConnTimeoutMs = connInfo.getConnTimeout() * 10;
@@ -1728,31 +1504,21 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // central never honours leaves the firmware streaming Write-Without-Response
     // chunks into a link it wrongly believes is on the 15 ms busy profile.
     //
-    // Deliberately only RECORDS the mismatch here rather than logging it. The
-    // first update event of a connection carries the parameters the *central*
-    // chose when it established the link, which naturally differ from a request
-    // we sent microseconds earlier and that nothing has answered yet. Measured
-    // on hardware 2026-08-03 against a bleak/CoreBluetooth central: request at
-    // t=+1ms for 15ms/0/6s, first update at t=+300ms reporting the central's own
-    // 30ms/0/720ms, then the next request granted exactly. Logging on every
-    // update turned that normal opening handshake into an ERR line on every
-    // single connection -- loud enough that the e2e harness had to allowlist the
-    // string, which is precisely how a diagnostic stops being read.
+    // g_connPolicy.onGrant() only RECORDS the match here rather than logging
+    // it. The first update event of a connection carries the parameters the
+    // *central* chose when it established the link, which naturally differ
+    // from a request we sent microseconds earlier and that nothing has
+    // answered yet. Measured on hardware 2026-08-03 against a
+    // bleak/CoreBluetooth central: request at t=+1ms for 15ms/0/6s, first
+    // update at t=+300ms reporting the central's own 30ms/0/720ms, then the
+    // next request granted exactly. Logging on every update turned that
+    // normal opening handshake into an ERR line on every single connection --
+    // loud enough that the e2e harness had to allowlist the string, which is
+    // precisely how a diagnostic stops being read.
     //
-    // tick() does the actual reporting once the request has had time to land.
-    g_connParamsMatchedRequest =
-        (g_reqIntervalUnits == 0 ||
-         (connInfo.getConnInterval() >= g_reqIntervalUnits && connInfo.getConnInterval() <= g_reqIntervalMaxUnits &&
-          connInfo.getConnLatency() == g_reqLatency && connInfo.getConnTimeout() == g_reqTimeoutUnits));
-    // The link only counts as being in a profile once the central says so. An
-    // update that does not match what we asked for is either the central's own
-    // opening parameters or a request of ours it declined -- in both cases the
-    // procedure is done, so stop treating ours as outstanding and let
-    // pumpConnParams() decide whether to ask again.
-    if (g_connParamsMatchedRequest) {
-      g_connProfile = g_requestedProfile;
-      g_connParamsInFlight = false;
-    }
+    // tick() does the actual reporting once the request has had time to land
+    // (g_connPolicy.divergenceDue()).
+    g_connPolicy.onGrant(connInfo.getConnInterval(), connInfo.getConnLatency(), connInfo.getConnTimeout(), millis());
     g_lastGrantedIntervalUnits = connInfo.getConnInterval();
     g_lastGrantedLatency = connInfo.getConnLatency();
     g_lastGrantedTimeoutUnits = connInfo.getConnTimeout();
@@ -1772,15 +1538,9 @@ class ServerCallbacks : public NimBLEServerCallbacks {
             static_cast<unsigned long>(connUptimeMs()), static_cast<unsigned>(reason), disconnectReasonName(reason),
             g_activeField);
     g_connectMs = 0;
-    g_reqIntervalUnits = 0;
-    g_reqIntervalMaxUnits = 0;
-    // The next connect gets a fresh onConnect() -> requestConnParamsForSessionState()
-    // edge; reset to Idle (the no-session state a fresh connection begins in)
-    // so a stale "already there" doesn't suppress that request.
-    g_connProfile = ConnProfile::Idle;
-    g_desiredProfile = ConnProfile::Idle;
-    g_requestedProfile = ConnProfile::Idle;
-    g_connParamsInFlight = false;
+    // The next connect gets a fresh onConnect() edge; see
+    // CompanionConnPolicy::onDisconnect()'s doc comment.
+    g_connPolicy.onDisconnect();
     resetReassembly();
     // Sessions do not survive the link. The token does — that is what makes the
     // next connect silent.
@@ -1976,27 +1736,28 @@ void tick() {
   // been requested. This is both the initial request on a state change (a
   // session claiming/losing the foreground) and the retry point for one that
   // was deferred behind another procedure or went unanswered -- cheap and
-  // idempotent, since requestConnParams()/pumpConnParams() no-op once the
-  // link is already at (or already pursuing) the desired profile. There is
-  // no timer here any more: no periodic idle-relax step, and no per-write or
-  // per-notify tightening -- see the comment above the ConnProfile constants
-  // for why the interval no longer needs to move at all.
-  requestConnParamsForSessionState();
+  // idempotent, since CompanionConnPolicy::step() no-ops once the link is
+  // already at (or already pursuing) the desired profile. There is no timer
+  // here any more: no periodic idle-relax step, and no per-write or
+  // per-notify tightening -- see CompanionConnPolicy.h for why the interval
+  // no longer needs to move at all.
+  syncConnPolicyForegroundState();
+  applyConnPolicyRequest(g_connPolicy.step(millis()));
 
   // DIAGNOSTIC: report a parameter request the central never honoured, once per
   // request, and only after it has had kConnParamsGraceMs to land. Checking here
   // rather than in onConnParamsUpdate() is the whole point: the opening update
   // of a connection reports the central's own chosen parameters, not a reply to
   // us, and flagging that produced an ERR line on every single connection.
-  if (!g_connParamsMatchedRequest && !g_connParamsDivergenceLogged && g_reqIntervalUnits != 0 &&
-      g_connParamsRequestedMs != 0 && millis() - g_connParamsRequestedMs > kConnParamsGraceMs) {
-    g_connParamsDivergenceLogged = true;
+  if (g_connPolicy.divergenceDue(millis())) {
     LOG_ERR("CBLE",
             "conn params NOT honoured after %lums: asked interval=%u-%u latency=%u timeout=%u, link is interval=%u "
             "latency=%u timeout=%u (units: 1.25ms / events / 10ms)",
-            static_cast<unsigned long>(kConnParamsGraceMs), static_cast<unsigned>(g_reqIntervalUnits),
-            static_cast<unsigned>(g_reqIntervalMaxUnits), static_cast<unsigned>(g_reqLatency),
-            static_cast<unsigned>(g_reqTimeoutUnits),
+            static_cast<unsigned long>(CompanionConnPolicy::kConnParamsGraceMs),
+            static_cast<unsigned>(g_connPolicy.requestedIntervalUnits()),
+            static_cast<unsigned>(g_connPolicy.requestedIntervalMaxUnits()),
+            static_cast<unsigned>(g_connPolicy.requestedLatencyUnits()),
+            static_cast<unsigned>(g_connPolicy.requestedTimeoutUnits()),
             static_cast<unsigned>(g_lastGrantedIntervalUnits), static_cast<unsigned>(g_lastGrantedLatency),
             static_cast<unsigned>(g_lastGrantedTimeoutUnits));
   }
