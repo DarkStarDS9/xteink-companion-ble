@@ -78,11 +78,15 @@ implements it, never after.
 > and the answer is worth carrying because it is a trap any peripheral can fall
 > into.
 >
-> `onConnect()` sent an `LL_LENGTH_REQ` (`NimBLEServer::setDataLen`) that iOS
-> never answered, and the Core Spec's **LL procedure response timeout of 40 s**
-> then dropped the link with **HCI `0x22`**. Every such disconnect ever captured
-> landed at **39992-39998 ms** into the connection — a spec constant, not radio
-> conditions. It also starved the two procedures fired alongside it: with it gone
+> `onConnect()` sent an `LL_LENGTH_REQ` (`NimBLEServer::setDataLen`) that on the
+> affected connections went unanswered, and the Core Spec's **LL procedure
+> response timeout of 40 s** then dropped the link with **HCI `0x22`**. Every
+> such disconnect ever captured landed at **39992-40001 ms** into the
+> connection — a spec constant, not radio conditions. (A 2026-08-06 sniffer
+> capture shows iOS *completing* `LL_LENGTH_REQ → RSP` on a calm connection, so
+> "iOS never answers" is too strong — the operative failure is the collision:
+> the request raced the conn-param and PHY procedures fired alongside it and
+> the central's own setup exchange, and a collided procedure expires at TPRT.) It also starved the two procedures fired alongside it: with it gone
 > the PHY reaches 2M and the opening conn-param request is granted verbatim,
 > neither of which used to happen.
 >
@@ -91,9 +95,11 @@ implements it, never after.
 > is still running its own setup exchange — is the wrong place to start one.
 > Data Length Extension is now requested **nowhere at all**. A controller-default
 > request in `ensureStarted()` was tried as a supposedly safe way to keep the
-> capability and brought the disconnect straight back on iOS: this central does
-> not complete a Data Length Update whoever starts it, so any DLE procedure on
-> the link expires the same 40 s timer. Note that a macOS harness cannot show
+> capability and brought the disconnect straight back on iOS: however the DLE
+> procedure gets started around connection setup, it lands in the same crowded
+> window and dies the same way, so any DLE on this link is treated as unsafe
+> until a *serialized* variant — one procedure at a time, well after connect
+> settles — survives a harness soak. Note that a macOS harness cannot show
 > this -- macOS self-negotiates DLE, so it neither benefits nor fails. Anything added to `onConnect()` in future
 > needs checking against that rule; `updatePhy()` is still there and is already
 > one procedure more than is comfortable.
