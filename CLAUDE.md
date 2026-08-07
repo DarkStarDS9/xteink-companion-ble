@@ -62,6 +62,26 @@ the wire format. Consumer apps depend on it.
 - The boot path in `src/main.cpp` is the one deliberate divergence and conflicts on most syncs.
   Keep the companion side.
 
+## Delegate research and implementation to subagents
+
+**If you are an Opus- or Fable-class model, hand research and implementation to subagents by
+default.** Do not read a pile of source files, run a long web-search sweep, or write a multi-file
+change directly in the main thread. Spawn agents for it and keep the main context for deciding,
+reviewing their diffs, and talking to the user.
+
+Why this is a rule and not a preference: the main thread is the only place that holds the thread of
+the argument — what has been measured, what was disproved, what the user actually asked for. Fill it
+with file contents and search results and that thread is what gets summarised away first. A session
+that has read everything itself ends up **less** able to reason about the whole than one that
+delegated and kept its own context for the reasoning.
+
+- Give each agent a narrow question and the constraints, including what it must **not** touch.
+- Require file:line citations, and confidence labels on research claims.
+- **Review the diff yourself.** A subagent's summary is a claim, not evidence — agents in this repo
+  have reported "done" on changes that were subtly wrong, and the review is the whole point of
+  staying out of the weeds.
+- Sonnet-class models running as the main thread may work directly; the tradeoff is different.
+
 ## Agent worktrees
 
 Work done in a `.claude/worktrees/*` checkout lives on a throwaway `worktree-*` branch. It is not
