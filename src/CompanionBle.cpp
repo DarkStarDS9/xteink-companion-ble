@@ -1654,23 +1654,14 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // below is the only way to know what actually landed.
     if (server) {
       server->updatePhy(connInfo.getConnHandle(), BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK, 0);
-      // Without this, the link layer stays on the legacy default data
-      // length (27-byte payload), regardless of the ~522-byte ATT MTU this
-      // firmware now accepts (see kMaxImageChunkPayload). A large ATT write
-      // still has to go out, but gets fragmented into far more over-the-air
-      // LL Data PDUs than necessary -- observed on hardware turning a
-      // single ~510-byte image CHUNK write into a ~250ms round trip despite
-      // an 8x tighter (30ms) connection interval, because most of that time
-      // is spent re-fragmenting one write across many connection events
-      // instead of sending it in one or two. 251 is BLE 4.2+'s max useful
-      // payload (BLE_GAP_MAX_TXOCTETS below) -- matches the write chunk size
-      // far better than the legacy default. Purely a request like the PHY
-      // and conn-param ones above; there is no NimBLE server-role callback
-      // to confirm what a given central actually grants. 251 is the
-      // Bluetooth Core Spec's own max TX octets for Data Length Extension
-      // (not a NimBLE-specific constant, since this build doesn't expose
-      // one).
-      server->setDataLen(connInfo.getConnHandle(), 251);
+      // Deliberately no Data Length Extension request here. Requesting it
+      // made every affected connection die at exactly TPRT (40 s) with HCI
+      // 0x22: LL_LENGTH_REQ can complete fine on a calm connection, but
+      // racing it against the conn-param and PHY requests fired above
+      // sometimes collides, and a collided LL procedure times out at exactly
+      // 40 s. The road back, if image throughput ever demands it, is a
+      // serialized request well after connect settles, proven by a harness
+      // soak -- never a re-add here.
     }
   }
   void onConnParamsUpdate(NimBLEConnInfo& connInfo) override {
