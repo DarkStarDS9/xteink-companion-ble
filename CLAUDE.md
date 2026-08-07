@@ -75,6 +75,29 @@ work's history.
   macOS TCC quirk, not a code bug. Run the harness from a plain terminal, or drive it as a launched
   process outside the multiplexer. Serial over USB is unaffected.
 
+## Every fix starts red
+
+Every bug fix starts with a failing test at the lowest level that can express it, not the highest
+one that happens to be handy. Prefer, in order:
+
+1. **Host unit test** (`test/`, seconds, no hardware) — if the seam exists. `CompanionBatchModel` and
+   `CompanionConnPolicy` were extracted out of hardware-only code on purpose so the batch state
+   machine and the conn-param profile policy — the two areas that have regressed the most — live
+   here now. If you are touching either, the seam already exists; use it.
+2. **Harness assertion** (`scripts/companion_e2e_test.py` and friends) — when the bug is protocol or
+   timing behaviour a host unit test cannot express, per "The phone is not a test harness" above.
+
+A fix that lands without a new or updated test states its reason in the commit message — "no seam
+yet" is not a reason, "this is a rendering/layout change with no host seam" is.
+
+A policy change over an already-verified mechanism (conn-param profiles, batch timing) needs its own
+measurement before landing, not just a plausible story — see the 2026-08-06 and 2026-08-07 git
+history for what shipping on a plausible story alone has cost here twice already.
+
+`scripts/run_companion_tests.sh` is the loop: run it, watch it fail red, fix, watch it go green.
+Plain terminal for anything BLE (see the tmux note above), and the serial port must be free before
+flashing — close any open monitor first.
+
 ## Upstream relationship
 
 - **`companion`** is the trunk and default branch. **`develop`** is a pristine mirror of
