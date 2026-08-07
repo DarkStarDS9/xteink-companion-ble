@@ -132,6 +132,26 @@ section.
   https://github.com/DarkStarDS9/CompanionKit (tag `11.0.0`); both consumer apps now depend on it
   via SPM instead of a vendored copy under `clients/swift/CompanionKit`.
 
+### The 01AXp4 line's independent read of the same morning (landed from `60456d44`)
+
+The parallel worktree session analyzed `reader_serial7.log` on its own at 13:31 and produced the
+cleanest summary table of the optimization arc — kept here because it is the before/after record in
+one place:
+
+| | Old ladder | Latency-10 regression | Latency-0 + holdoff |
+|---|---|---|---|
+| Title / body wire time | 298–598 ms | 360–690 ms | **30 / 31 ms** |
+| Batch commit | 634 ms median | 2916 ms median | **242 ms** |
+| Parameter negotiations | 2–3 per article | flapping | **1 per connection** |
+| Safety-net fires | occasional | 4 of 11 | **0** |
+
+It also recorded a 2.1-hour connection ending in a clean `0x13`, and the boot-time `0x22` at
+40.001 s whose parameter negotiation the logger missed — and concluded, correctly on its evidence,
+that the `0x22`'s "cause is still unidentified." **Superseded the same afternoon:** that build still
+fired the DLE request in `onConnect` (`setDataLen` was only removed on trunk, `ca5e518a`), and the
+host A/B above identified the cause and proved the fix. The entry stands as written because reaching
+a weaker conclusion from a narrower window is exactly what the doc's ethos says to preserve.
+
 ---
 
 ## Equipment
