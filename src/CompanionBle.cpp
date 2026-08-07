@@ -424,8 +424,35 @@ uint8_t g_foreground = kNoSession;
 // couple of real updateConnParams() calls per connection, never one per
 // article -- see the comment above the ConnProfile constants for why that
 // matters.
+// How long the link must go with nobody holding the screen before it drops to
+// Idle's deep latency. Not a power tuning knob -- it exists because "has a
+// foreground session" is false for the first couple of seconds of *every*
+// connection, while the v6 handshake is still running, and briefly whenever an
+// app hands the screen over. Measured 2026-08-07 without it: every connection
+// went Session (at connect) -> Idle (+563 ms, handshake not finished yet) ->
+// Session (+2316 ms), and because a duplicate grant confused the match check
+// the link then sat at Idle's 930 ms effective interval until +6552 ms -- right
+// through the first pushes. Median batch commit went 634 ms -> 2916 ms, i.e.
+// most pushes hit the 3 s batch safety net. Idle is worth having, but only for
+// a link that is genuinely unattended, never for one mid-handshake.
+constexpr uint32_t kIdleHoldoffMs = 10000;
+
+// millis() since nobody has held the screen; 0 while some session does. Set at
+// connect so a fresh connection starts the holdoff rather than counting as
+// long-unattended from the first tick().
+uint32_t g_noForegroundSinceMs = 0;
+
 void requestConnParamsForSessionState() {
-  requestConnParams(g_foreground != kNoSession ? ConnProfile::Session : ConnProfile::Idle);
+  if (g_foreground != kNoSession) {
+    g_noForegroundSinceMs = 0;
+    requestConnParams(ConnProfile::Session);
+    return;
+  }
+  if (g_noForegroundSinceMs == 0) g_noForegroundSinceMs = millis();
+  // Stay on Session through the handshake window and any brief handover; only a
+  // sustained absence earns Idle.
+  const bool unattended = millis() - g_noForegroundSinceMs >= kIdleHoldoffMs;
+  requestConnParams(unattended ? ConnProfile::Idle : ConnProfile::Session);
 }
 
 // Pending on-screen pairing prompt. Exactly one at a time — a second prompt
@@ -1633,6 +1660,10 @@ const char* disconnectReasonName(int reason) {
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
     g_connectMs = millis();
+    // Start the Idle holdoff now, so tick()'s first call during the handshake
+    // -- when no session holds the screen yet -- does not immediately undo the
+    // Session request below (see kIdleHoldoffMs).
+    g_noForegroundSinceMs = millis();
     LOG_DBG("CBLE", "central connected");
     // Negotiate the connection params once, right here, rather than waiting
     // for tick()'s next call to notice -- "negotiate once per connection,
