@@ -726,7 +726,18 @@ async def ensure_declared_foreground(
     if console.state().get("foreground") == str(session.session_id):
         return True
     outcome = await session.acquire()
-    return results.check(f"{label}: holds the screen", outcome[0] == "foreground", str(outcome))
+    if not results.check(f"{label}: holds the screen", outcome[0] == "foreground", str(outcome)):
+        return False
+    # applyForegroundChange() runs on the main loop task, not the BLE host task
+    # that just answered ACQUIRE (docs/companion-declared-shape-design.md §7),
+    # and it unconditionally clears content on a handoff -- so the screen the
+    # caller is about to snapshot as "before" is briefly still whatever the
+    # previous foreground peer left on it. Same race await_screen() exists for
+    # elsewhere: settle to the post-handoff state before returning, or a caller
+    # comparing screen-before/screen-after would be comparing against a stale
+    # read rather than the state its own push actually ran against.
+    console.await_screen("waiting_app")
+    return True
 
 
 async def no_render_status_arrives(link: Link, marker: int, window: float) -> list:
@@ -1416,10 +1427,16 @@ async def run_tests(args, console: Console, results: Results) -> None:
                             (RENDER_REJECTED_SHAPE, image_to_text_id) in session_a.render_statuses,
                             str(session_a.render_statuses),
                         )
+                    # One live read, reused for both the comparison and the
+                    # message -- see the equivalent comment on the text-batch
+                    # case below for why two separate console.state() calls
+                    # here would risk comparing against one value while
+                    # printing another.
+                    screen_after = console.state().get("screen")
                     results.check(
                         "a refused image left the screen as it was",
-                        console.state().get("screen") == screen_before,
-                        f"screen went {screen_before!r} -> {console.state().get('screen')!r}",
+                        screen_after == screen_before,
+                        f"screen went {screen_before!r} -> {screen_after!r}",
                     )
 
                 # --- a text batch pushed to an IMAGE peer -------------------- #
@@ -1470,10 +1487,16 @@ async def run_tests(args, console: Console, results: Results) -> None:
                         f"{len(answers)} RENDER_STATUS for one batch: "
                         f"{[(RENDER_RESULTS.get(n.result, n.result), n.push_id) for n in answers]}",
                     )
+                    # One live read, reused for both the comparison and the
+                    # message -- console.state() is a real serial round trip, so
+                    # two separate calls here can straddle a transient and the
+                    # message would then show two coincidentally-equal values
+                    # while describing a comparison that actually saw neither.
+                    screen_after = console.state().get("screen")
                     results.check(
                         "a refused text batch left the screen as it was",
-                        console.state().get("screen") == screen_before,
-                        f"screen went {screen_before!r} -> {console.state().get('screen')!r}",
+                        screen_after == screen_before,
+                        f"screen went {screen_before!r} -> {screen_after!r}",
                     )
 
                     # --- tag state is an overlay, so an IMAGE peer may push it -- #
@@ -1617,10 +1640,15 @@ async def run_tests(args, console: Console, results: Results) -> None:
                     )
 
                 # The device is expected to say, out loud, that it refused
-                # something -- three times over. The exact wording belongs to the
-                # firmware, so only the word it must contain is exempted, and
-                # only for this section.
-                check_no_errors(console, results, "shape", allowed=("shape",))
+                # something -- four times over: three field-push refusals
+                # (CompanionBle.cpp:1203, "field 0x.. rejected: peer declared
+                # shape 0x..") and the NO_SHAPE_DECL store-time refusal
+                # (CompanionBle.cpp:1115, "asset 0x05 rejected (4)" -- storeAsset()
+                # logs by numeric AssetStoreResult, not by name, and does not
+                # mention "shape" at all). The exact wording belongs to the
+                # firmware, so only what each log line is known to contain is
+                # exempted, and only for this section.
+                check_no_errors(console, results, "shape", allowed=("shape", "asset 0x05 rejected"))
 
 
 # --------------------------------------------------------------------------- #
