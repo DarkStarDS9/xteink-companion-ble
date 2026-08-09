@@ -1,0 +1,187 @@
+# ToDo List Mode — Design Sketch
+
+**STATUS: sketch, not adopted.** Nothing here is wire-final. Written to be picked up as a phase A
+implementation plan once reviewed, in the style of `docs/companion-multi-app-design.md`, which this
+builds directly on top of rather than beside.
+
+Primary use case: shopping lists. Sync from the phone, then walk the store with just the reader,
+checking items off with no phone in hand, and have the check-offs land back on the phone next time
+it's nearby.
+
+---
+
+## 1. What this is, precisely
+
+Not a new top-level firmware mode. `main.cpp` boots straight into `CompanionModeActivity`
+(root `CLAUDE.md`), and v6+ already generalized that activity to render whatever shape of content
+the foreground peer declares — title/body, or a photo. ToDo List is a third shape: a new
+`Screen::List` alongside `Screen::Text` / `Screen::Image`
+(`src/activities/companion/CompanionModeActivity.h:26-35`), reached by a peer that declares a new UI
+capability bit, using the session/peer/asset-digest machinery §3–§7 of the multi-app design already
+built — not a parallel mechanism.
+
+The one real departure from that design's principle: today the device never mutates app data, only
+forwards raw button events or does closed, on-device-only screen actions (`LocalPagePrev`,
+`LocalSleep`). Checking an item off *is* a data mutation, and it has to survive with no phone
+present, or "walk around the store with just the reader" doesn't work. §5 below is why that's an
+acceptable, bounded exception rather than a crack in "dumb firmware, smart phone": the device still
+never merges or decides anything, it only accumulates a diff and hands it back verbatim.
+
+## 2. Data model
+
+- **Document** = every list for one peer, pushed and replaced as a single unit (see §4 — user
+  preference: sync all lists at once, not per-list, given how small this data is).
+- **List** = `{ listId, title, items[] }`.
+- **Group** (user-confirmed as real, not YAGNI: most todo apps group items) = `{ groupId, label }`,
+  referenced by id from an item — not a nesting structure. A list is a flat item array; groups are a
+  label items point at, same shape as `docs/companion-multi-app-design.md`'s tags being labels a
+  content push points at rather than an owned hierarchy. This is deliberate: nested structures cost a
+  recursive parser on a part with 380 KB of RAM, and "flat list + group label per item, rendered as
+  a divider when the label changes" is enough for a shopping list and does not foreclose a deeper
+  model later if it turns out to be needed.
+- **Item** = `{ itemId, groupId (0 = ungrouped), text, checked }`.
+- Ids (`listId`, `groupId`, `itemId`) are **device-opaque**, assigned and owned by the phone, same
+  rule as `appId`/`installId`/content-id everywhere else in this protocol: the firmware compares them
+  for equality and echoes them back, never generates or interprets them.
+
+## 3. Storage layout
+
+Extends `CompanionPeerStore`'s existing per-peer directory
+(`src/CompanionPeerStore.h:19-27`), same pattern as `buttons.bin`/`icon.bin`:
+
+```
+peers/<peerKey>/
+  lists.bin        the wire asset: revision (u32) + serialized document, exactly as pushed
+  list_state.bin   local diff: { revision it was taken against, itemId -> checked } for items the
+                   device has toggled since lists.bin's own revision was pushed
+```
+
+`lists.bin` is the phone's last-known-good truth, stored verbatim like every other asset here
+(§ comment at `src/CompanionPeerStore.h:34-37` — "assets are stored as the exact bytes the phone
+pushed... rather than re-encoded", no parser, no `JsonDocument`). `list_state.bin` is the only truly
+new kind of file this feature needs: everywhere else on-device, SD storage is a cache of something
+the phone already knows; this one is source-of-truth data that did not come from the phone yet.
+
+## 4. Wire format
+
+- **New field `kFieldListDoc = 0x08`** (next free per `src/CompanionBle.h:209`). Pushed as a whole
+  document — no incremental add/remove-item ops, matching how `kFieldUiDeclaration` and the icon are
+  always full replaces. Framed and reassembled like title/body (`kFieldTitle`/`kFieldBody`), not
+  streamed straight to SD like `kFieldImage`: list text is small (a big shopping list is a few KB,
+  nowhere near a raw 132×792 image), so RAM reassembly under a new cap — e.g.
+  `kMaxListDocLen = 16 * 1024`, a `CompanionBle.h` constant next to `kMaxFieldLen` — followed by one
+  write to `lists.bin`, mirrors what already happens for the UI declaration
+  (`kMaxUiDeclarationLen = 512` at `src/CompanionPeerStore.h:107`) just at a larger size.
+- **Document carries a `revision : u32`**, monotonically increasing, assigned by the phone on every
+  push. This is what makes "sync all lists together" (§6) coherent: one number describes the whole
+  document's freshness, not one per list.
+- **New UI capability bit**, alongside `kUiCapabilityImageGallery`
+  (`src/CompanionBle.h:189`) — call it `kUiCapabilityTodoList`. A peer that sets it gets an entry
+  point analogous to the gallery picker (§8 of the multi-app design): CONFIRM on its sleep-screen
+  icon enters `Screen::List` over that peer's stored document, exactly the same "local SD browse of
+  content the app already pushed" shape already argued as not-a-launcher for the gallery picker.
+- **New Session-characteristic notify, `LIST_STATE`**, sent once on `HELLO_OK`/`FOREGROUND` for a
+  `kUiCapabilityTodoList` peer, before the peer pushes anything: `{ revision, count, count ×
+  { itemId, checked } }` — the device's current `list_state.bin` diff against whatever revision it
+  has. This is the asset-digest pattern (§5 of the multi-app design: "device reports opaque state,
+  app decides what's stale, app pushes") applied to list state instead of an asset tag. The device
+  never decides whether its diff is stale or how to merge it; the phone does, then re-pushes a new
+  `kFieldListDoc` at a new revision, which the device stores wholesale and against which it clears
+  `list_state.bin`.
+
+All additive — no framing change to an existing op, no length change to an existing notification —
+so, following the pattern already used for `ASSET_ACK`/`IMAGE_STATUS`, this should not need the kind
+of breaking cutover v6 was. Still needs a version bump to advertise the new capability bit and field
+in the capability characteristic, but old clients that never set `kUiCapabilityTodoList` see none of
+this.
+
+## 5. On-device UX
+
+- `Screen::List` added to `src/activities/companion/CompanionModeActivity.h:26-35`.
+- Navigation, entirely local, no protocol surface — same "screen-local, no BLE notification" class as
+  the existing gallery Up/Down paging (`src/activities/companion/CompanionModeActivity.cpp:792`
+  onward) and local text pagination:
+  - Up/Down: move item cursor, paging the visible window when it runs off-screen.
+  - Left/Right: switch between lists within the document.
+  - Confirm: toggle checked on the item under cursor.
+  - Back: leave `Screen::List`, back to the icon grid.
+- A toggle writes through to `list_state.bin` immediately (small, infrequent writes — nothing like
+  the per-CHUNK write rate of an image push). Rendering redraws just the toggled row's checkbox glyph
+  where the panel's partial-refresh path allows it, full list redraw otherwise — a rendering detail,
+  not a protocol one.
+- This is the one place a button's meaning isn't declared by the peer's `ButtonRouting` map (§7 of
+  the multi-app design) — it's implicit in being on `Screen::List`, the same way gallery Up/Down and
+  text pagination are already implicit in their screens rather than routed. No new `ButtonRouting`
+  enum value needed.
+
+## 6. Sync model
+
+User-confirmed: sync the whole document together, not list-by-list. This simplifies what was an open
+question into: **one revision number for the entire document**, not one per list. Consequences:
+
+- The phone always pushes every list in one `kFieldListDoc`, even to change one item on one list.
+  Fine at this size — the whole point of confirming this now is that a few KB of shopping-list text
+  makes per-list revisioning not worth its bookkeeping.
+- `LIST_STATE`'s diff is likewise one flat `itemId -> checked` map across every list in the document,
+  since `itemId` is already globally opaque and unique within a peer's document, not scoped to a
+  list.
+- Failure mode this accepts: two lists edited offline in the same session and reconciled together is
+  fine (last-write-wins per item, phone's call); two *different devices* offline-editing the same
+  peer's lists at once is out of scope — same single-peer, single-device assumption the rest of this
+  protocol already makes (one BLE link, one foreground session).
+
+## 7. CompanionKit surface (first-class, per direction)
+
+Sibling repo, same versioning discipline as everything else there (package major = protocol
+version). New first-class Swift types, not opaque-bytes round-tripping:
+
+- `TodoList { listId, title, items: [TodoItem] }`, `TodoGroup { groupId, label }`,
+  `TodoItem { itemId, groupId, text, checked }`.
+- `TodoDocument { revision, lists: [TodoList], groups: [TodoGroup] }` — the `kFieldListDoc` codec,
+  alongside `UiDeclaration.swift`/`ContentFramer.swift`'s existing pattern.
+- `CompanionClient` gains an event for the `LIST_STATE` notify (mirrors how asset digests already
+  surface) and a `pushTodoDocument(_:)` call. The merge logic — combining the device's reported diff
+  with the app's own edits into a new revision — lives here, in the app-facing package, per "the
+  device never merges" in §4/§6.
+
+## 8. Memory
+
+| Item | Where it lives | Cost |
+|---|---|---|
+| Document (`lists.bin`) | SD | 0 RAM |
+| Local diff (`list_state.bin`) | SD | 0 RAM |
+| In-flight document reassembly | RAM, foreground peer only, freed after write to SD | ≤ `kMaxListDocLen` (proposed 16 KB), transient |
+| List/cursor nav state | RAM, foreground peer only | comparable to the ~200 B gallery nav state (§11 of the multi-app design) |
+
+The reassembly buffer is the only new steady-state-adjacent cost, and it is not steady-state — it is
+held only for the duration of one push, same lifetime as the existing title/body reassembly buffer,
+just larger. Net new *resident* RAM is well under 1 KB, matching the multi-app design's own budget
+outcome.
+
+## 9. Open questions
+
+1. **Reassembly cap size.** 16 KB is a guess pending a sense of how big a real shopping list plus a
+   week's meal-plan list plus whatever else gets stress-tested actually is. Needs a number before
+   this ships, not a round one picked in advance.
+2. **Partial-refresh on toggle.** Whether the panel's grayscale settle path supports single-row
+   redraw cheaply enough to make per-toggle feel instant, or whether toggling several items in a row
+   needs to coalesce into one redraw the way batched content pushes already do
+   (`kFinalFieldFlag`). Rendering-layer question, not a protocol one — doesn't block the wire design.
+3. **Group ordering.** Groups are referenced by id from items (§2); does render order follow first
+   appearance in the item array, or does the document carry an explicit group order separate from
+   item order? Affects the wire format's group table, worth deciding before implementation.
+
+## 10. Sequencing
+
+- **A — Wire + storage + `Screen::List` rendering + read-only sync.** §2–§4, §8. Gets a pushed
+  document on screen, paginated, no offline checking yet. Provable with the existing host-harness
+  discipline (`scripts/companion_e2e_test.py`) since it's push-and-render, same shape as text/image
+  pushes today.
+- **B — Offline checking + `LIST_STATE` sync-back.** §5–§6. The genuinely new mechanism. Needs its
+  own host-harness coverage for the round trip (push document → simulate local toggle by writing
+  `list_state.bin` directly in a test build → reconnect → assert `LIST_STATE` reports it), per this
+  repo's "every fix starts red" / no-phone-as-test-harness rules — this is protocol and firmware
+  timing behavior, not something that needs a phone to prove.
+- **C — CompanionKit surface.** §7. Can start once A's wire format is stable; does not need B to land
+  first, since the merge logic it owns is exercised by the harness fake in B, not required to be a
+  real iOS app for either A or B to be provable.
