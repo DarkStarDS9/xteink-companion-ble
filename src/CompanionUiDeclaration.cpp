@@ -88,7 +88,13 @@ bool fieldMatchesShape(uint8_t field, uint8_t declaredShape) {
       return field == companionble::kFieldTitle || field == companionble::kFieldBody ||
              field == companionble::kFieldContentId || field == companionble::kFieldTagState;
     case companionble::ContentShape::Image:
-      return field == companionble::kFieldImage;
+      // Tag state is an overlay, not content: a visible tag renders as a chip
+      // over the print, and a tag pushed *with* the image is drawn when the
+      // image is drawn (docs/companion-display-protocol.md, "Tags are drawn
+      // over an image"). Refusing 0x07 here would un-design that atomic
+      // image+tag push and reinstate the silent no-op that section says is
+      // gone, so the overlay field is permitted under both content shapes.
+      return field == companionble::kFieldImage || field == companionble::kFieldTagState;
     case companionble::ContentShape::List:
       // No list content field exists on the wire yet (see
       // docs/companion-todo-list-design.md), so a LIST peer pushing any content

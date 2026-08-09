@@ -1476,6 +1476,62 @@ async def run_tests(args, console: Console, results: Results) -> None:
                         f"screen went {screen_before!r} -> {console.state().get('screen')!r}",
                     )
 
+                    # --- tag state is an overlay, so an IMAGE peer may push it -- #
+                    #
+                    # The one content field both shapes permit. It is not content
+                    # -- it is a chip drawn over whatever is on screen -- so
+                    # refusing it here would either lose an IMAGE peer's tags or
+                    # force a second, non-atomic Status write. Standalone first,
+                    # because it is cheap and isolates "not refused" from "drawn
+                    # with the print".
+                    tag_only_id = 0x64
+                    marker = len(link.notifications)
+                    await session_b.push_field(
+                        FIELD_TAG_STATE, encode_tag_state([(0, 2)]), final=True, push_id=tag_only_id
+                    )
+                    refusals = [
+                        n
+                        for n in await no_render_status_arrives(link, marker, window=4.0)
+                        if n.session_id == session_b.session_id and n.result == RENDER_REJECTED_SHAPE
+                    ]
+                    results.check(
+                        "a tag state push from an IMAGE peer is not refused for its shape",
+                        not refusals,
+                        f"RejectedShape for pushId(s) {[n.push_id for n in refusals]} — 0x07 is an "
+                        "overlay and is legal under both TEXT and IMAGE",
+                    )
+                    results.check(
+                        "the IMAGE peer's tag actually landed on the device",
+                        console.tags().get(0) == "filled",
+                        str(console.tags()),
+                    )
+
+                    # ...and the case the exemption exists for: image + tag in
+                    # one atomic push, the tag drawn when the print is drawn.
+                    # A full transfer, because the tag has to survive to the
+                    # render -- a max_chunks shortcut would never get there.
+                    await session_b.push_field(FIELD_TAG_STATE, encode_tag_state([(1, 1)]))
+                    image_tag_id = 0x65
+                    verdict = await session_b.push_image(shape_raw, push_id=image_tag_id)
+                    results.check(
+                        "an IMAGE peer's image + tag batch is displayed, not refused",
+                        verdict == RENDER_DISPLAYED,
+                        f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                    )
+                    results.check(
+                        "the batched tag is set with the print on screen",
+                        console.state().get("screen") == "image"
+                        and console.tags().get(1) == "outline",
+                        f"{console.state()} {console.tags()}",
+                    )
+                    # There is no read-back for tag *rendering* by design (it is
+                    # pure drawing); CMD:SCREENSHOT is the visual check that the
+                    # chip is over the print rather than beside it.
+                    await session_b.push_field(
+                        FIELD_TAG_STATE, encode_tag_state([(0, 0), (1, 0)]), final=True
+                    )
+                    await asyncio.sleep(1.5)
+
                 # --- a declaration with no shape byte (i.e. any v11 client) --- #
                 #
                 # This needs a peer that has never stored a declaration, which is

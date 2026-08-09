@@ -554,8 +554,10 @@ RENDER_STATUS result     0x00 DISPLAYED
                                                 error -- see "Superseded pushes" below
                          0x06 REJECTED_SHAPE    the pushed field is not one this peer's declared
                                                 content shape permits (v12): an image from a TEXT
-                                                peer, a title/body/content-id/tag-state field from
-                                                an IMAGE peer, any content field from a LIST peer.
+                                                peer, a title/body/content-id field from an IMAGE
+                                                peer, any content field from a LIST peer. Tag state
+                                                (0x07) is an overlay and is permitted under both
+                                                TEXT and IMAGE.
                                                 Latched when the offending START arrives -- before
                                                 any buffer is allocated -- and answered at END, so
                                                 a whole batch of illegal fields is still answered
@@ -818,7 +820,7 @@ discarded on disconnect and on a foreground handover.
 | `0x04` | image | max image length (capability) | **streamed to SD**, never buffered in RAM | IMAGE |
 | `0x05` | UI declaration (shape + buttons + tags) | 512 bytes | SD (`ui.bin`) | *asset — never checked* |
 | `0x06` | icon | icon width x height / 8 bytes | SD (`icon.bin`) | *asset — never checked* |
-| `0x07` | tag state | 13 bytes | RAM (foreground only) | TEXT |
+| `0x07` | tag state | 13 bytes | RAM (foreground only) | TEXT + IMAGE |
 
 Next free: `0x08`.
 
@@ -826,7 +828,10 @@ The last column is v12's permitted-field table: a peer may push a content field
 only if its declared content shape matches, and anything else is answered
 `RENDER_STATUS(REJECTED_SHAPE)` — see "UI declaration field". The two asset
 fields are exempt by construction: pushing `0x05` is how a peer changes its
-shape in the first place. `LIST` peers have no permitted content field yet.
+shape in the first place. Tag state (`0x07`) is exempt in a different way: it is
+an overlay drawn *over* whatever content is on screen rather than content of its
+own, so both content shapes permit it. `LIST` peers have no permitted content
+field yet — not even `0x07`, since there is no list screen to overlay.
 
 Content past a field's cap is truncated (title/body/content-id) or rejected
 outright with `ASSET_ACK`/`RENDER_STATUS` (image, UI declaration, icon) — a
@@ -1096,8 +1101,9 @@ compression-dependent variance and no worst-case blowup risk.
 **Interaction with text (rewritten for v12).** An image push replaces the screen
 entirely — title, body and paging are not drawn while an image is displayed —
 and there is still no compositing of the two. What changed in v12 is *which peer
-may push what*: a peer that has declared `IMAGE` may push field `0x04` and
-nothing else, and a peer that has declared `TEXT` may not push an image at all.
+may push what*: a peer that has declared `IMAGE` may push field `0x04` (plus the
+overlay field `0x07`) and nothing else, and a peer that has declared `TEXT` may
+not push an image at all.
 Pushing a body after an image no longer "returns the screen to text"; from an
 `IMAGE` peer it is refused outright with `RENDER_STATUS` `REJECTED_SHAPE`, and
 from a `TEXT` peer the image was never accepted in the first place.
@@ -1128,24 +1134,21 @@ image is displayed redraws only the chips, over the retained image, with a
 differential refresh. It does not re-decode or re-settle — that would cost
 seconds for a mark that moved.
 
-**v12: an `IMAGE` peer sets tags over the Status characteristic, not field
-`0x07`.** The tag-state *field* belongs to the `TEXT` shape, so an `IMAGE` peer
-pushing `0x07` — alone or batched with the image — is refused
-`REJECTED_SHAPE`. The **Status characteristic** write (see "Status
-characteristic" below) is not a content-field push and is not shape-checked, so
-it remains available to a peer of any shape, and it is how an `IMAGE` peer
-switches a chip on. Everything above about chips over the print still holds;
-only the way an `IMAGE` peer sends the state changes. This is the one place
-where v12's field/shape table costs a client something concrete, and the
-alternative — permitting `0x07` under both shapes — was not taken, because it
-would make "which fields may this peer push" no longer answerable from the shape
-alone.
+**v12: tag state is an overlay, so field `0x07` is legal for an `IMAGE` peer
+too.** The shape table says what *content* a peer pushes, and a tag is not
+content — it is a chip drawn over whatever content is on screen. So `0x07` is
+exempt from the one-shape-one-field-kind rule and is permitted under both
+`TEXT` and `IMAGE`: an `IMAGE` peer may push image + tag state as a single
+atomic batch, exactly as a `TEXT` peer pushes title + body + tag state. (`LIST`
+still permits no content field at all, `0x07` included, because there is no list
+screen to overlay yet.) The **Status characteristic** write (see "Status
+characteristic" below) is not a content-field push and is not shape-checked
+either, so both routes stay open to a peer of any shape: use the field when the
+content is changing too, the Status write when only the chip is.
 
 **On timing, if you want a "finished developing" mark.** A tag pushed *with* the
 image is drawn when the image is drawn, which is the *start* of the grayscale
-settle, not the end — but see the note directly above: for an `IMAGE` peer that
-"pushed with the image" path is gone, and a Status write is the only way in.
-If you want a mark that means "this print has finished
+settle, not the end. If you want a mark that means "this print has finished
 resolving", set it with a standalone Status write after `RENDER_STATUS(DISPLAYED)`
 arrives — that notification is sent after the settle completes, and the redraw it
 triggers is the cheap chips-only one described above. The device will not infer
@@ -1182,9 +1185,12 @@ byte         capabilities bitmask       <- optional; absent means none set
 
 ```
 0x01  TEXT    may push title (0x01), body (0x02), content-id (0x03), tag state (0x07)
-0x02  IMAGE   may push image (0x04)
+0x02  IMAGE   may push image (0x04), tag state (0x07)
 0x03  LIST    a list document; no content field exists for it on the wire yet
 ```
+
+Tag state appears under both shapes on purpose: it is an overlay, not content —
+see "Tags are drawn over an image" above.
 
 A peer declares **one** shape and may push only the content fields belonging to
 it, for as long as that declaration stands. A field outside it is refused with
@@ -1609,8 +1615,9 @@ declared is ignored.
 
 **Not shape-checked (v12).** This is a Status-characteristic write, not a
 content-field push, so it is available to a peer of any declared content shape.
-That is deliberate and it is the only way an `IMAGE` peer sets a tag at all,
-since field `0x07` belongs to the `TEXT` shape — see "Image field" above.
+Field `0x07` is equally available to a `TEXT` or an `IMAGE` peer — tag state is
+an overlay and both shapes permit it (see "Image field" above) — so the choice
+between the two routes is about atomicity, not about shape.
 
 ## On-screen behaviour
 
@@ -1706,9 +1713,11 @@ growth would make `peers.json` unbounded, and it is parsed into RAM.
    the optional trailing bytes, and why it lives here rather than on `ACQUIRE`.
 2. **A peer may push only the content fields its declared shape permits.** TEXT:
    title (`0x01`), body (`0x02`), content-id (`0x03`), tag state (`0x07`).
-   IMAGE: image (`0x04`). LIST: nothing yet — no list content field exists on
-   the wire. The asset fields, declaration (`0x05`) and icon (`0x06`), are
-   **never** shape-checked.
+   IMAGE: image (`0x04`), tag state (`0x07`). LIST: nothing yet — no list
+   content field exists on the wire. Tag state is permitted under both shapes
+   because it is an overlay drawn over the content, not content itself. The
+   asset fields, declaration (`0x05`) and icon (`0x06`), are **never**
+   shape-checked.
 3. **New `RENDER_STATUS` result `0x06 REJECTED_SHAPE`.** Latched at the
    offending `START`, before any buffer is allocated, and answered at `END`.
    A whole batch of illegal fields is answered **exactly once**, on its
@@ -2138,9 +2147,10 @@ Images:
     is now accepted and renders.
 28b. With a tag visible, push an image and confirm the chip is drawn over the
     print; hide every tag, re-push, and confirm the print is untouched. **(v12)**
-    Set the tag with a **Status characteristic** write, not field `0x07`: an
-    `IMAGE` peer pushing `0x07` is refused `REJECTED_SHAPE`, while the Status
-    write is not shape-checked and still applies.
+    Do it both ways round: a **Status characteristic** write (not shape-checked)
+    and a field `0x07` push batched with the image (permitted, since tag state
+    is an overlay rather than content) — an `IMAGE` peer must be accepted on
+    both routes, with the batched one committing image and chip in one redraw.
 28c. **(v9)** Push an image over Write Without Response with correctly
     incrementing CHUNK sequence numbers: confirm `IMAGE_CHUNK_ACK` notifies
     roughly every 32 chunks and the transfer still ends in

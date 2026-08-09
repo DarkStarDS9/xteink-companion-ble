@@ -352,16 +352,27 @@ TEST(CompanionShapeEnforcement, TextPeerMayPushTheTextBatchFields) {
   EXPECT_TRUE(companionui::fieldMatchesShape(companionble::kFieldTagState, kText));
 }
 
+TEST(CompanionShapeEnforcement, TagStateIsAnOverlayPermittedUnderTextAndImage) {
+  // 0x07 is not content, it is a chip drawn over whatever content is on the
+  // screen, so it is exempt from the shape table's "one shape, one field kind"
+  // rule. An IMAGE peer must be able to push image + tag as one atomic batch;
+  // refusing the tag would either lose it or force a second, non-atomic write.
+  EXPECT_TRUE(companionui::fieldMatchesShape(companionble::kFieldTagState, kText));
+  EXPECT_TRUE(companionui::fieldMatchesShape(companionble::kFieldTagState, kImage));
+}
+
 TEST(CompanionShapeEnforcement, TextPeerMayNotPushAnImage) {
   EXPECT_FALSE(companionui::fieldMatchesShape(companionble::kFieldImage, kText));
 }
 
-TEST(CompanionShapeEnforcement, ImagePeerMayPushOnlyTheImageField) {
+TEST(CompanionShapeEnforcement, ImagePeerMayPushTheImageFieldAndNoTextField) {
   EXPECT_TRUE(companionui::fieldMatchesShape(companionble::kFieldImage, kImage));
   EXPECT_FALSE(companionui::fieldMatchesShape(companionble::kFieldTitle, kImage));
   EXPECT_FALSE(companionui::fieldMatchesShape(companionble::kFieldBody, kImage));
   EXPECT_FALSE(companionui::fieldMatchesShape(companionble::kFieldContentId, kImage));
-  EXPECT_FALSE(companionui::fieldMatchesShape(companionble::kFieldTagState, kImage));
+  // Tag state is the one field both shapes share; see
+  // TagStateIsAnOverlayPermittedUnderTextAndImage.
+  EXPECT_TRUE(companionui::fieldMatchesShape(companionble::kFieldTagState, kImage));
 }
 
 TEST(CompanionShapeEnforcement, ListPeerHasNoContentFieldYet) {

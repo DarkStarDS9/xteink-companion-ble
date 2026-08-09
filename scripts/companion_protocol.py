@@ -162,16 +162,20 @@ RENDER_RESULTS = {
 # --------------------------------------------------------------------------- #
 
 SHAPE_TEXT = 0x01  # title (0x01), body (0x02), content-id (0x03), tag-state (0x07)
-SHAPE_IMAGE = 0x02  # image (0x04)
+SHAPE_IMAGE = 0x02  # image (0x04), tag-state (0x07)
 SHAPE_LIST = 0x03  # todo-list document; no content field exists for it yet
 SHAPE_NAMES = {SHAPE_TEXT: "TEXT", SHAPE_IMAGE: "IMAGE", SHAPE_LIST: "LIST"}
 
 # Which content fields each shape permits. Asset fields (0x05 declaration,
 # 0x06 icon) are never shape-checked -- a peer of any shape declares itself and
-# supplies its icon.
+# supplies its icon. Tag state (0x07) is exempt in a different way: it is an
+# overlay drawn over whatever content is on screen, not content of its own, so
+# both TEXT and IMAGE permit it and an IMAGE peer can push image + tag as a
+# single atomic batch. LIST permits nothing yet, 0x07 included -- there is no
+# list screen to overlay.
 SHAPE_FIELDS = {
     SHAPE_TEXT: (FIELD_TITLE, FIELD_BODY, FIELD_CONTENT_ID, FIELD_TAG_STATE),
-    SHAPE_IMAGE: (FIELD_IMAGE,),
+    SHAPE_IMAGE: (FIELD_IMAGE, FIELD_TAG_STATE),
     SHAPE_LIST: (),
 }
 

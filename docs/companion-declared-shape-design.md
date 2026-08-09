@@ -1,9 +1,16 @@
 # Declared Content Shape — Design
 
-**STATUS: proposal, not implemented.** The authoritative wire contract remains
-`docs/companion-display-protocol.md` (v11), which today describes the **opposite** of this document.
-Nothing here is live until that doc is updated in the same commit as the firmware, per this repo's
-rule that the protocol doc is the product.
+**STATUS: §9 slice A is implemented in firmware, protocol doc and host harness; nothing has run on
+hardware.** The authoritative wire contract is `docs/companion-display-protocol.md`, now at v12 and
+describing the model below rather than the opposite of it. Landed: the mandatory shape byte, the
+ACQUIRE-time cache, the START-latch/END-answer refusal, `RejectedShape` and `RejectedNoShape`,
+version 12 and capability bit 4, host unit tests over the parse and the permitted-field table, and
+the harness's `[shape]` group. **Not** landed and not claimed: no part of this has been exercised
+against a real device — the harness cases are written but unexecuted — and slices B, C and D (the
+RAM savings, and the CompanionKit/consumer-app releases) are untouched.
+
+One deliberate amendment since this was written: **tag state (`0x07`) is permitted under both `TEXT`
+and `IMAGE`**, because it is an overlay rather than content — see §5.
 
 Prompted by `docs/companion-todo-list-design.md`: adding a third content shape exposed that the
 first two were never really "modes" at all.
@@ -67,7 +74,7 @@ stored document with no session in existence (`docs/companion-todo-list-design.m
 therefore has to know a peer's shape **while disconnected**. An `ACQUIRE`-time byte is per-session
 state and cannot answer that question; the UI declaration is already persisted per-peer on SD and
 already read while disconnected for exactly this class of decision (`isImageCapable()` drives the
-gallery picker today, `src/CompanionPeerStore.cpp:426-450`).
+gallery picker today, `src/CompanionPeerStore.cpp:401-412`).
 
 Secondary reasons, all pointing the same way:
 
@@ -85,7 +92,7 @@ Secondary reasons, all pointing the same way:
   (`src/CompanionPeerStore.cpp:163`) plus one read in `loadUiDeclaration()`. Both are wrong: under
   the offset-4 placement above, the *trailing* byte count does not change at all, and there turned
   out to be **four** independent hand-rolled walks of this layout, not two —
-  `uiDeclarationParses()`, `isImageCapable()` (`CompanionPeerStore.cpp:426`),
+  `uiDeclarationParses()`, `isImageCapable()` (`CompanionPeerStore.cpp:401`),
   `CompanionModeActivity::loadUiDeclaration()`, and the `CUI` command in `CompanionTestConsole.cpp`.
   Every one of them starts its walk at a hardcoded offset. Inserting a byte at offset 4 breaks all
   four silently — the firmware still builds and every host test still passes, because three of the
@@ -118,7 +125,7 @@ The shape values:
 
 ```
 0x01  TEXT     title/body/content-id/tag-state
-0x02  IMAGE    image
+0x02  IMAGE    image, tag-state (an overlay, permitted under both -- see §5)
 0x03  LIST     todo-list document
 ```
 
@@ -164,21 +171,34 @@ inspecting content.
 
 **The trap:** at content-push time the peer's declaration is *not* in RAM. `Session` carries only
 `peerKey`/`contentId`, and every existing declaration read is an SD read (`hasUiDeclaration()` is a
-`Storage.exists()`, `CompanionPeerStore.cpp:299`; `isImageCapable()` is a full open/seek/read,
-`:426-450`). Checking shape per push would put an SD open on the NimBLE host task for **every field
+`Storage.exists()`, `CompanionPeerStore.cpp:274`; `isImageCapable()` is a full open/read/parse,
+`:401-412`). Checking shape per push would put an SD open on the NimBLE host task for **every field
 of every push** — precisely what the image writer task exists to avoid
-(`src/CompanionBle.cpp:600-608`). Any implementation that does this is wrong, however correct it
+(`src/CompanionBle.cpp:605-640`, `:737-747`). Any implementation that does this is wrong, however correct it
 looks.
 
 **The fix:** cache the declared shape once, at `ACQUIRE`, where the declaration is already being read
-(`hasUiDeclaration()` at `src/CompanionBle.cpp:980`). A byte on `Session` set in `setForeground()`
-(`:363-379`), refreshed in `finishAsset()`'s declaration-re-push branch (`:1061`) so §4's escape
-hatch stays correct. That keeps the ACQUIRE-time read as the only SD touch.
+— as implemented, that read is `companionpeer::readDeclaredShape()` (`src/CompanionBle.cpp:1014-1039`,
+which also tightened the old bare `hasUiDeclaration()` existence check into a full parse). A byte on
+`Session` (`declaredShape`), set in the `ACQUIRE` handler just before `setForeground()` (`:383-399`)
+and refreshed in `finishAsset()`'s declaration-re-push branch (`:1109-1133`, the read at `:1127`) so
+§4's escape hatch stays correct. That keeps the ACQUIRE-time read as the only SD touch.
+
+**Tag state is exempt: it is an overlay, not content.** Field `0x07` is permitted under *both* `TEXT`
+and `IMAGE` (`src/CompanionUiDeclaration.cpp:90-98`). A tag is a chip drawn over whatever content is
+on screen, so it fails this design's own §2 test for what a shape is for — it holds no screen state
+the phone lacks and claims no buttons — and refusing it would un-design the protocol's atomic
+image+tag push, reinstating the accept-then-never-draw no-op that
+`docs/companion-display-protocol.md`'s "Tags are drawn over an image" section says is gone. `LIST`
+still permits nothing, `0x07` included: there is no list screen to overlay yet, and forward-dating
+that is unproven.
 
 **Rejection path:** reject at `START`, before any buffer is allocated — the natural slot is right
-after the `isKnownField` + `sessionById` checks (`src/CompanionBle.cpp:1105-1108`). `START` carries no
-`pushId` (it arrives only on `END`, `:1297`), so this must **latch at START and answer at END**,
-mirroring `g_activeImageOverflow` (`:1123` → `:1310`) exactly rather than inventing a new pattern.
+after the `isKnownField` + `sessionById` checks — as implemented, `src/CompanionBle.cpp:1195-1208`,
+just past those checks at `:1152-1157`. `START` carries no `pushId` (it arrives only on `END`,
+`:1396`), so this must **latch at START and answer at END**, mirroring `g_activeImageOverflow`
+(`:432`, latched `:1213`, answered `:1420`) exactly rather than inventing a new pattern; the latch is
+`g_activeShapeRejected` (`:439`) and the answer is at `:1401-1408`.
 The answer is a new `RenderResult` case:
 
 ```
@@ -249,7 +269,9 @@ land after the text half; it is called out here so the saving is not double-coun
 are this project's own. Concretely, a coordinated release of firmware v12, CompanionKit 12.x,
 SpokenFeeds and Snap2Ink.
 
-Plus four things we own inside this repo and must change knowingly:
+Plus four things we own inside this repo and must change knowingly (and one thing this deliberately
+does **not** break: tag state, field `0x07`, stays legal for every content shape but `LIST`, because
+it is an overlay drawn over the content rather than content of its own — see §5):
 
 - **`docs/companion-display-protocol.md:924-928`** — the "no image mode the client enters or leaves"
   paragraph is directly contradicted and must be rewritten, not amended.
