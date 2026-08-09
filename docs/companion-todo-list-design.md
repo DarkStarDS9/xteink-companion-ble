@@ -97,11 +97,19 @@ yet.
 - **Document carries a `revision : u32`**, monotonically increasing, assigned by the phone on every
   push. This is what makes "sync all lists together" (§6) coherent: one number describes the whole
   document's freshness, not one per list.
-- **New UI capability bit**, alongside `kUiCapabilityImageGallery`
-  (`src/CompanionBle.h:189`) — call it `kUiCapabilityTodoList`. A peer that sets it gets an entry
-  point analogous to the gallery picker (§8 of the multi-app design): CONFIRM on its sleep-screen
-  icon enters `Screen::List` over that peer's stored document, exactly the same "local SD browse of
-  content the app already pushed" shape already argued as not-a-launcher for the gallery picker.
+- **A declared content shape of `LIST`**, per `docs/companion-declared-shape-design.md` — *not* a new
+  capability bit alongside `kUiCapabilityImageGallery`, which was this doc's first proposal. That
+  proposal was wrong in an instructive way: it assumed content shape was already declared at
+  handshake, when in fact the implemented protocol is purely reactive (last completed push owns the
+  screen, `docs/companion-display-protocol.md:924-928`). A list cannot live under reactive rules —
+  it holds a cursor and unsynced local check-offs that a stray title/body push from the same app
+  would silently destroy, and it claims too many buttons to negotiate per screen. See §2 of the
+  declared-shape doc. A peer declaring `LIST` also gets the picker entry point the capability bit was
+  reaching for: CONFIRM on its sleep-screen icon enters `Screen::List` over that peer's stored
+  document — the same "local SD browse of content the app already pushed" argument that makes the
+  gallery picker not-a-launcher (§8 of the multi-app design). **This is also why the shape is
+  declared in the persisted UI declaration rather than on `ACQUIRE`:** that entry point runs with no
+  phone connected, so the device must know a peer's shape while disconnected.
 - **New Session-characteristic notify, `LIST_STATE`**, sent once on `HELLO_OK`/`FOREGROUND` for a
   `kUiCapabilityTodoList` peer, before the peer pushes anything: `{ revision, count, count ×
   { itemId, checked } }` — the device's current `list_state.json` diff against whatever revision it
@@ -135,6 +143,12 @@ this.
   the multi-app design) — it's implicit in being on `Screen::List`, the same way gallery Up/Down and
   text pagination are already implicit in their screens rather than routed. No new `ButtonRouting`
   enum value needed.
+- **What makes that safe is the declared shape**, not the screen state. The gallery gets away with
+  claiming Up/Down only because it takes them when the peer's own map left them unclaimed
+  (`docs/companion-multi-app-design.md:96-106`); a list needs Up/Down/Left/Right/Confirm, which is
+  too much of the device to negotiate that way. Because a `LIST` peer declared itself as one before
+  it ever reached the screen, its button map and the list's own navigation are known not to conflict
+  up front, rather than being reconciled per redraw.
 
 ## 6. Sync model
 
@@ -206,6 +220,10 @@ committed infrastructure for phase B, not a documentation artifact — the throw
 itself was removed after measuring.
 
 ## 10. Sequencing
+
+**Blocked on `docs/companion-declared-shape-design.md` phase A** (the shape declaration and its
+enforcement). That is a prerequisite, not a parallel track: without a declared shape there is no safe
+way for `Screen::List` to hold a cursor or claim its buttons — see §4 above and §2 of that document.
 
 - **A — Wire + storage + `Screen::List` rendering + read-only sync.** §2–§4, §8. Gets a pushed
   document on screen, paginated, no offline checking yet. Provable with the existing host-harness
