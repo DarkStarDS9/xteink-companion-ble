@@ -92,11 +92,27 @@ A third optional trailing byte on the UI declaration, after the `TagRenderStyle`
 capability bitmask:
 
 ```
-0x00  LEGACY   unset/absent — text and image both permitted, list forbidden (see §6)
 0x01  TEXT     title/body/content-id/tag-state
 0x02  IMAGE    image
 0x03  LIST     todo-list document
 ```
+
+**Mandatory** — there is no unset value and no default. A declaration without the byte fails
+`uiDeclarationParses()` and is rejected at store time, which means the peer has no stored declaration
+at all, which means `ACQUIRE` is already refused by the existing `kAcquireDeniedNoButtonMap` gate
+(`src/CompanionBle.cpp:980-983`). No new `ACQUIRE_DENIED` reason is needed: the existing structural
+rule — *a peer that has not declared itself cannot reach the screen* — extends to cover shape for
+free, exactly as `docs/companion-multi-app-design.md` §7 argues for the button map.
+
+The rejection is reported on `ASSET_ACK` with a distinct `AssetStoreResult`:
+
+```
+RejectedNoShape = 0x04   declaration carries no content shape
+```
+
+Distinct from the generic `RejectedFormat` on purpose. It costs one enum value and is worth it
+precisely during the migration in §6, when three codebases are being updated at once and "your
+declaration is missing its shape byte" is a far better thing to read in a log than "malformed".
 
 A single value, not a bitmask. The bitmask option (declare a *set* of permitted shapes, allocate
 their union) was rejected: it solves the RAM question but not the two problems in §2, because a peer
@@ -141,27 +157,36 @@ The answer is a new `RenderResult` case:
 RejectedShape = 0x06   this peer declared a different content shape
 ```
 
-## 6. Backward compatibility: additive, not a v6-style clean break
+## 6. Clean break, v11 → v12
 
-An absent shape byte means `LEGACY`: text and image both permitted, list forbidden, current
-behaviour exactly preserved.
+**Decided: a clean break, no legacy path.** An earlier draft of this document proposed treating an
+absent shape byte as a permissive `LEGACY` value, reasoning from `docs/companion-multi-app-design.md`
+§9's record of what v6's coordinated release cost. That reasoning does not apply here: **every client
+of this protocol is written by this project's author.** There is no third-party consumer to strand,
+so the only thing a compatibility shim would buy is the right to keep a permissive mode nobody wants,
+in exchange for a `LEGACY` branch living in the firmware forever.
 
-This is deliberate and is the one place this design does **not** follow the author's stated intent to
-the letter — a legacy peer can still switch between text and image mid-session. It is worth it:
+Consequences, stated plainly rather than discovered later:
 
-- `docs/companion-multi-app-design.md` §9 records what v6's clean break cost — *"flashing v6 firmware
-  breaks the shipped SpokenFeeds build until it ships a v6 update. Both sides must be released
-  together."* That coordination cost is real and was paid once already.
-- It buys nothing here. Both shipped apps are already single-shape **in practice** (SpokenFeeds
+- **The shipped SpokenFeeds and Snap2Ink builds stop working against v12 firmware** until each ships
+  a build that declares a shape. Same coordination shape as v6 — firmware and clients release
+  together. Both are one-line changes (each app is already single-shape in practice: SpokenFeeds
   pushes only title/body, `SpokenFeedsMixer/Services/CompanionDeviceService.swift:288`; Snap2Ink only
-  images, `Snap2Ink/Transport/CompanionKitTransport.swift:87`), so forcing a break would break them
-  to enforce a rule they already follow.
-- Adoption is then opt-in per app, and the RAM payoff (§7) lands per app as each declares.
+  images, `Snap2Ink/Transport/CompanionKitTransport.swift:87`).
+- **A v11 client against v12 firmware fails cleanly, not mysteriously**: its declaration is refused
+  with `RejectedNoShape` on `ASSET_ACK`, and its subsequent `ACQUIRE` is denied
+  `NO_UI_DECLARATION` — which is already the documented "push field `0x05`, then retry" path
+  (`docs/companion-display-protocol.md:271`). The capability characteristic also reports version 12,
+  so a client can detect the mismatch before pushing anything.
+- **The RAM payoff (§7) becomes unconditional** rather than opt-in per app. This is the substantive
+  win of breaking: with no legacy peers, the firmware always knows the foreground shape, so the
+  buffers in §7 are genuinely never allocated for a peer that cannot use them — instead of being
+  kept resident against the possibility of a legacy peer that might.
 
-Version bump **11 → 12** regardless, since the capability characteristic must advertise
-shape-awareness so a client can tell whether declaring is even understood: feature bitmask bit 4 is
-free (`src/CompanionBle.cpp:825`, currently `0x0F`). The version literal at `src/CompanionBle.cpp:830`
-is a bare `11` and should become a named constant in the same change.
+Version bump **11 → 12**. Feature bitmask bit 4 is free for shape-awareness (`src/CompanionBle.cpp:825`,
+currently `0x0F`); the version literal at `src/CompanionBle.cpp:830` is a bare `11` and should become
+a named constant in the same change. `scripts/companion_protocol.py:46` (`PROTOCOL_VERSION = 11`) and
+CompanionKit's major version (which tracks the protocol version by convention) move together.
 
 ## 7. What declaring actually saves
 
@@ -173,6 +198,10 @@ is a bare `11` and should become a named constant in the same change.
 Nothing else is both shape-specific and sizeable — image pushes already stream to SD with no large
 RAM buffer, and decode is row-at-a-time
 (`lib/Epub/Epub/converters/RawBitmapToFramebufferConverter.cpp:82-96`).
+
+Because §6 is a clean break, **every peer declares, so these savings are unconditional** — there is
+no legacy peer whose possible text push forces the 8 KB to stay resident just in case. That is the
+concrete return on breaking rather than shimming.
 
 **This is what makes the allocation question fall out for free.** `g_batchModel`'s fixed 8 KB is a
 vestige of the first Companion Mode commit (`59c7d937`), when title/body was the only shape — it
@@ -188,20 +217,25 @@ land after the text half; it is called out here so the saving is not double-coun
 
 ## 8. What this breaks, stated plainly
 
-Nothing in the field (§6), but three things we own and must change knowingly:
+**Every client, until each declares a shape** — see §6. That is accepted, not regretted: all of them
+are this project's own. Concretely, a coordinated release of firmware v12, CompanionKit 12.x,
+SpokenFeeds and Snap2Ink.
+
+Plus four things we own inside this repo and must change knowingly:
 
 - **`docs/companion-display-protocol.md:924-928`** — the "no image mode the client enters or leaves"
   paragraph is directly contradicted and must be rewritten, not amended.
 - **Manual test 28 (`:1769`)** — *"Push a body after an image and confirm the screen returns to
-  text."* Still valid for a `LEGACY` peer; must be re-scoped to say so.
+  text."* No longer a valid behaviour at all under a clean break; it inverts into its opposite —
+  push a body to an `IMAGE`-declared peer and confirm it is **refused** with `RejectedShape`.
 - **`docs/companion-display-protocol.md:477-478`** — the `pushId` rationale cites running "an image
   and a text batch" concurrently as the motivating example. `pushId` remains correct and necessary
   (two concurrent *same-shape* pushes, and the general "one answer per push" contract), but that
   example must be replaced.
 - **`scripts/companion_e2e_test.py`** — `session_a` pushes title/body (`:799-800`) and later an image
-  (`:1192`) on the same enrolled peer. Under a declared shape this becomes either a `LEGACY`-peer
-  test or two peers; it must also grow a new case asserting `RejectedShape` fires, per this repo's
-  every-fix-starts-red rule.
+  (`:1192`) on the same enrolled peer. That is now an illegal client, so it must be split into two
+  peers with different declared shapes, and grow new cases asserting `RejectedShape` and
+  `RejectedNoShape` both fire, per this repo's every-fix-starts-red rule.
 
 ## 9. Sequencing
 
@@ -212,7 +246,11 @@ Nothing in the field (§6), but three things we own and must change knowingly:
   allocated in `applyForegroundChange()`. Needs A. This is the change that retires the 8 KB vestige.
 - **C — Image writer gating.** §7's second row. Independent of B; larger blast radius since it
   touches `ensureStarted()`. Can slip.
-- **D — CompanionKit + consumer apps.** Declare a shape in `UiDeclaration`; opt-in per app, so
-  SpokenFeeds and Snap2Ink can adopt independently and neither blocks the firmware landing.
+- **D — CompanionKit + consumer apps.** Declare a shape in `UiDeclaration` (`TEXT` for SpokenFeeds,
+  `IMAGE` for Snap2Ink), bump CompanionKit's major to 12 per its protocol-tracking convention, bump
+  each app's pin. **Ships with A, not after it** — under §6's clean break, v12 firmware and a v11
+  client cannot both be in the field working. This is the coordination cost the break buys, and it is
+  the one part of this plan that is not just a firmware change.
 
-Only A blocks `docs/companion-todo-list-design.md` phase A.
+Only A blocks `docs/companion-todo-list-design.md` phase A. A and D block each other's *release*, not
+each other's *development* — A is provable on its own against the host harness before any app moves.
