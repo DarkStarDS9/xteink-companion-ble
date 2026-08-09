@@ -110,10 +110,37 @@ TEST(CompanionUiDeclaration, V11DeclarationWithNoShapeByteIsRejected) {
   // is a *valid* shape value, and the trap this test exists to catch: nothing
   // about the leading byte alone can tell v11 from v12, and only the length
   // arithmetic downstream can.
+  //
+  // Must be NoShape specifically, not merely != Ok: an app mid-migration is
+  // owed "your declaration is missing its shape byte", not a generic
+  // "malformed" that sends it hunting through its own framing for a bug that
+  // isn't there. A build that walks the v12 layout only, and falls back to
+  // Malformed the moment that walk doesn't land, passes a weaker `!= Ok`
+  // assertion here while failing this one — that gap shipped once and was
+  // only caught on hardware (scripts/companion_e2e_test.py's [shape] group).
   std::vector<uint8_t> v11{2};
   append(v11, button(1, 0x01, "Play"));
   append(v11, button(2, 0x01, "Next"));
-  EXPECT_NE(parse(asset(v11)), ParseResult::Ok);
+  EXPECT_EQ(parse(asset(v11)), ParseResult::NoShape);
+}
+
+TEST(CompanionUiDeclaration, V11DeclarationWithTagsAndTrailingOptionalsIsNoShape) {
+  // The shape a real v11 client's full declaration takes: buttons, tags, and
+  // both trailing optional bytes, none of which lines up with the v12 layout
+  // once the leading shape byte is simply absent (as opposed to present but
+  // wrong) -- this is what scripts/companion_e2e_test.py's NO_SHAPE_DECL
+  // actually sends, and is a stricter shape than the two-button case above.
+  std::vector<uint8_t> v11{4};
+  append(v11, button(1, 1, "<"));
+  append(v11, button(2, 2, ">"));
+  append(v11, button(3, 3, "Save"));
+  append(v11, button(4, 3, "Back"));
+  v11.push_back(2);
+  append(v11, tag(0, "Saved"));
+  append(v11, tag(1, "New"));
+  v11.push_back(static_cast<uint8_t>(TagRenderStyle::Bordered));
+  v11.push_back(0);
+  EXPECT_EQ(parse(asset(v11)), ParseResult::NoShape);
 }
 
 TEST(CompanionUiDeclaration, V11DeclarationWithNoButtonsIsRejected) {
