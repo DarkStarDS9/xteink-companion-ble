@@ -85,6 +85,16 @@ constexpr uint8_t kDeniedNoSlots = 0x02;
 constexpr uint8_t kDeniedMalformed = 0x03;
 constexpr uint8_t kDeniedStorage = 0x04;
 constexpr uint8_t kDeniedBusy = 0x05;
+// v12: the client's own declared protocolVersion (HELLO's first field after
+// helloTag) does not match kProtocolVersion. Distinct from kDeniedMalformed on
+// purpose -- a length-valid HELLO from a genuinely different protocol version
+// is not corrupt, it is just talking to the wrong device generation, and a
+// client is owed that distinction the same way RejectedNoShape (see
+// docs/companion-declared-shape-design.md section 3) used to try to infer it
+// after the fact from a v11-shaped UI declaration. This replaces that
+// inference: a client's version is now a fact the device is told, not a shape
+// it has to guess from a buffer that is missing a byte.
+constexpr uint8_t kDeniedProtocolMismatch = 0x06;
 
 constexpr uint8_t kAcquireDeniedNoButtonMap = 0x00;
 constexpr uint8_t kAcquireDeniedUnknownSession = 0x01;
@@ -914,33 +924,51 @@ void admitPeer(uint16_t helloTag, const char* peerKey, const uint8_t token[16]) 
 }
 
 void handleHello(const uint8_t* data, size_t len) {
-  // opcode(1) helloTag(2) appId(16) installId(16) tokenLen(1) token[..]
-  // nameLen(1) name[..] userNameLen(1) userName[..]
-  if (len < 1 + 2 + 32 + 1) {
+  // opcode(1) helloTag(2) protocolVersion(1) appId(16) installId(16) tokenLen(1)
+  // token[..] nameLen(1) name[..] userNameLen(1) userName[..]
+  if (len < 1 + 2 + 1) {
     notifyHelloDenied(0, kDeniedMalformed);
     return;
   }
   const uint16_t helloTag = static_cast<uint16_t>(data[1] | (data[2] << 8));
-  const uint8_t* appId = data + 3;
-  const uint8_t* installId = data + 19;
-  const uint8_t tokenLen = data[35];
-  if (len < 36u + tokenLen + 1u) {
+
+  // v12: checked before anything past it is trusted. This field's wire offset
+  // is fixed for good -- every future protocol version keeps it right here,
+  // straight after helloTag -- specifically so a mismatch can always be caught
+  // this early, before assuming the rest of the payload is laid out the way
+  // this build expects. Replaces inferring a stale client after the fact from
+  // a v11-shaped UI declaration (the old RejectedNoShape path); see
+  // kDeniedProtocolMismatch's comment.
+  const uint8_t protocolVersion = data[3];
+  if (protocolVersion != kProtocolVersion) {
+    notifyHelloDenied(helloTag, kDeniedProtocolMismatch);
+    return;
+  }
+
+  if (len < 1 + 2 + 1 + 32 + 1) {
     notifyHelloDenied(helloTag, kDeniedMalformed);
     return;
   }
-  const uint8_t* token = data + 36;
-  const uint8_t nameLen = data[36 + tokenLen];
-  if (len < 37u + tokenLen + nameLen + 1u) {
+  const uint8_t* appId = data + 4;
+  const uint8_t* installId = data + 20;
+  const uint8_t tokenLen = data[36];
+  if (len < 37u + tokenLen + 1u) {
     notifyHelloDenied(helloTag, kDeniedMalformed);
     return;
   }
-  const uint8_t* name = data + 37 + tokenLen;
-  const uint8_t userNameLen = data[37 + tokenLen + nameLen];
-  if (len < 38u + tokenLen + nameLen + userNameLen) {
+  const uint8_t* token = data + 37;
+  const uint8_t nameLen = data[37 + tokenLen];
+  if (len < 38u + tokenLen + nameLen + 1u) {
     notifyHelloDenied(helloTag, kDeniedMalformed);
     return;
   }
-  const uint8_t* userNameBytes = data + 38 + tokenLen + nameLen;
+  const uint8_t* name = data + 38 + tokenLen;
+  const uint8_t userNameLen = data[38 + tokenLen + nameLen];
+  if (len < 39u + tokenLen + nameLen + userNameLen) {
+    notifyHelloDenied(helloTag, kDeniedMalformed);
+    return;
+  }
+  const uint8_t* userNameBytes = data + 39 + tokenLen + nameLen;
 
   char displayName[companionpeer::kMaxNameLen + 1] = {0};
   const size_t nameCopy = nameLen > companionpeer::kMaxNameLen ? companionpeer::kMaxNameLen : nameLen;

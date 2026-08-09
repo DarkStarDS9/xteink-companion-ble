@@ -101,35 +101,38 @@ TEST(CompanionUiDeclaration, IsKnownShapeCoversExactlyTheThreeDeclaredValues) {
 }
 
 // ---------------------------------------------------------------------------
-// The migration case
+// The pre-v12 shape (now unreachable in practice, still worth pinning)
 // ---------------------------------------------------------------------------
+//
+// Through the v12 migration window, HELLO carried no protocolVersion field, so
+// the device could not refuse a stale client before it pushed a declaration --
+// only after, by noticing the declaration didn't parse. These two tests used
+// to require that "doesn't parse" verdict to be NoShape specifically, so a
+// migrating app was told what was actually wrong rather than a generic
+// "malformed". As of HELLO's protocolVersion field
+// (docs/companion-display-protocol.md's Session characteristic section) a
+// client old enough to omit the shape byte is also old enough to fail the
+// HELLO version check, so it can never reach ASSET push at all -- a buffer
+// shaped like this now only happens from real corruption or a bug in a
+// compliant client, and Malformed is the honest answer. Kept as regression
+// tests for that reasoning, not for the byte layout itself.
 
-TEST(CompanionUiDeclaration, V11DeclarationWithNoShapeByteIsRejected) {
-  // Exactly what a shipped v11 client pushes: digest, then the button count
-  // where the shape byte now lives. Two buttons, so byte 4 reads 0x02 — which
-  // is a *valid* shape value, and the trap this test exists to catch: nothing
-  // about the leading byte alone can tell v11 from v12, and only the length
-  // arithmetic downstream can.
-  //
-  // Must be NoShape specifically, not merely != Ok: an app mid-migration is
-  // owed "your declaration is missing its shape byte", not a generic
-  // "malformed" that sends it hunting through its own framing for a bug that
-  // isn't there. A build that walks the v12 layout only, and falls back to
-  // Malformed the moment that walk doesn't land, passes a weaker `!= Ok`
-  // assertion here while failing this one — that gap shipped once and was
-  // only caught on hardware (scripts/companion_e2e_test.py's [shape] group).
+TEST(CompanionUiDeclaration, V11ShapedDeclarationIsMalformedNotNoShape) {
+  // What a pre-v12 client used to push: digest, then the button count where
+  // the shape byte now lives. Two buttons, so byte 4 reads 0x02 — a *valid*
+  // shape value, which is exactly why this can't be told apart from a v12
+  // declaration by its leading byte alone; only the length arithmetic
+  // downstream can, and it reliably lands on Malformed for this shape.
   std::vector<uint8_t> v11{2};
   append(v11, button(1, 0x01, "Play"));
   append(v11, button(2, 0x01, "Next"));
-  EXPECT_EQ(parse(asset(v11)), ParseResult::NoShape);
+  EXPECT_EQ(parse(asset(v11)), ParseResult::Malformed);
 }
 
-TEST(CompanionUiDeclaration, V11DeclarationWithTagsAndTrailingOptionalsIsNoShape) {
-  // The shape a real v11 client's full declaration takes: buttons, tags, and
-  // both trailing optional bytes, none of which lines up with the v12 layout
-  // once the leading shape byte is simply absent (as opposed to present but
-  // wrong) -- this is what scripts/companion_e2e_test.py's NO_SHAPE_DECL
-  // actually sends, and is a stricter shape than the two-button case above.
+TEST(CompanionUiDeclaration, V11ShapedDeclarationWithTagsIsMalformedNotNoShape) {
+  // The fuller pre-v12 shape: buttons, tags, and both trailing optional bytes
+  // -- this is what scripts/companion_e2e_test.py's NO_SHAPE_DECL used to send
+  // before the HELLO version check made that scenario obsolete.
   std::vector<uint8_t> v11{4};
   append(v11, button(1, 1, "<"));
   append(v11, button(2, 2, ">"));
@@ -140,7 +143,7 @@ TEST(CompanionUiDeclaration, V11DeclarationWithTagsAndTrailingOptionalsIsNoShape
   append(v11, tag(1, "New"));
   v11.push_back(static_cast<uint8_t>(TagRenderStyle::Bordered));
   v11.push_back(0);
-  EXPECT_EQ(parse(asset(v11)), ParseResult::NoShape);
+  EXPECT_EQ(parse(asset(v11)), ParseResult::Malformed);
 }
 
 TEST(CompanionUiDeclaration, V11DeclarationWithNoButtonsIsRejected) {

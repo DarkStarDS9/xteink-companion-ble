@@ -52,10 +52,12 @@ Covered:
                TEXT peer and a text batch pushed to an IMAGE peer are both refused
                with RENDER_STATUS(RejectedShape) — the batch case asserting the
                count, since "one answer per push" is what the final-field rule
-               exists to guarantee. Also: a declaration with no shape byte (i.e.
-               any v11 client) is refused ASSET_ACK(RejectedNoShape) and its
+               exists to guarantee. Also: a v11-shaped declaration from a
+               compliant session is refused ASSET_ACK(RejectedFormat) and its
                ACQUIRE then denied, and re-declaring while foreground switches a
-               peer's shape, which is the protocol's only sanctioned way to do it.
+               peer's shape, which is the protocol's only sanctioned way to do
+               it. See [enrollment] for the HELLO-level protocolVersion check
+               that now catches an actual stale client before this point.
   spokenfeeds  mimics a real consumer app: push a batch, then BLOCK for RENDER_STATUS
                before doing anything else, same as SpokenFeeds waiting on it before
                starting audio. A timeout here is "the screen updated but the phone
@@ -112,7 +114,7 @@ except ImportError:
 from bleak import BleakClient, BleakScanner
 
 from companion_protocol import (
-    ASSET_REJECTED_NO_SHAPE,
+    ASSET_REJECTED_FORMAT,
     ASSET_RESULTS,
     ASSET_STORED,
     BTN_BACK,
@@ -121,12 +123,14 @@ from companion_protocol import (
     BTN_RIGHT,
     CAPABILITY_CHAR_UUID,
     CAP_FLAG_SHAPE_AWARE,
+    DENIED_REASONS,
     FIELD_BODY,
     FIELD_CONTENT_ID,
     FIELD_IMAGE,
     FIELD_TAG_STATE,
     FIELD_TITLE,
     FIELD_UI_DECL,
+    HELLO_DENIED_PROTOCOL_MISMATCH,
     PROTOCOL_VERSION,
     RENDER_DISPLAYED,
     RENDER_REJECTED_SHAPE,
@@ -157,9 +161,10 @@ from companion_protocol import (
 # makes an illegal client outright: a peer declares one shape and may push only
 # the fields belonging to it.
 #
-# C exists only to be a peer with *no* stored declaration, which is the one
-# state the RejectedNoShape path needs and neither A nor B can be once they have
-# declared — a rejected declaration leaves the previously stored one in place.
+# C exists only to be a peer with *no* stored declaration, which the
+# v11-shaped-declaration and protocolVersion-mismatch checks both need and
+# neither A nor B can be once they have declared — a rejected declaration
+# leaves the previously stored one in place.
 APP_A = uuid.UUID("2f1d7b64-9c3e-4a55-8f21-0c7b5e9a3d10").bytes
 APP_B = uuid.UUID("7ac41e08-5d62-4f1b-9e33-1b8c4d2f60a5").bytes
 APP_C = uuid.UUID("c4a91f27-38b0-4d6e-a1f9-2e5d70c8b431").bytes
@@ -831,6 +836,27 @@ async def run_tests(args, console: Console, results: Results) -> None:
         # --- enrollment ---------------------------------------------------- #
         if enabled("enrollment"):
             print("\n[enrollment] first contact with an on-device confirm")
+
+            # v12: a client on a different protocol version is refused right
+            # here, before there is a session to push anything on -- the field
+            # kDeniedProtocolMismatch exists for
+            # (docs/companion-display-protocol.md's Session characteristic
+            # section), replacing the old RejectedNoShape inference that used
+            # to only catch this once a stale client's declaration failed to
+            # parse. Uses session_c, not session_a, so a denied HELLO here
+            # doesn't consume the identity the real enrollment checks below
+            # exercise -- a denial sets no session state (Session.wait_hello()
+            # only adopts session_id/token on .ok), so session_c is exactly as
+            # "never enrolled" afterward as it would be otherwise.
+            await session_c.send_hello(protocol_version=PROTOCOL_VERSION - 1)
+            mismatch_reply = await session_c.wait_hello(timeout=10.0)
+            results.check(
+                "a stale protocolVersion is refused HELLO_DENIED(PROTOCOL_MISMATCH)",
+                not mismatch_reply.ok and mismatch_reply.reason == HELLO_DENIED_PROTOCOL_MISMATCH,
+                f"ok={mismatch_reply.ok} reason="
+                f"{DENIED_REASONS.get(mismatch_reply.reason, mismatch_reply.reason)!r}",
+            )
+
             await session_a.send_hello()
             got_pending = False
             try:
@@ -1057,8 +1083,9 @@ async def run_tests(args, console: Console, results: Results) -> None:
             # going deaf after one.
             await session_a.push_field(FIELD_TAG_STATE, encode_tag_state([(1, 2)]), final=True)
             await asyncio.sleep(2.0)
+            tags_after_discard = console.tags()
             results.check("a standalone tag push still applies after a discarded batch",
-                          console.tags().get(1) == "filled", str(console.tags()))
+                          tags_after_discard.get(1) == "filled", str(tags_after_discard))
             await session_a.push_field(FIELD_TAG_STATE, encode_tag_state([(1, 0)]), final=True)
             await asyncio.sleep(1.5)
 
@@ -1094,8 +1121,9 @@ async def run_tests(args, console: Console, results: Results) -> None:
             # An undeclared id must be ignored rather than create a tag.
             await session_a.set_tag(99, 2)
             await asyncio.sleep(1.0)
+            tags_after_undeclared = console.tags()
             results.check("an undeclared tag id creates nothing",
-                          len(console.tags()) == len(DEFAULT_TAGS), str(console.tags()))
+                          len(tags_after_undeclared) == len(DEFAULT_TAGS), str(tags_after_undeclared))
 
             # Atomic: content and tag state in one batch, one redraw.
             await session_a.push_field(FIELD_TITLE, b"Tagged article")
@@ -1263,10 +1291,14 @@ async def run_tests(args, console: Console, results: Results) -> None:
                     # group's assertion for the wrong reason).
                     await session_a.push_field(FIELD_TITLE, b"App A should be ignored", final=True)
                     await asyncio.sleep(1.5)
+                    # One live read per check, reused for both the comparison
+                    # and the message -- console.state() is a real serial round
+                    # trip, so two separate calls can straddle a transient.
+                    state_after_ignored_push = console.state()
                     results.check(
                         "the foreground peer is still app B",
-                        console.state().get("foreground") == str(session_b.session_id),
-                        str(console.state()),
+                        state_after_ignored_push.get("foreground") == str(session_b.session_id),
+                        str(state_after_ignored_push),
                     )
 
                     # Re-grant: FOREGROUND must fire again, not just the first
@@ -1275,12 +1307,14 @@ async def run_tests(args, console: Console, results: Results) -> None:
                     outcome = await session_a.acquire()
                     results.check("FOREGROUND fires again on a re-grant",
                                   outcome[0] == "foreground", str(outcome))
+                    state_after_regrant = console.state()
                     results.check("the screen went back to app A",
-                                  console.state().get("foreground") == str(session_a.session_id),
-                                  str(console.state()))
+                                  state_after_regrant.get("foreground") == str(session_a.session_id),
+                                  str(state_after_regrant))
+                    tags_after_regrant = console.tags()
                     results.check("tags cleared on the handover",
-                                  all(state == "hidden" for state in console.tags().values()),
-                                  str(console.tags()))
+                                  all(state == "hidden" for state in tags_after_regrant.values()),
+                                  str(tags_after_regrant))
                 check_no_errors(console, results, "preemption")
 
             # --- image push -------------------------------------------------- #
@@ -1376,8 +1410,14 @@ async def run_tests(args, console: Console, results: Results) -> None:
                             verdict == RENDER_SEQUENCE_GAP,
                             f"result {RENDER_RESULTS.get(verdict, verdict)}",
                         )
+                    # One live read for both the comparison and the message --
+                    # console.state() is a real serial round trip, so two
+                    # separate calls here can straddle a transient (see the
+                    # equivalent fix in the [shape] group's screen-unchanged
+                    # checks).
+                    state_after_gap = console.state()
                     results.check("the previous screen is retained after a gapped image",
-                                  console.state().get("screen") == "image", str(console.state()))
+                                  state_after_gap.get("screen") == "image", str(state_after_gap))
                     check_no_errors(console, results, "image seqgap", allowed=("CHUNK sequence gap",))
 
             # --- v12 declared content shape ---------------------------------- #
@@ -1523,10 +1563,11 @@ async def run_tests(args, console: Console, results: Results) -> None:
                         f"RejectedShape for pushId(s) {[n.push_id for n in refusals]} — 0x07 is an "
                         "overlay and is legal under both TEXT and IMAGE",
                     )
+                    tags_after_image_peer_tag = console.tags()
                     results.check(
                         "the IMAGE peer's tag actually landed on the device",
-                        console.tags().get(0) == "filled",
-                        str(console.tags()),
+                        tags_after_image_peer_tag.get(0) == "filled",
+                        str(tags_after_image_peer_tag),
                     )
 
                     # ...and the case the exemption exists for: image + tag in
@@ -1541,11 +1582,15 @@ async def run_tests(args, console: Console, results: Results) -> None:
                         verdict == RENDER_DISPLAYED,
                         f"result {RENDER_RESULTS.get(verdict, verdict)}",
                     )
+                    # One live read of each, reused for both the comparison and
+                    # the message -- see the equivalent fix above.
+                    state_after_image_tag = console.state()
+                    tags_after_image_tag = console.tags()
                     results.check(
                         "the batched tag is set with the print on screen",
-                        console.state().get("screen") == "image"
-                        and console.tags().get(1) == "outline",
-                        f"{console.state()} {console.tags()}",
+                        state_after_image_tag.get("screen") == "image"
+                        and tags_after_image_tag.get(1) == "outline",
+                        f"{state_after_image_tag} {tags_after_image_tag}",
                     )
                     # There is no read-back for tag *rendering* by design (it is
                     # pure drawing); CMD:SCREENSHOT is the visual check that the
@@ -1556,6 +1601,18 @@ async def run_tests(args, console: Console, results: Results) -> None:
                     await asyncio.sleep(1.5)
 
                 # --- a declaration with no shape byte (i.e. any v11 client) --- #
+                #
+                # A real v11 client can no longer even reach this: HELLO's
+                # protocolVersion field (see the [enrollment] group's mismatch
+                # check above) refuses it before it has a session to push
+                # anything on. So this is no longer testing "how does the
+                # device tell a stale client apart from garbage" -- that
+                # question doesn't exist anymore, RejectedNoShape's original
+                # purpose (docs/companion-declared-shape-design.md section 3)
+                # is retired. What is still worth proving: a v11-shaped buffer
+                # from a *compliant* (correct protocolVersion) session is
+                # refused as malformed, same as any other corrupt asset, and
+                # ACQUIRE is still denied for want of a declaration.
                 #
                 # This needs a peer that has never stored a declaration, which is
                 # the whole reason session_c exists: a rejected declaration
@@ -1572,10 +1629,9 @@ async def run_tests(args, console: Console, results: Results) -> None:
                                  "" if reply_c.ok else reply_c.reason_text):
                     result_c, _tag_c = await session_c.push_asset(FIELD_UI_DECL, NO_SHAPE_DECL)
                     results.check(
-                        "a declaration with no shape byte is refused ASSET_ACK(RejectedNoShape)",
-                        result_c == ASSET_REJECTED_NO_SHAPE,
-                        f"ASSET_ACK {ASSET_RESULTS.get(result_c, result_c)} — a v11 client must "
-                        "fail here, by name, rather than be tolerated or told 'malformed'",
+                        "a v11-shaped declaration from a compliant session is refused ASSET_ACK(RejectedFormat)",
+                        result_c == ASSET_REJECTED_FORMAT,
+                        f"ASSET_ACK {ASSET_RESULTS.get(result_c, result_c)}",
                     )
                     # ...and because nothing was stored, the existing structural
                     # gate does the rest. No new ACQUIRE_DENIED reason exists or
@@ -1623,10 +1679,13 @@ async def run_tests(args, console: Console, results: Results) -> None:
                                 verdict == RENDER_DISPLAYED,
                                 f"result {RENDER_RESULTS.get(verdict, verdict)}",
                             )
+                        # One live read, reused for both -- see the equivalent
+                        # comment on the [image seqgap] fix above.
+                        state_after_redeclare = console.state()
                         results.check(
                             "the re-declared peer is showing text",
-                            console.state().get("screen") == "text",
-                            str(console.state()),
+                            state_after_redeclare.get("screen") == "text",
+                            str(state_after_redeclare),
                         )
                     # Put B back the way the rest of this file assumes it, so a
                     # --keep-peers rerun starts from the same place.

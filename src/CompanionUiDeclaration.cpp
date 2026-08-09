@@ -11,16 +11,12 @@ bool isKnownShape(uint8_t raw) {
 namespace {
 
 // Walks buttons, the optional tag section, and the optional trailing bytes,
-// starting from `buttonCountOffset` -- the offset of the button-count byte.
-// Shared between the v12 walk (button count at offset 1, past the mandatory
-// shape byte) and the v11 fallback below (button count at offset 0, because
-// a stale v11 client never wrote a shape byte at all). Returns false on any
-// truncation or overrun; `info` is left partially written on failure, which
-// is fine because every caller discards it in that case.
-bool walkBody(const uint8_t* body, size_t len, size_t buttonCountOffset, DeclarationInfo* info) {
-  if (buttonCountOffset >= len) return false;
-  const uint8_t buttonCount = body[buttonCountOffset];
-  size_t offset = buttonCountOffset + 1;
+// past the mandatory shape byte (button count at offset 1). Returns false on
+// any truncation or overrun; `info` is left partially written on failure,
+// which is fine because the caller discards it in that case.
+bool walkBody(const uint8_t* body, size_t len, DeclarationInfo* info) {
+  const uint8_t buttonCount = body[1];
+  size_t offset = kBodyFirstButtonOffset;
   for (uint8_t i = 0; i < buttonCount; ++i) {
     if (offset + 3 > len) return false;
     offset += 3 + body[offset + 2];
@@ -71,32 +67,25 @@ bool walkBody(const uint8_t* body, size_t len, size_t buttonCountOffset, Declara
 // about it — a declaration that half-parsed would draw nonsense hints with no
 // way to find out why. See the header for the byte layout and for why the
 // mandatory shape byte sits in front of the optional trailing block.
+//
+// A stale (pre-v12) client -- one that never wrote the shape byte at all --
+// cannot reach this: HELLO's protocolVersion field (v12,
+// docs/companion-display-protocol.md's Session characteristic section) refuses
+// it before it has a session to push a declaration on. So unlike the v12
+// migration window, NoShape here is never an inference about the client's
+// age -- it is a compliant client's declaration that parses structurally but
+// carries a shape byte with no known value (0x00, or above List).
 ParseResult parseBody(const uint8_t* body, size_t len, DeclarationInfo* out) {
   if (body == nullptr || len < kMinBodyLen) return ParseResult::Malformed;
 
   const uint8_t rawShape = body[0];
   DeclarationInfo info;
-  if (walkBody(body, len, /*buttonCountOffset=*/1, &info)) {
-    // Structure is sound with the shape byte in place; only now is the shape
-    // value itself judged. A buffer that walks cleanly but carries an unknown
-    // value (0x00, or above List) is NoShape too -- see isKnownShape's comment.
-    if (!isKnownShape(rawShape)) return ParseResult::NoShape;
-    info.shape = static_cast<companionble::ContentShape>(rawShape);
-    if (out != nullptr) *out = info;
-    return ParseResult::Ok;
-  }
+  if (!walkBody(body, len, &info)) return ParseResult::Malformed;
 
-  // The v12 walk didn't land cleanly. Inserting the shape byte shifted every
-  // offset after it by one, so a genuine v11 buffer -- the case
-  // AssetStoreResult::RejectedNoShape exists to name (see
-  // docs/companion-declared-shape-design.md section 3) -- almost never walks
-  // cleanly under the v12 layout; it is not corrupt, it is just missing byte
-  // 0. Re-walk as if that byte were never there (button count at offset 0)
-  // before giving up: if *that* lands cleanly, this is a stale v11 client,
-  // not a malformed one, and it is worth telling the app so by name.
-  DeclarationInfo v11Info;
-  if (walkBody(body, len, /*buttonCountOffset=*/0, &v11Info)) return ParseResult::NoShape;
-  return ParseResult::Malformed;
+  if (!isKnownShape(rawShape)) return ParseResult::NoShape;
+  info.shape = static_cast<companionble::ContentShape>(rawShape);
+  if (out != nullptr) *out = info;
+  return ParseResult::Ok;
 }
 
 ParseResult parseAsset(const uint8_t* data, size_t len, DeclarationInfo* out) {

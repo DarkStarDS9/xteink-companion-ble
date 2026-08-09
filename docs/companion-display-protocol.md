@@ -462,15 +462,15 @@ again.
 notifications **before** writing `HELLO`. Every message is a single write or a
 single notification — this characteristic is never chunked.
 
-`HELLO` (up to 101 bytes) and `HELLO_OK` (up to 30 bytes) exceed BLE's minimum
-MTU, so a handshake needs an ATT MTU of at least 105. The device requests 185
+`HELLO` (up to 103 bytes) and `HELLO_OK` (up to 30 bytes) exceed BLE's minimum
+MTU, so a handshake needs an ATT MTU of at least 106. The device requests 185
 and both iOS and Android negotiate well above the floor in practice; a central
 that cannot get past 23 cannot use v8 at all.
 
 ### Phone → device (write)
 
 ```
-0x01 HELLO      helloTag[2]  appId[16]  installId[16]
+0x01 HELLO      helloTag[2]  protocolVersion:1  appId[16]  installId[16]
                 tokenLen:1  token[tokenLen]         (tokenLen 0 or 16)
                 nameLen:1   name[nameLen]           (UTF-8, <= 24 bytes, may be empty)
                 userNameLen:1  userName[userNameLen] (UTF-8, <= 24 bytes, may be empty)
@@ -478,6 +478,31 @@ that cannot get past 23 cannot use v8 at all.
 0x03 ACQUIRE    sessionId
 0x04 RELEASE    sessionId
 ```
+
+`protocolVersion` (v12) is the client's own protocol version — the current
+value of `PROTOCOL_VERSION` (`scripts/companion_protocol.py`) /
+`CompanionProtocol.version` (CompanionKit) / `kProtocolVersion`
+(`src/CompanionBle.h`), the same one the capability characteristic already
+reports device-side. Checked first, before anything else in the payload is
+even assumed to be laid out where this build expects — a mismatch is denied
+`PROTOCOL_MISMATCH` immediately, without parsing `appId`/`installId`/the rest.
+This field's wire offset (right after `helloTag`) is fixed for the life of the
+protocol for exactly that reason: whatever else a future version changes, this
+one field never moves, so a version mismatch can always be caught this early.
+
+A compliant client is expected to catch this itself first, by reading the
+capability characteristic before ever writing `HELLO` (see "Capability
+characteristic" above) — this field is the device-side backstop for that
+contract, not a replacement for it. Before v12 there was no such field, and no
+such backstop: a stale (pre-v12) client's declaration could only be refused
+after the fact, once its missing shape byte made it fail to parse as a v12
+declaration — the device had to *infer* "this looks like a v11 client" from a
+buffer shaped like one. `REJECTED_NO_SHAPE` no longer carries that inference:
+a stale client is now refused here, at `HELLO`, before it ever reaches a
+declaration push. `REJECTED_NO_SHAPE` still exists and still fires for what it
+was always the more honest answer for — a compliant client whose declaration
+is otherwise sound but carries a shape byte with no known value (0x00, or
+above `LIST`) — see `docs/companion-declared-shape-design.md` section 3.
 
 `name` is the display name shown on the pairing prompt and the "waiting for
 <app>" screen — the app's user-visible name ("Snap2Ink"), not the peer's.
@@ -520,6 +545,7 @@ HELLO_DENIED reason      0x00 USER_REJECTED     user pressed BACK on the prompt
                          0x03 MALFORMED         unparseable HELLO
                          0x04 STORAGE           SD unavailable / peer dir could not be created
                          0x05 BUSY              another pairing prompt is already on screen
+                         0x06 PROTOCOL_MISMATCH protocolVersion doesn't match kProtocolVersion -- v12
 
 BACKGROUND reason        0x00 PREEMPTED         another session acquired the screen
                          0x01 RELEASED          this session released it

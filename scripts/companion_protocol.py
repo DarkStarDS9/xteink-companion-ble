@@ -106,7 +106,9 @@ DENIED_REASONS = {
     0x03: "malformed HELLO",
     0x04: "storage failure",
     0x05: "another pairing prompt is up",
+    0x06: "protocol version mismatch",  # v12
 }
+HELLO_DENIED_PROTOCOL_MISMATCH = 0x06
 ACQUIRE_DENIED_REASONS = {0x00: "no UI declaration stored", 0x01: "unknown session"}
 BACKGROUND_REASONS = {0x00: "preempted", 0x01: "released", 0x02: "link lost"}
 
@@ -228,9 +230,12 @@ def encode_ui_declaration(
     fails loudly here instead of silently reading TAGS as the shape.
 
     `shape=None` emits a v11-shaped declaration with no shape byte at all. No
-    real client wants that; it exists so a test can provoke the device's
-    ASSET_REJECTED_NO_SHAPE path, which is also exactly what a stale v11 client
-    hits against v12 firmware.
+    real client wants that, and no real (correct-protocolVersion) client can
+    even reach this anymore -- a stale client is refused at HELLO now, before
+    it has a session to push a declaration on (see HELLO's protocolVersion
+    field). This exists to prove a v11-shaped buffer from a *compliant*
+    session is still just refused as malformed (ASSET_REJECTED_FORMAT), same
+    as any other corrupt asset.
 
     `style` (v6) and `capabilities` (v8) are the optional trailing bytes and
     are positional, not tagged — asking for capabilities without a style byte
@@ -275,14 +280,25 @@ def encode_icon_bits(bits: bytes) -> bytes:
 
 
 def encode_hello(hello_tag: int, app_id: bytes, install_id: bytes, token: bytes | None,
-                 name: str, user_name: str = "") -> bytes:
-    """The v8 HELLO shape: ..., nameLen/name, then userNameLen/userName.
+                 name: str, user_name: str = "", protocol_version: int = PROTOCOL_VERSION) -> bytes:
+    """The v12 HELLO shape: ..., protocolVersion, appId, installId, ..., nameLen/name,
+    then userNameLen/userName.
+
+    `protocol_version` (v12) defaults to this module's own PROTOCOL_VERSION —
+    override it only to deliberately provoke HELLO_DENIED(PROTOCOL_MISMATCH),
+    e.g. to test that a stale client is refused here rather than only once its
+    (now-unreachable) declaration push fails to parse. It sits right after
+    helloTag and is checked before anything else in the payload, by design
+    (docs/companion-display-protocol.md's Session characteristic section) — a
+    device building against a different protocol version could in principle
+    lay out everything after it differently, so it is the one field a client
+    can always rely on being read from the same offset.
 
     Both names are length-prefixed and may be empty, but the length byte is
     never optional — a v7-shaped HELLO (no userName field at all) is one field
     short of what the device parses and is rejected as malformed.
     """
-    payload = bytes([SESS_HELLO]) + struct.pack("<H", hello_tag) + app_id + install_id
+    payload = bytes([SESS_HELLO]) + struct.pack("<H", hello_tag) + bytes([protocol_version]) + app_id + install_id
     payload += bytes([len(token) if token else 0]) + (token or b"")
     encoded_name = name.encode("utf-8")[:24]
     payload += bytes([len(encoded_name)]) + encoded_name
@@ -672,13 +688,17 @@ class Session:
 
     # -- handshake ----------------------------------------------------------- #
 
-    async def send_hello(self, token: bytes | None = None) -> None:
+    async def send_hello(self, token: bytes | None = None, protocol_version: int = PROTOCOL_VERSION) -> None:
         """Arm the reply futures and write HELLO. Does not wait for the answer.
 
         Split from wait_hello() because the interesting case has something to do
         in between: an unknown peer's HELLO answers HELLO_PENDING and then
         nothing at all until somebody presses CONFIRM on the device, which is
         what the e2e harness is there to do.
+
+        `protocol_version` defaults to this module's own version; pass a
+        different value to provoke HELLO_DENIED(PROTOCOL_MISMATCH) -- see
+        encode_hello()'s doc comment.
         """
         assert self.link is not None
         if token is not None:
@@ -686,7 +706,8 @@ class Session:
         self.hello_tag = int.from_bytes(os.urandom(2), "little") or 1
         self._hello_future = self.link.loop.create_future()
         self._pending_future = self.link.loop.create_future()
-        payload = encode_hello(self.hello_tag, self.app_id, self.install_id, self.token, self.name, self.user_name)
+        payload = encode_hello(self.hello_tag, self.app_id, self.install_id, self.token, self.name, self.user_name,
+                               protocol_version)
         await self._client.write_gatt_char(SESSION_CHAR_UUID, payload, response=True)
 
     async def wait_hello(self, timeout: float = 40.0) -> HelloResult:
