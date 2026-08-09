@@ -15,6 +15,7 @@
 #include "CompanionBle.h"
 #include "CompanionPeerStore.h"
 #include "CompanionTestConsole.h"
+#include "CompanionUiDeclaration.h"
 #include "Epub/converters/ImageDecoderFactory.h"
 #include "MappedInputManager.h"
 #include "activities/reader/ReaderUtils.h"
@@ -303,10 +304,15 @@ void CompanionModeActivity::loadUiDeclaration() {
   uint8_t raw[companionpeer::kMaxUiDeclarationLen];
   const size_t len =
       companionpeer::readAssetBody(foregroundPeerKey.c_str(), companionpeer::kAssetUiDeclaration, raw, sizeof(raw));
-  if (len < 1) return;
+  // Validate through the shared codec rather than re-deriving the layout here.
+  // storeAsset() refuses anything that does not parse, so a stored declaration
+  // that fails now means a corrupt card, not an old client -- leaving the
+  // cleared state (no buttons, no tags) is the safe answer either way.
+  companionui::DeclarationInfo info;
+  if (companionui::parseBody(raw, len, &info) != companionui::ParseResult::Ok) return;
 
-  const uint8_t buttonEntries = raw[0];
-  size_t offset = 1;
+  const uint8_t buttonEntries = info.buttonCount;
+  size_t offset = companionui::kBodyFirstButtonOffset;
   for (uint8_t i = 0; i < buttonEntries && offset + 3 <= len; ++i) {
     const uint8_t buttonId = raw[offset];
     const uint8_t routing = raw[offset + 1];

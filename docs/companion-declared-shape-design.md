@@ -80,22 +80,50 @@ Secondary reasons, all pointing the same way:
   being a list peer. Declaring them in one asset is coherent, and halves the digest bookkeeping,
   which is the same argument that folded button labels and tag labels into one asset to begin with
   (`src/CompanionBle.h:199-202`).
-- It is cheap. `uiDeclarationParses()` currently ends `return len - offset <= 2;`
-  (`src/CompanionPeerStore.cpp:163`) — permitting at most two trailing optional bytes. One more byte
-  means `<= 3` there and one more read in `loadUiDeclaration()`
-  (`CompanionModeActivity.cpp:355-361`), following the established "ran out of buffer means absent"
-  convention.
+- It is cheap *to specify*, but not as cheap to implement as an earlier draft of this bullet claimed.
+  That draft said the change was `return len - offset <= 2;` becoming `<= 3`
+  (`src/CompanionPeerStore.cpp:163`) plus one read in `loadUiDeclaration()`. Both are wrong: under
+  the offset-4 placement above, the *trailing* byte count does not change at all, and there turned
+  out to be **four** independent hand-rolled walks of this layout, not two —
+  `uiDeclarationParses()`, `isImageCapable()` (`CompanionPeerStore.cpp:426`),
+  `CompanionModeActivity::loadUiDeclaration()`, and the `CUI` command in `CompanionTestConsole.cpp`.
+  Every one of them starts its walk at a hardcoded offset. Inserting a byte at offset 4 breaks all
+  four silently — the firmware still builds and every host test still passes, because three of the
+  four are hardware-only code. This is the real cost of the change and the reason the parse was
+  extracted into `src/CompanionUiDeclaration.{h,cpp}` with a shared `kBodyFirstButtonOffset` rather
+  than patched in place.
 
 ### Wire shape
 
-A third optional trailing byte on the UI declaration, after the `TagRenderStyle` byte and the
-capability bitmask:
+**A mandatory byte immediately after the 4-byte digest, before the button count** — *not* a third
+trailing byte after `TagRenderStyle` and the capability bitmask, which is where an earlier draft put
+it. That placement is unimplementable: the declaration's trailing fields signal absence by the buffer
+running out (`src/CompanionPeerStore.cpp:158-163`), so a **mandatory** field cannot sit behind
+optional ones — given a single trailing byte, a decoder cannot tell a shape from a render style.
+Inserting at offset 4 is free precisely because §6 is a clean break, and it leaves the
+trailing-optional convention intact for the two fields that legitimately use it.
+
+```
+bytes 0..3   opaque digest
+byte  4      content shape              <- new, mandatory
+byte  5      button entry count N
+N x { buttonId:1, routing:1, labelLen:1, label[labelLen] }
+byte         tag entry count M          (optional; absent means zero tags)
+M x { tagId:1, labelLen:1, label[labelLen] }
+byte         tag render style           (optional; absent means Bordered)
+byte         capabilities bitmask       (optional; absent means none)
+```
+
+The shape values:
 
 ```
 0x01  TEXT     title/body/content-id/tag-state
 0x02  IMAGE    image
 0x03  LIST     todo-list document
 ```
+
+`0x00` and anything above `0x03` are invalid, not reserved — an unknown shape is refused rather than
+tolerated, since the whole point is that the firmware always knows what a peer will push.
 
 **Mandatory** — there is no unset value and no default. A declaration without the byte fails
 `uiDeclarationParses()` and is rejected at store time, which means the peer has no stored declaration

@@ -145,6 +145,13 @@ enum class AssetStoreResult : uint8_t {
   RejectedSize = 0x01,
   RejectedFormat = 0x02,
   RejectedStorage = 0x03,
+  // A UI declaration that parses structurally but carries no known content
+  // shape (companionble::ContentShape). Distinct from RejectedFormat on
+  // purpose: it costs one enum value and earns it during the v11 -> v12
+  // migration, when "your declaration is missing its shape byte" is a far
+  // better thing to read in a log than "malformed" — see
+  // docs/companion-declared-shape-design.md section 3.
+  RejectedNoShape = 0x04,
 };
 AssetStoreResult storeAsset(const char* peerKey, uint8_t assetId, const uint8_t* data, size_t len,
                             size_t expectedIconBytes);

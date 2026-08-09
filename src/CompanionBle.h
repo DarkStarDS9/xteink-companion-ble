@@ -124,6 +124,29 @@ enum class ButtonRouting : uint8_t {
   LocalSleep = 0x04,
 };
 
+// What kind of content a peer pushes, declared once per peer in its UI
+// declaration (kFieldUiDeclaration) rather than inferred from whichever field
+// happened to arrive last. See docs/companion-declared-shape-design.md: the
+// firmware has to know a peer's shape *while disconnected* (the idle icon grid
+// opens a peer's stored document with no session in existence), which an
+// ACQUIRE-time byte could never answer, and a shape that holds local user
+// state must not be clobbered by a stray title/body push from the same app.
+//
+// A single value, not a bitmask: a peer declaring "text or list" would
+// reintroduce exactly the state-clobbering and button-claiming ambiguity the
+// declaration exists to remove.
+//
+// 0x00 and anything above 0x03 are INVALID, not reserved — an unknown shape is
+// refused rather than tolerated, because the whole point of declaring is that
+// the firmware always knows what a peer will push. Tolerating an unknown value
+// would mean falling back to "whatever arrives", i.e. the reactive model this
+// replaces.
+enum class ContentShape : uint8_t {
+  Text = 0x01,   // title/body/content-id/tag-state
+  Image = 0x02,  // image
+  List = 0x03,   // todo-list document
+};
+
 // Button-event characteristic event types (bits 6-4 of the header byte). Only
 // one exists today; the field is reserved so a future non-press event could
 // share this characteristic without a wire-incompatible change.

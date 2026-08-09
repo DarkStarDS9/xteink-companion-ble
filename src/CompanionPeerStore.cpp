@@ -1,6 +1,7 @@
 #include "CompanionPeerStore.h"
 
 #include "CompanionBle.h"
+#include "CompanionUiDeclaration.h"
 
 #include <ArduinoJson.h>
 #include <HalStorage.h>
@@ -122,46 +123,11 @@ bool writeWholeFile(const std::string& path, const uint8_t* data, size_t len) {
   return written == len;
 }
 
-// The UI declaration is validated here rather than at render time so a
-// malformed push is rejected with ASSET_REJECTED_FORMAT while the app can still
-// do something about it — a declaration that half-parsed would draw nonsense
-// hints with no way to find out why.
-//
-//   bytes 0..3  opaque digest
-//   byte  4     button entry count N
-//   N x { buttonId:1, routing:1, labelLen:1, label[labelLen] }
-//   byte        tag entry count M          (optional; absent means zero tags)
-//   M x { tagId:1, labelLen:1, label[labelLen] }
-//   byte        tag render style           (optional; absent means Bordered)
-//   byte        capabilities bitmask       (optional; absent means none)
-bool uiDeclarationParses(const uint8_t* data, size_t len) {
-  if (len < 5) return false;  // digest + button count
-  const uint8_t buttonCount = data[4];
-  size_t offset = 5;
-  for (uint8_t i = 0; i < buttonCount; ++i) {
-    if (offset + 3 > len) return false;
-    offset += 3 + data[offset + 2];
-    if (offset > len) return false;
-  }
-
-  // The tag section is optional: an app with no tags may simply stop after its
-  // buttons rather than append a zero byte.
-  if (offset != len) {
-    const uint8_t tagCount = data[offset++];
-    for (uint8_t i = 0; i < tagCount; ++i) {
-      if (offset + 2 > len) return false;
-      offset += 2 + data[offset + 1];
-      if (offset > len) return false;
-    }
-  }
-
-  // Up to two more trailing bytes may follow the tag section: tag render
-  // style, then capabilities. Both are optional and independently absent —
-  // "ran out of buffer" is how a decoder tells absent from present, so
-  // anything beyond two extra bytes here is not a declaration this version
-  // knows how to produce.
-  return len - offset <= 2;
-}
+// The UI declaration's byte layout, its validation rules and its host gtest
+// suite all live in CompanionUiDeclaration.{h,cpp} — this file cannot be
+// host-built (ArduinoJson, PersistableStore, HalStorage), and the codec is
+// pure, so it was extracted exactly as CompanionBatchModel and
+// CompanionConnPolicy were. Nothing here parses declaration bytes itself.
 
 // Deletes a peer's directory and everything under it. Used by LRU eviction.
 void removePeerDir(const char* peerKey) {
@@ -286,7 +252,16 @@ AssetStoreResult storeAsset(const char* peerKey, uint8_t assetId, const uint8_t*
     if (len != 4 + expectedIconBytes) return AssetStoreResult::RejectedSize;
   } else if (assetId == kAssetUiDeclaration) {
     if (len > kMaxUiDeclarationLen) return AssetStoreResult::RejectedSize;
-    if (!uiDeclarationParses(data, len)) return AssetStoreResult::RejectedFormat;
+    switch (companionui::parseAsset(data, len, nullptr)) {
+      case companionui::ParseResult::Ok:
+        break;
+      // Reported separately from the generic format failure so a client
+      // mid-migration is told which of the two it is; see the enum's comment.
+      case companionui::ParseResult::NoShape:
+        return AssetStoreResult::RejectedNoShape;
+      case companionui::ParseResult::Malformed:
+        return AssetStoreResult::RejectedFormat;
+    }
   } else {
     return AssetStoreResult::RejectedFormat;
   }
@@ -424,29 +399,16 @@ std::string userName(const char* peerKey) {
 }
 
 bool isImageCapable(const char* peerKey) {
+  // readAssetBody() strips the opaque tag, so this is the declaration *body*:
+  // shape byte first, then the button count. It walked the layout by hand
+  // until the shape byte was added — a second copy of the offset arithmetic
+  // that would have silently read the shape as a button count. Both callers
+  // now share the one parser.
   uint8_t raw[kMaxUiDeclarationLen];
   const size_t len = readAssetBody(peerKey, kAssetUiDeclaration, raw, sizeof(raw));
-  if (len < 1) return false;
-
-  const uint8_t buttonCount = raw[0];
-  size_t offset = 1;
-  for (uint8_t i = 0; i < buttonCount; ++i) {
-    if (offset + 3 > len) return false;
-    offset += 3 + raw[offset + 2];
-    if (offset > len) return false;
-  }
-  if (offset == len) return false;  // no tag section, so nothing trailing either
-
-  const uint8_t tagCount = raw[offset++];
-  for (uint8_t i = 0; i < tagCount; ++i) {
-    if (offset + 2 > len) return false;
-    offset += 2 + raw[offset + 1];
-    if (offset > len) return false;
-  }
-
-  if (offset < len) ++offset;   // skip the optional tag-render-style byte, present or not
-  if (offset >= len) return false;  // no capabilities byte present
-  return (raw[offset] & companionble::kUiCapabilityImageGallery) != 0;
+  companionui::DeclarationInfo info;
+  if (companionui::parseBody(raw, len, &info) != companionui::ParseResult::Ok) return false;
+  return (info.capabilities & companionble::kUiCapabilityImageGallery) != 0;
 }
 
 void touch(const char* peerKey) {

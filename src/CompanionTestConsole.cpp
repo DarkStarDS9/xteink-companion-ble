@@ -8,6 +8,7 @@
 #include <cstdio>
 
 #include "CompanionPeerStore.h"
+#include "CompanionUiDeclaration.h"
 
 namespace companiontest {
 
@@ -240,9 +241,19 @@ bool handleCommand(const String& command) {
       return true;
     }
 
-    const uint8_t buttonCount = raw[0];
-    reply("ui peer=%s buttons=%u", peerKey, static_cast<unsigned>(buttonCount));
-    size_t offset = 1;
+    // Validate and read the header through the shared codec; only the per-entry
+    // labels are walked here. See CompanionUiDeclaration.h's note on
+    // kBodyFirstButtonOffset for why this offset is not spelled out locally.
+    companionui::DeclarationInfo info;
+    if (companionui::parseBody(raw, length, &info) != companionui::ParseResult::Ok) {
+      reply("ui none: peer %s has an unparseable declaration", peerKey);
+      return true;
+    }
+
+    const uint8_t buttonCount = info.buttonCount;
+    reply("ui peer=%s shape=%u buttons=%u", peerKey, static_cast<unsigned>(info.shape),
+          static_cast<unsigned>(buttonCount));
+    size_t offset = companionui::kBodyFirstButtonOffset;
     for (uint8_t i = 0; i < buttonCount && offset + 3 <= length; ++i) {
       const uint8_t id = raw[offset];
       const uint8_t routing = raw[offset + 1];
