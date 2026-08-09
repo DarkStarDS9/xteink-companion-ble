@@ -39,6 +39,13 @@ class HalDisplay {
                             bool fromProgmem = false) const;
 
   void displayBuffer(RefreshMode mode = RefreshMode::FAST_REFRESH, bool turnOffScreen = false);
+  // Panel-memory-coordinate windowed refresh (x/w must already be 8-aligned —
+  // see GfxRenderer::displayWindow for the screen-coordinate wrapper that
+  // handles alignment and rotation). Forwards to EInkDisplay::displayWindow,
+  // which was marked EXPERIMENTAL in the vendored SDK; this is the first
+  // caller. Passes straight to PanelDriver::displayWindow, which on X3 issues
+  // UC8253's CMD_PARTIAL_WINDOW/PARTIAL_IN/PARTIAL_OUT.
+  void displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool turnOffScreen = false);
   // Non-blocking refresh (shadow-free): starts the panel waveform and returns
   // while the panel refreshes on its own. The framebuffer must stay untouched
   // until waitRefreshComplete(), and the caller must rebuild the differential

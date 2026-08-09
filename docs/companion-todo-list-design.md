@@ -75,12 +75,25 @@ yet.
 
 - **New field `kFieldListDoc = 0x08`** (next free per `src/CompanionBle.h:209`). Pushed as a whole
   document — no incremental add/remove-item ops, matching how `kFieldUiDeclaration` and the icon are
-  always full replaces. Framed and reassembled like title/body (`kFieldTitle`/`kFieldBody`), not
-  streamed straight to SD like `kFieldImage`: list text is small (a big shopping list is a few KB,
-  nowhere near a raw 132×792 image), so RAM reassembly under a new cap — e.g.
-  `kMaxListDocLen = 16 * 1024`, a `CompanionBle.h` constant next to `kMaxFieldLen` — followed by one
-  parse-and-write to `lists.json`, mirrors what already happens for the UI declaration
-  (`kMaxUiDeclarationLen = 512` at `src/CompanionPeerStore.h:107`) just at a larger size.
+  always full replaces. Reassembled in RAM like title/body (`kFieldTitle`/`kFieldBody`), not streamed
+  straight to SD like `kFieldImage`: list text is small.
+  - **Cap: `kMaxListDocLen = 16 KB`**, chosen against the actual remaining headroom, not picked round:
+    current steady-state DRAM usage is 154,857 / 321,296 bytes (48.2%), leaving ~166 KB
+    (`pio run -e default`'s size report, measured while doing this design pass) — even the full 16 KB
+    resident would be a rounding error against that.
+  - **But it must NOT follow title/body's storage pattern.** `kFieldTitle`/`kFieldBody` reassemble
+    into `CompanionBatchModel::titleBuf_`/`bodyBuf_`, fixed `kMaxFieldLen` (4 KB) arrays inside the
+    **global** `g_batchModel` instance (`src/CompanionBatchModel.h:109,113`,
+    `src/activities/companion/CompanionModeActivity.cpp:102`) — resident for the firmware's entire
+    life, not just during a push, which is fine at 2×4 KB on a hot path exercised by every content
+    push. A list document is 4x that size and pushed rarely (a full document replace, not a per-item
+    op) — following the same fixed-global-buffer pattern would make 16 KB permanently resident for a
+    feature most sessions never touch. Instead: heap-allocate via `makeUniqueNoThrow` (per this repo's
+    heap-discipline convention) for the duration of one push, write straight through to `lists.json`,
+    free immediately after. Alloc-per-push is normally something to avoid here for fragmentation
+    reasons, but a todo-list push is infrequent enough (not a hot per-CHUNK or per-frame path) that
+    the tradeoff favors not carrying 16 KB permanently over avoiding one alloc/free per full-document
+    sync.
 - **Document carries a `revision : u32`**, monotonically increasing, assigned by the phone on every
   push. This is what makes "sync all lists together" (§6) coherent: one number describes the whole
   document's freshness, not one per list.
@@ -160,26 +173,37 @@ version). New first-class Swift types, not opaque-bytes round-tripping:
 |---|---|---|
 | Document (`lists.json`) | SD | 0 RAM |
 | Local diff (`list_state.json`) | SD | 0 RAM |
-| In-flight document reassembly | RAM, foreground peer only, freed after write to SD | ≤ `kMaxListDocLen` (proposed 16 KB), transient |
+| In-flight document reassembly | heap, `makeUniqueNoThrow`, freed right after the write to SD | ≤ `kMaxListDocLen` = 16 KB, transient — **not** a fixed global buffer (see §4's note on why this deliberately does not copy the title/body pattern) |
 | List/cursor nav state | RAM, foreground peer only | comparable to the ~200 B gallery nav state (§11 of the multi-app design) |
 
-The reassembly buffer is the only new steady-state-adjacent cost, and it is not steady-state — it is
-held only for the duration of one push, same lifetime as the existing title/body reassembly buffer,
-just larger. Net new *resident* RAM is well under 1 KB, matching the multi-app design's own budget
-outcome.
+Net new *permanently resident* RAM is well under 1 KB, matching the multi-app design's own budget
+outcome — the 16 KB reassembly buffer is real but transient, alive only for the duration of one push,
+against ~166 KB of measured headroom (see §4).
 
-## 9. Open questions
+## 9. Open questions — resolved
 
 ~~Group ordering~~ — resolved by §2's move to hierarchical nesting: order is array position, no
 separate field needed.
 
-1. **Reassembly cap size.** 16 KB is a guess pending a sense of how big a real shopping list plus a
-   week's meal-plan list plus whatever else gets stress-tested actually is. Needs a number before
-   this ships, not a round one picked in advance.
-2. **Partial-refresh on toggle.** Whether the panel's grayscale settle path supports single-row
-   redraw cheaply enough to make per-toggle feel instant, or whether toggling several items in a row
-   needs to coalesce into one redraw the way batched content pushes already do
-   (`kFinalFieldFlag`). Rendering-layer question, not a protocol one — doesn't block the wire design.
+~~Reassembly cap size~~ — **resolved: 16 KB, heap-transient, not a global buffer.** Settled by reading
+the actual measured RAM budget (`pio run -e default`'s size report: 154,857 / 321,296 bytes DRAM used,
+~166 KB headroom) rather than picking a round number — see §4's full reasoning and its correction to
+this doc's earlier, wrong assumption that the title/body reassembly buffer is already transient (it
+isn't; it's a fixed 4 KB × 2 global array, `src/CompanionBatchModel.h:109,113`). This is a resolvable
+by-reading-the-code question, not one that needed a device — no on-device test was run for this one.
+
+~~Partial-refresh on toggle~~ — **resolved on hardware: viable, no coalescing needed.** `HalDisplay`
+had no windowed-refresh entry point (`GfxRenderer::displayWindow` was a commented-out declaration at
+`lib/GfxRenderer/GfxRenderer.h:194`, one layer above a working but unwired SDK implementation,
+`FreeInkDisplay::displayWindow`, `freeink-sdk/libs/display/FreeInkDisplay/src/FreeInkDisplay.cpp:672`)
+— wired it through (`HalDisplay::displayWindow`, `GfxRenderer::displayWindow`, reusing the alignment
+helper `readFramebufferRegion`/`writeFramebufferRegion` already share) and measured on an X3 with a
+throwaway serial-triggered probe: a full `FAST_REFRESH` took **2979 ms**; a windowed refresh of a
+single ~40px list-row took **430 ms** — about 7x faster, and comfortably under the ~2.2s multi-pass
+grayscale settle already accepted as normal for a full content push (`src/CompanionBle.h:224-227`).
+**A toggle can refresh its own row without coalescing.** The `displayWindow` plumbing is now real,
+committed infrastructure for phase B, not a documentation artifact — the throwaway probe command
+itself was removed after measuring.
 
 ## 10. Sequencing
 

@@ -190,8 +190,14 @@ class GfxRenderer {
   // fadingFix isn't forcing the blocking path. Callers can skip overlap
   // scaffolding (e.g. whole-plane grayscale buffers) when false.
   bool supportsAsyncRefresh() const;
-  // EXPERIMENTAL: Windowed update - display only a rectangular region
-  // void displayWindow(int x, int y, int width, int height) const;
+  // Windowed refresh of a screen-coordinate rectangle: only that region is
+  // repainted rather than the whole panel. Aligns/rotates via
+  // screenRectToAlignedMemRect (the same helper readFramebufferRegion uses),
+  // so x/w get snapped outward to 8-pixel boundaries before reaching
+  // HalDisplay::displayWindow — the drawn region may be slightly larger than
+  // requested, never smaller. No-op if the rectangle is empty or fully
+  // offscreen after clamping.
+  void displayWindow(int x, int y, int width, int height, bool turnOffScreen = false) const;
   void invertScreen() const;
   void clearScreen(uint8_t color = 0xFF) const;
   void getOrientedViewableTRBL(int* outTop, int* outRight, int* outBottom, int* outLeft) const;

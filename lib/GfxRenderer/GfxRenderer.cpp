@@ -1575,6 +1575,13 @@ size_t GfxRenderer::readFramebufferRegion(int x, int y, int w, int h, uint8_t* d
   return needed;
 }
 
+void GfxRenderer::displayWindow(int x, int y, int width, int height, bool turnOffScreen) const {
+  const AlignedMemRect mem = screenRectToAlignedMemRect(orientation, x, y, width, height, panelWidth, panelHeight);
+  if (!mem.valid) return;
+
+  display.displayWindow(mem.x, mem.y, mem.w, mem.h, turnOffScreen);
+}
+
 void GfxRenderer::writeFramebufferRegion(int x, int y, int w, int h, const uint8_t* src) {
   if (src == nullptr || w <= 0 || h <= 0) return;
 
