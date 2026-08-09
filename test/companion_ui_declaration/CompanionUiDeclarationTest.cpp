@@ -331,4 +331,74 @@ TEST(CompanionUiDeclaration, OutStructIsUntouchedWhenTheParseFails) {
   EXPECT_EQ(info.buttonCount, 42);
 }
 
+// ---------------------------------------------------------------------------
+// v12 enforcement: which content fields a declared shape permits.
+//
+// Every case here is a wire-contract statement, not an implementation detail:
+// a mismatch is answered RenderResult::RejectedShape and the push is dropped,
+// so a wrong entry in this table silently bricks a real app's content.
+// ---------------------------------------------------------------------------
+
+constexpr uint8_t kText = static_cast<uint8_t>(ContentShape::Text);
+constexpr uint8_t kImage = static_cast<uint8_t>(ContentShape::Image);
+constexpr uint8_t kList = static_cast<uint8_t>(ContentShape::List);
+
+TEST(CompanionShapeEnforcement, TextPeerMayPushTheTextBatchFields) {
+  EXPECT_TRUE(companionui::fieldMatchesShape(companionble::kFieldTitle, kText));
+  EXPECT_TRUE(companionui::fieldMatchesShape(companionble::kFieldBody, kText));
+  EXPECT_TRUE(companionui::fieldMatchesShape(companionble::kFieldContentId, kText));
+  // Tag state rides the same atomic batch as title/body, so a TEXT peer that
+  // could not push it could not commit content and its tags in one redraw.
+  EXPECT_TRUE(companionui::fieldMatchesShape(companionble::kFieldTagState, kText));
+}
+
+TEST(CompanionShapeEnforcement, TextPeerMayNotPushAnImage) {
+  EXPECT_FALSE(companionui::fieldMatchesShape(companionble::kFieldImage, kText));
+}
+
+TEST(CompanionShapeEnforcement, ImagePeerMayPushOnlyTheImageField) {
+  EXPECT_TRUE(companionui::fieldMatchesShape(companionble::kFieldImage, kImage));
+  EXPECT_FALSE(companionui::fieldMatchesShape(companionble::kFieldTitle, kImage));
+  EXPECT_FALSE(companionui::fieldMatchesShape(companionble::kFieldBody, kImage));
+  EXPECT_FALSE(companionui::fieldMatchesShape(companionble::kFieldContentId, kImage));
+  EXPECT_FALSE(companionui::fieldMatchesShape(companionble::kFieldTagState, kImage));
+}
+
+TEST(CompanionShapeEnforcement, ListPeerHasNoContentFieldYet) {
+  // Deliberate: the list document has no wire field of its own yet, so a LIST
+  // peer pushing anything is pushing something it could not render. This test
+  // is expected to change when that field is added -- not to be deleted.
+  for (const uint8_t field : {companionble::kFieldTitle, companionble::kFieldBody, companionble::kFieldContentId,
+                              companionble::kFieldImage, companionble::kFieldTagState}) {
+    EXPECT_FALSE(companionui::fieldMatchesShape(field, kList)) << "field " << std::hex << int(field);
+  }
+}
+
+TEST(CompanionShapeEnforcement, UnknownOrUncachedShapePermitsNothing) {
+  // 0 is the Session's "not cached yet" sentinel; the caller must catch it
+  // before asking. If it ever reaches here the answer is "no", not "sure".
+  EXPECT_FALSE(companionui::fieldMatchesShape(companionble::kFieldTitle, 0));
+  EXPECT_FALSE(companionui::fieldMatchesShape(companionble::kFieldImage, 0xFF));
+}
+
+TEST(CompanionShapeEnforcement, EveryKnownShapeAcceptsAtLeastOneFieldOrIsDeliberatelyEmpty) {
+  // Guards the enum against a shape being added to ContentShape and forgotten
+  // in the table: a new value would fall out of every arm and reject silently.
+  for (const uint8_t shape : {kText, kImage, kList}) {
+    ASSERT_TRUE(companionui::isKnownShape(shape));
+  }
+  EXPECT_TRUE(companionui::fieldMatchesShape(companionble::kFieldBody, kText));
+  EXPECT_TRUE(companionui::fieldMatchesShape(companionble::kFieldImage, kImage));
+}
+
+TEST(CompanionShapeEnforcement, AParsedDeclarationsShapeDrivesTheTableDirectly) {
+  // The two halves joined: what parseBody() reports is exactly what enforcement
+  // consumes, with no re-interpretation in between.
+  DeclarationInfo info;
+  const auto a = asset(body(static_cast<uint8_t>(ContentShape::Image), {button(1, 0x01, "Next")}));
+  ASSERT_EQ(parse(a, &info), ParseResult::Ok);
+  EXPECT_TRUE(companionui::fieldMatchesShape(companionble::kFieldImage, static_cast<uint8_t>(info.shape)));
+  EXPECT_FALSE(companionui::fieldMatchesShape(companionble::kFieldBody, static_cast<uint8_t>(info.shape)));
+}
+
 }  // namespace

@@ -211,6 +211,14 @@ enum class TagRenderStyle : uint8_t {
 // apps that say they push photos at all.
 inline constexpr uint8_t kUiCapabilityImageGallery = 0x01;
 
+// Wire protocol version, reported as the first byte of the capability
+// characteristic. Named rather than a bare literal at its one use site because
+// a version bump and the behaviour change that earns it must be impossible to
+// land apart. v12 is the declared-content-shape break: a peer's UI declaration
+// carries a mandatory shape byte, and a push that does not match it is refused
+// with RenderResult::RejectedShape rather than silently taking the screen.
+inline constexpr uint8_t kProtocolVersion = 12;
+
 // Content characteristic field identifiers, matching docs/companion-display-protocol.md.
 inline constexpr uint8_t kFieldTitle = 0x01;
 inline constexpr uint8_t kFieldBody = 0x02;
@@ -282,6 +290,17 @@ enum class RenderResult : uint8_t {
   // from every other case here in that nothing actually went wrong: the push
   // was merely overtaken, and a caller may well not want to retry it.
   Superseded = 0x05,
+  // v12: the pushing peer declared a different content shape, so this field is
+  // one it can never render -- a title/body to an IMAGE peer, an image to a
+  // TEXT peer. The shape is the peer's own statement of what it pushes (see
+  // docs/companion-declared-shape-design.md §3), so unlike every case above
+  // this is a client bug: retrying the same push unchanged fails identically.
+  // Changing shape is possible but deliberate -- re-push the UI declaration
+  // (§4), which clears the screen and reloads the button map.
+  //
+  // Latched at START, before any buffer is allocated, and answered at END,
+  // mirroring the oversize-image path exactly -- START carries no pushId.
+  RejectedShape = 0x06,
 };
 
 // Why a session lost the screen, reported as BACKGROUND.

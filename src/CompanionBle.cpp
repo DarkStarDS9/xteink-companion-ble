@@ -17,6 +17,7 @@
 
 #include "CompanionConnPolicy.h"
 #include "CompanionPeerStore.h"
+#include "CompanionUiDeclaration.h"
 #include "Epub/converters/RawBitmapToFramebufferConverter.h"
 #include "Memory.h"
 
@@ -254,6 +255,16 @@ struct Session {
   // background app that comes back does not inherit somebody else's token.
   uint8_t contentId[kMaxContentIdLen] = {0};
   uint8_t contentIdLen = 0;
+  // This peer's declared content shape (companionble::ContentShape), cached
+  // from SD at ACQUIRE and refreshed when the peer re-pushes its declaration.
+  // The cache is the whole point: see docs/companion-declared-shape-design.md
+  // §5 -- consulting SD per push would put an open on the BLE host task for
+  // every field of every push.
+  //
+  // A raw byte rather than ContentShape because 0 is not a legal shape and has
+  // to mean "not known yet": allocateSession() zero-initialises, and an enum
+  // with no zero enumerator would make that state unnameable.
+  uint8_t declaredShape = 0;
 };
 
 Session g_sessions[kMaxSessions];
@@ -419,6 +430,13 @@ uint32_t g_activeWritten = 0;
 bool g_activeFinal = false;
 std::unique_ptr<uint8_t[]> g_activeBuf;
 bool g_activeImageOverflow = false;
+// v12: set at START when the field being pushed is not one the foreground
+// peer's declared content shape permits (see fieldMatchesShape() below). The
+// transfer is then consumed and thrown away -- no buffer is allocated, CHUNKs
+// no-op -- and END answers RejectedShape. Latched rather than answered on the
+// spot for the same reason g_activeImageOverflow is: START carries no pushId,
+// it arrives only on END.
+bool g_activeShapeRejected = false;
 // Set once handing image work to the writer task fails (queue full/missing,
 // see enqueueImageWork()) -- once true, further CHUNKs for this transfer are
 // dropped without retrying (a retry loop here would just re-introduce the
@@ -782,6 +800,7 @@ void resetReassembly() {
   g_activeWritten = 0;
   g_activeFinal = false;
   g_activeImageOverflow = false;
+  g_activeShapeRejected = false;
   g_activeImageFailed = false;
   g_activeSeq = 0;
   g_activeSeqGap = false;
@@ -817,6 +836,12 @@ bool isKnownField(uint8_t field) {
          field == kFieldUiDeclaration || field == kFieldIcon || field == kFieldTagState;
 }
 
+// v12's permitted-field table is companionui::fieldMatchesShape(), one file
+// over: it is a pure lookup with no NimBLE dependency, and it lives beside the
+// parser that produces the shape in the first place so a host gtest can reach
+// it. This translation unit cannot be host-built at all, which is the same
+// argument that moved parseBody() out of CompanionPeerStore.cpp.
+
 // ---------------------------------------------------------------------------
 // Capability characteristic
 // ---------------------------------------------------------------------------
@@ -836,12 +861,14 @@ void computeCapabilityValue(const GfxRenderer& renderer, int fontId) {
   const uint64_t mac = ESP.getEfuseMac();
 
   size_t offset = 0;
-  g_capabilityValue[offset++] = 11;  // protocol version
+  g_capabilityValue[offset++] = kProtocolVersion;
   g_capabilityValue[offset++] = static_cast<uint8_t>(screenWidthChars > 255 ? 255 : screenWidthChars);
   g_capabilityValue[offset++] = static_cast<uint8_t>(screenHeightChars > 255 ? 255 : screenHeightChars);
   g_capabilityValue[offset++] = static_cast<uint8_t>(kMaxFieldLen & 0xFF);
   g_capabilityValue[offset++] = static_cast<uint8_t>((kMaxFieldLen >> 8) & 0xFF);
-  g_capabilityValue[offset++] = 0x0F;  // bit0 image, bit1 button map, bit2 icons, bit3 sessions
+  // bit0 image, bit1 button map, bit2 icons, bit3 sessions,
+  // bit4 declared content shape (v12)
+  g_capabilityValue[offset++] = 0x1F;
   g_capabilityValue[offset++] = static_cast<uint8_t>(kMaxImageFieldLen & 0xFF);
   g_capabilityValue[offset++] = static_cast<uint8_t>((kMaxImageFieldLen >> 8) & 0xFF);
   g_capabilityValue[offset++] = static_cast<uint8_t>((kMaxImageFieldLen >> 16) & 0xFF);
@@ -984,14 +1011,31 @@ class SessionCharCallbacks : public NimBLECharacteristicCallbacks {
           notifySession(denied, sizeof(denied));
           return;
         }
-        // A peer with no button map cannot take the screen. This is what makes
-        // "an app with undefined buttons" structurally impossible rather than a
-        // case the rendering code has to handle.
-        if (!companionpeer::hasUiDeclaration(session->peerKey)) {
+        // A peer with no usable declaration cannot take the screen. This is
+        // what makes "an app with undefined buttons" -- and, since v12, "an app
+        // whose content shape nobody knows" -- structurally impossible rather
+        // than a case the rendering code has to handle.
+        //
+        // THIS READ IS THE ONLY SD TOUCH FOR THE SHAPE. It is cached on the
+        // session here and consulted from RAM on every subsequent push; see
+        // docs/companion-declared-shape-design.md §5 for why per-push reads are
+        // the one implementation that must not be written, however natural it
+        // looks: an SD open on the NimBLE host task for every field of every
+        // push is exactly what the image writer task exists to avoid.
+        //
+        // Deliberately a full parse rather than the bare Storage.exists() this
+        // used to be. It tightens the gate -- a stored-but-corrupt declaration
+        // now denies instead of admitting a peer with a garbage button map --
+        // and needs no new denial reason: §3's structural rule is that a peer
+        // which has not declared itself cannot reach the screen, and an
+        // unparseable declaration has declared nothing.
+        companionble::ContentShape shape;
+        if (!companionpeer::readDeclaredShape(session->peerKey, &shape)) {
           const uint8_t denied[3] = {kSessAcquireDenied, sessionId, kAcquireDeniedNoButtonMap};
           notifySession(denied, sizeof(denied));
           return;
         }
+        session->declaredShape = static_cast<uint8_t>(shape);
         setForeground(sessionId);
         break;
       }
@@ -1060,18 +1104,31 @@ void beginImageStaging(const Session& session) {
   if (!enqueueImageWork(msg, "open")) g_activeImageFailed = true;
 }
 
-void finishAsset(uint8_t field, const Session& session, uint8_t sessionId) {
+// `session` is non-const because a stored UI declaration re-push updates the
+// cached content shape on it -- see the Stored branch below.
+void finishAsset(uint8_t field, Session& session, uint8_t sessionId) {
   const companionpeer::AssetStoreResult result = companionpeer::storeAsset(
       session.peerKey, field == kFieldIcon ? companionpeer::kAssetIcon : companionpeer::kAssetUiDeclaration,
       g_activeBuf.get(), g_activeWritten, kIconBytes);
   notifyAssetAck(sessionId, field, result, session.peerKey);
   if (result != companionpeer::AssetStoreResult::Stored) {
     LOG_ERR("CBLE", "asset 0x%02x rejected (%u)", field, static_cast<unsigned>(static_cast<uint8_t>(result)));
-  } else if (field == kFieldUiDeclaration && g_foreground == sessionId && g_foregroundCb) {
+  } else if (field == kFieldUiDeclaration && g_foreground == sessionId) {
     // The foreground app just changed its control scheme; re-read it now rather
     // than waiting for the next connect.
-    const std::string name = companionpeer::displayName(session.peerKey);
-    g_foregroundCb(session.peerKey, name.c_str());
+    //
+    // The cached shape is refreshed from the same read, and must be: re-pushing
+    // the declaration while foreground is the *only* sanctioned way to change
+    // content shape mid-session (docs/companion-declared-shape-design.md §4),
+    // so leaving the cache stale here would enforce the old shape against an
+    // app that has just legitimately become a different one. This is the second
+    // and last SD touch for the shape; the push path never reads.
+    companionble::ContentShape shape;
+    if (companionpeer::readDeclaredShape(session.peerKey, &shape)) session.declaredShape = static_cast<uint8_t>(shape);
+    if (g_foregroundCb) {
+      const std::string name = companionpeer::displayName(session.peerKey);
+      g_foregroundCb(session.peerKey, name.c_str());
+    }
   }
 }
 
@@ -1126,6 +1183,30 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
         g_activeFinal = (fieldByte & kFinalFieldFlag) != 0;
         g_activeWritten = 0;
 
+        // v12: does this content field match what the peer declared it pushes?
+        // Latched here -- after resetReassembly() has cleared the flag, before
+        // any buffer is allocated and before the image branch's early return --
+        // and answered at END, where the pushId finally arrives. Assets are
+        // never checked; see fieldMatchesShape() on why doing so deadlocks.
+        //
+        // The shape comes from the Session cache, never from SD: this is the
+        // hot path §5 of docs/companion-declared-shape-design.md exists to keep
+        // clean.
+        if (!isAsset) {
+          if (session->declaredShape == 0) {
+            // Unreachable by construction -- a content push requires the
+            // foreground, and becoming foreground requires ACQUIRE, which
+            // caches the shape. If it ever happens it is a cache bug, and
+            // failing open beats bricking every push from a legitimate peer.
+            LOG_ERR("CBLE", "session %u foreground with no cached shape", static_cast<unsigned>(sessionId));
+          } else if (!companionui::fieldMatchesShape(field, session->declaredShape)) {
+            LOG_ERR("CBLE", "field 0x%02x rejected: peer declared shape 0x%02x", field,
+                    static_cast<unsigned>(session->declaredShape));
+            g_activeShapeRejected = true;
+            return;
+          }
+        }
+
         if (field == kFieldImage) {
           // Oversize images are rejected at END rather than here so the app gets
           // one clear RENDER_STATUS either way; the bytes are simply not stored.
@@ -1160,7 +1241,7 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           // of when the write arrived, not what this task did with it.
           const uint32_t chunkEntryMs = millis();
           recordChunkGap(chunkEntryMs);
-          if (g_activeImageOverflow || g_activeImageFailed || g_activeSeqGap) return;
+          if (g_activeImageOverflow || g_activeShapeRejected || g_activeImageFailed || g_activeSeqGap) return;
           // v9: image CHUNKs carry a 2-byte little-endian sequence number
           // right after sessionId -- byte 0 opcode, byte 1 sessionId, bytes
           // 2-3 seq, bytes 4..N payload. Every other field's CHUNK is
@@ -1227,6 +1308,13 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           recordChunkBusy(chunkEntryMs);
           return;
         }
+
+        // v12: a shape-rejected transfer is consumed and thrown away -- no
+        // buffer was allocated at START, and the answer is owed at END, so
+        // every CHUNK in between is a no-op. Stated explicitly rather than
+        // left to the !g_activeBuf guards below, which would reach the same
+        // place for the wrong reason.
+        if (g_activeShapeRejected) return;
 
         if (fieldUsesSeqChunk(g_activeField)) {
           // v10: title/body CHUNKs carry the same 2-byte little-endian
@@ -1305,6 +1393,20 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
         // final one of its batch (see ContentFieldCallback's doc comment);
         // pulled out here, once, so every branch below can just use it.
         const uint8_t pushId = data[2];
+
+        // v12: this transfer was refused at START because the field is not one
+        // the peer's declared content shape can render. Answered here, where
+        // the pushId finally exists, and before the per-field switch so none of
+        // it runs on bytes that were deliberately never buffered.
+        if (g_activeShapeRejected) {
+          // Only the final-flagged field answers. The device owes exactly one
+          // RENDER_STATUS per push and only the final field's pushId is
+          // retained (docs/companion-display-protocol.md:731-742, :904), so a
+          // title+body batch to an IMAGE peer must fire one status, not two.
+          if (g_activeFinal) notifyRenderStatus(RenderResult::RejectedShape, pushId);
+          resetReassembly();
+          break;
+        }
 
         switch (field) {
           case kFieldImage: {

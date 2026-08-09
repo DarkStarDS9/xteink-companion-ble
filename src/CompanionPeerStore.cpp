@@ -411,6 +411,18 @@ bool isImageCapable(const char* peerKey) {
   return (info.capabilities & companionble::kUiCapabilityImageGallery) != 0;
 }
 
+bool readDeclaredShape(const char* peerKey, companionble::ContentShape* out) {
+  // Same read-then-shared-parse shape as isImageCapable() above, and for the
+  // same reason: the offsets live in exactly one place (companionui::parseBody)
+  // so a layout change cannot silently desync one caller from the others.
+  uint8_t raw[kMaxUiDeclarationLen];
+  const size_t len = readAssetBody(peerKey, kAssetUiDeclaration, raw, sizeof(raw));
+  companionui::DeclarationInfo info;
+  if (companionui::parseBody(raw, len, &info) != companionui::ParseResult::Ok) return false;
+  if (out) *out = info.shape;
+  return true;
+}
+
 void touch(const char* peerKey) {
   JsonDocument doc;
   if (!loadIndex(doc)) return;

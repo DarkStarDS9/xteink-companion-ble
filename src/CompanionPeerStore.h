@@ -40,6 +40,11 @@
 #include <cstdint>
 #include <string>
 
+// For companionble::ContentShape, the one protocol enum that surfaces in this
+// header's API. CompanionBle.h is enum/constant declarations only (it pulls in
+// nothing but <cstddef>/<cstdint>), so this costs no dependency.
+#include "CompanionBle.h"
+
 namespace companionpeer {
 
 // Bytes in an appId / installId / pairing token. All opaque to the firmware,
@@ -197,6 +202,17 @@ std::string userName(const char* peerKey);
 // (companionble::kUiCapabilityImageGallery) — i.e. it wants a tile in the
 // on-device gallery picker. False for a peer with no declaration at all.
 bool isImageCapable(const char* peerKey);
+
+// Reads this peer's declared content shape out of its stored UI declaration.
+// False — with *out untouched — when the peer has no declaration, or one that
+// no longer parses; a stored-but-unreadable declaration is treated exactly
+// like none at all, per docs/companion-declared-shape-design.md §3.
+//
+// This is an SD open/read. It belongs at ACQUIRE time and at declaration
+// re-push time, and nowhere else: the answer is cached on the session from
+// there, because consulting it per push would put an SD open on the NimBLE
+// host task for every field of every push (§5).
+bool readDeclaredShape(const char* peerKey, companionble::ContentShape* out);
 
 // Marks the peer as most recently seen and evicts beyond kMaxPeers.
 void touch(const char* peerKey);

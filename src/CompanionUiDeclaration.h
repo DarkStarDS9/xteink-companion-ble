@@ -112,4 +112,22 @@ ParseResult parseAsset(const uint8_t* data, size_t len, DeclarationInfo* out);
 // comment on why unknown is refused rather than reserved.
 bool isKnownShape(uint8_t raw);
 
+// v12 enforcement: may a peer that declared `declaredShape` push this *content*
+// field? A pure table. It lives here rather than beside the field ids in
+// CompanionBle.cpp for one reason: this file is host-buildable and that one is
+// not, and the table is exactly the kind of thing that should fail in a gtest
+// rather than on hardware.
+//
+// CONTENT FIELDS ONLY -- kFieldUiDeclaration and kFieldIcon must never be
+// passed in. Pushing a declaration is precisely how a peer changes its shape,
+// and asset pushes deliberately bypass the foreground gate for the same
+// structural reason (see CompanionBle.cpp's START handler). Shape-checking
+// either one deadlocks enrollment: a peer whose stored shape is wrong could
+// never push the declaration that would fix it.
+//
+// `declaredShape` is the raw byte cached on a Session rather than a
+// ContentShape, because 0 has to mean "not cached yet" and there is no
+// enumerator for that. The caller handles that case before calling.
+bool fieldMatchesShape(uint8_t field, uint8_t declaredShape);
+
 }  // namespace companionui

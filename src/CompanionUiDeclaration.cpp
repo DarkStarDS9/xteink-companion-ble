@@ -82,4 +82,24 @@ ParseResult parseAsset(const uint8_t* data, size_t len, DeclarationInfo* out) {
   return parseBody(data + kDigestLen, len - kDigestLen, out);
 }
 
+bool fieldMatchesShape(uint8_t field, uint8_t declaredShape) {
+  switch (static_cast<companionble::ContentShape>(declaredShape)) {
+    case companionble::ContentShape::Text:
+      return field == companionble::kFieldTitle || field == companionble::kFieldBody ||
+             field == companionble::kFieldContentId || field == companionble::kFieldTagState;
+    case companionble::ContentShape::Image:
+      return field == companionble::kFieldImage;
+    case companionble::ContentShape::List:
+      // No list content field exists on the wire yet (see
+      // docs/companion-todo-list-design.md), so a LIST peer pushing any content
+      // field today is pushing something it could not render.
+      return false;
+  }
+  // Not reachable for a shape that came out of an Ok parse, which is the only
+  // way a shape is ever cached. Refuse rather than admit: an unknown shape is
+  // precisely the "nobody knows what this peer pushes" state the declaration
+  // exists to make impossible.
+  return false;
+}
+
 }  // namespace companionui
