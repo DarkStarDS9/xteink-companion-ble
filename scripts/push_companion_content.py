@@ -24,6 +24,12 @@ Usage:
 The pairing token is kept in ~/.crosspoint_companion_tokens.json, keyed by the
 device id, so the second run onward needs no on-device confirmation.
 
+Since v12 a peer declares one content shape and may push only the fields that
+belong to it. This script picks its shape from its arguments — IMAGE for
+--image/--image-from, TEXT otherwise — and re-declares when that changes, which
+is the protocol's sanctioned (screen-clearing) way to switch. Requires a v12+
+device: an older one would misparse the declaration's new leading shape byte.
+
 Requires `bleak` (see scripts/requirements.txt); `Pillow` only for --image-from
 and --icon. On macOS, the first run prompts for Bluetooth permission for the
 terminal/Python process.
@@ -49,12 +55,16 @@ from companion_protocol import (
     FIELD_TAG_STATE,
     FIELD_TITLE,
     FIELD_UI_DECL,
+    PROTOCOL_VERSION,
     RENDER_DISPLAYED,
     RENDER_RESULTS,
     ROUTING_PAGE_NEXT,
     ROUTING_PAGE_PREV,
     ROUTING_REMOTE,
     SERVICE_UUID,
+    SHAPE_IMAGE,
+    SHAPE_NAMES,
+    SHAPE_TEXT,
     BACKGROUND_REASONS,
     Link,
     Session,
@@ -97,16 +107,36 @@ BUTTON_MAP = [
 TAGS = [(0, "Saved"), (1, "New")]
 
 
-def declaration() -> bytes:
-    return encode_ui_declaration(BUTTON_MAP, TAGS)
+def declaration(shape: int) -> bytes:
+    """This script's UI declaration for one content shape (v12's mandatory byte).
+
+    The shape is a parameter rather than a constant because this script is the
+    one client that legitimately pushes both kinds: `--image` makes it an IMAGE
+    peer, everything else a TEXT peer. A peer may only push fields matching the
+    shape it declared, so the shape has to be decided from the arguments before
+    the declaration goes out.
+
+    Switching between runs is the protocol's sanctioned escape hatch, not a
+    loophole: a different shape changes the digest, so the push below fires,
+    and re-pushing a declaration triggers a foreground change that clears the
+    screen. That is exactly the intended cost of an app re-declaring what it is.
+    """
+    return encode_ui_declaration(BUTTON_MAP, TAGS, shape=shape)
 
 
 # --------------------------------------------------------------------------- #
 # Version gates
 #
-# This script only exercises the stable-since-v6 subset of the protocol for
-# most of what it sends, so it accepts any v6+ device — but two fields moved to
-# a sequence-numbered CHUNK since then (image in v9, title/body in v10) and the
+# v12 raised the floor for this script to v12 outright. Until then it accepted
+# any v6+ device, because it only exercised the stable-since-v6 subset. That
+# stopped being true when the content shape became a mandatory byte at the
+# *front* of the UI declaration: a v11 device reads that byte as the button
+# count and walks the rest of the asset off its own layout. There is no version
+# of that failure that is loud, so the gate has to be, and a clean break is
+# exactly the case where refusing early beats degrading.
+#
+# The older gates below still apply for the same reason: two fields moved to
+# a sequence-numbered CHUNK (image in v9, title/body in v10) and the
 # framer in companion_protocol always sends that sequence number. To a pre-v9/
 # pre-v10 device those two bytes are not a header, they are the first two bytes
 # of the payload, so the push would not fail, it would silently corrupt. Refuse
@@ -311,7 +341,9 @@ async def run(args) -> None:
 
     async with BleakClient(device.address) as client:
         caps = parse_capabilities(
-            bytes(await client.read_gatt_char(CAPABILITY_CHAR_UUID)), minimum_version=6, who="this script"
+            bytes(await client.read_gatt_char(CAPABILITY_CHAR_UUID)),
+            minimum_version=PROTOCOL_VERSION,
+            who="this script (its UI declaration carries v12's mandatory content shape)",
         )
         print(
             f"  v{caps['version']} device {caps['device_id']}: {caps['px_wide']}x{caps['px_high']}px, "
@@ -343,11 +375,14 @@ async def run(args) -> None:
 
         # Push only what the device does not already have — the device compares
         # nothing, so staleness is this side's conclusion.
-        ui = declaration()
+        pushing_image = bool(args.image or args.image_from)
+        shape = SHAPE_IMAGE if pushing_image else SHAPE_TEXT
+        ui = declaration(shape)
         if session.asset_tags.get(FIELD_UI_DECL) != ui[:4]:
+            print(f"  declaring content shape {SHAPE_NAMES[shape]}")
             await push_asset(session, FIELD_UI_DECL, ui)
         else:
-            print("  UI declaration already current.")
+            print(f"  UI declaration already current (shape {SHAPE_NAMES[shape]}).")
 
         if args.icon:
             icon = encode_icon(args.icon, caps["icon_w"], caps["icon_h"])
@@ -362,7 +397,7 @@ async def run(args) -> None:
             raise SystemExit(f"ACQUIRE denied: {reason}")
         print("  Screen acquired.")
 
-        if args.image or args.image_from:
+        if pushing_image:
             if args.image:
                 raw_bitmap = Path(args.image).read_bytes()
             else:
@@ -429,6 +464,17 @@ def main() -> None:
         help="Seconds to wait for RENDER_STATUS when --await-render is set (default: 10)",
     )
     args = parser.parse_args()
+
+    # v12: a peer declares one content shape and may only push fields belonging
+    # to it. Tag state (0x07) is a TEXT field, so asking for a tag alongside an
+    # image is asking the device to answer RejectedShape. Refuse here, where the
+    # message can say why, rather than on the wire.
+    if (args.image or args.image_from) and (args.tag is not None or args.set_tag is not None):
+        parser.error(
+            "--tag/--set-tag are TEXT-shape fields and cannot be combined with an image push: "
+            "this script declares IMAGE for --image/--image-from, and a peer may only push "
+            "fields matching its declared shape (see docs/companion-display-protocol.md)"
+        )
 
     try:
         asyncio.run(run(args))

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-End-to-end test harness for Companion Display Protocol v11, on real hardware.
+End-to-end test harness for Companion Display Protocol v12, on real hardware.
 
 Drives both halves of the device at once: BLE over the host's own radio, and
 physical buttons over USB serial. That combination is what makes v6's most
@@ -22,6 +22,7 @@ Then:
 
     python scripts/companion_e2e_test.py --port /dev/cu.usbmodem21201
     python scripts/companion_e2e_test.py --port ... --only enrollment,preemption
+    python scripts/companion_e2e_test.py --port ... --only enrollment,reconnect,shape
     python scripts/companion_e2e_test.py --port ... --keep-peers   # skip the CRESET
     python scripts/companion_e2e_test.py --port ... --only enrollment,buttonmap,spokenfeeds \
         --articles 5 --render-timeout 10
@@ -47,6 +48,14 @@ Covered:
   preemption   two sessions on one link, last-requester-wins, in-flight discard
   image        raw packed 2bpp full-screen push, chunk acks, and the decode verdict
   tags         app-declared tags: atomic with content, and state-only writes
+  shape        v12: the declared content shape is enforced. An image pushed to a
+               TEXT peer and a text batch pushed to an IMAGE peer are both refused
+               with RENDER_STATUS(RejectedShape) — the batch case asserting the
+               count, since "one answer per push" is what the final-field rule
+               exists to guarantee. Also: a declaration with no shape byte (i.e.
+               any v11 client) is refused ASSET_ACK(RejectedNoShape) and its
+               ACQUIRE then denied, and re-declaring while foreground switches a
+               peer's shape, which is the protocol's only sanctioned way to do it.
   spokenfeeds  mimics a real consumer app: push a batch, then BLOCK for RENDER_STATUS
                before doing anything else, same as SpokenFeeds waiting on it before
                starting audio. A timeout here is "the screen updated but the phone
@@ -103,11 +112,15 @@ except ImportError:
 from bleak import BleakClient, BleakScanner
 
 from companion_protocol import (
+    ASSET_REJECTED_NO_SHAPE,
+    ASSET_RESULTS,
+    ASSET_STORED,
     BTN_BACK,
     BTN_CONFIRM,
     BTN_LEFT,
     BTN_RIGHT,
     CAPABILITY_CHAR_UUID,
+    CAP_FLAG_SHAPE_AWARE,
     FIELD_BODY,
     FIELD_CONTENT_ID,
     FIELD_IMAGE,
@@ -116,6 +129,7 @@ from companion_protocol import (
     FIELD_UI_DECL,
     PROTOCOL_VERSION,
     RENDER_DISPLAYED,
+    RENDER_REJECTED_SHAPE,
     RENDER_SEQUENCE_GAP,
     RENDER_RESULTS,
     ROUTING_PAGE_NEXT,
@@ -123,6 +137,9 @@ from companion_protocol import (
     ROUTING_REMOTE,
     SERVICE_UUID,
     SESS_RENDER_STATUS,
+    SHAPE_IMAGE,
+    SHAPE_NAMES,
+    SHAPE_TEXT,
     Link,
     Session,
     encode_tag_state,
@@ -132,10 +149,20 @@ from companion_protocol import (
     raw_image_length,
 )
 
-# Two distinct simulated apps, so the preemption test exercises the case that
-# actually motivated v6: two apps sharing one phone's single BLE link.
+# Three distinct simulated apps. A and B exercise the case that actually
+# motivated v6 — two apps sharing one phone's single BLE link — and since v12
+# they also carry different *declared content shapes*: A is a TEXT peer (title/
+# body/content-id/tag-state) and B an IMAGE peer. That split is not cosmetic.
+# Through v11 one enrolled peer here pushed both text and an image, which v12
+# makes an illegal client outright: a peer declares one shape and may push only
+# the fields belonging to it.
+#
+# C exists only to be a peer with *no* stored declaration, which is the one
+# state the RejectedNoShape path needs and neither A nor B can be once they have
+# declared — a rejected declaration leaves the previously stored one in place.
 APP_A = uuid.UUID("2f1d7b64-9c3e-4a55-8f21-0c7b5e9a3d10").bytes
 APP_B = uuid.UUID("7ac41e08-5d62-4f1b-9e33-1b8c4d2f60a5").bytes
+APP_C = uuid.UUID("c4a91f27-38b0-4d6e-a1f9-2e5d70c8b431").bytes
 
 DEFAULT_TAGS = [(0, "Saved"), (1, "New")]
 
@@ -145,6 +172,16 @@ DEFAULT_MAP = [
     (BTN_CONFIRM, ROUTING_REMOTE, "Save"),
     (BTN_BACK, ROUTING_REMOTE, "Back"),
 ]
+
+# The same buttons and tags under each declared shape. Built once, because the
+# digest is a hash of the whole body: the shape byte is part of it, so these two
+# are different assets to the device and re-pushing one over the other is
+# exactly the deliberate, screen-clearing shape switch the protocol sanctions.
+TEXT_DECL = encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS, shape=SHAPE_TEXT)
+IMAGE_DECL = encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS, shape=SHAPE_IMAGE)
+# What every v11 client sends: no shape byte at all. Not a client this harness
+# imitates anywhere except in the one case that asserts it is refused.
+NO_SHAPE_DECL = encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS, shape=None)
 
 
 # --------------------------------------------------------------------------- #
@@ -649,6 +686,49 @@ async def push_field_timed(session: Session, field_id: int, data: bytes, final: 
     return elapsed_ms
 
 
+async def ensure_declared_foreground(
+    session: Session, console: "Console", results: "Results", declaration: bytes, label: str
+) -> bool:
+    """Get `session` enrolled, declared with `declaration`, and holding the screen.
+
+    Every group below needs a peer of a *particular* declared shape on the
+    screen, and which peer that is now depends on what the group pushes. Doing
+    it by hand in each group is what let the pre-v12 harness drift into pushing
+    text and images from one identity; doing it here also keeps a group runnable
+    standalone under --only (e.g. `--only enrollment,reconnect,shape`), where the
+    group that would have enrolled the peer never ran.
+
+    The declaration is only re-pushed when the device's stored digest differs,
+    because re-pushing one is not free: it triggers a foreground change that
+    clears the screen. That is the point of the escape hatch, not a side effect
+    to trip over between assertions.
+    """
+    if not session.session_id:
+        await session.send_hello()
+        try:
+            await asyncio.wait_for(asyncio.shield(session.pending_future()), timeout=5.0)
+            console.press(BTN_CONFIRM)  # unknown identity: answer the pairing prompt
+        except asyncio.TimeoutError:
+            pass  # known peer: HELLO_OK comes straight back, no prompt
+        reply = await session.wait_hello(timeout=15.0)
+        if not results.check(f"{label}: enrolled", reply.ok, "" if reply.ok else reply.reason_text):
+            return False
+
+    if session.asset_tags.get(FIELD_UI_DECL) != declaration[:4]:
+        result, tag = await session.push_asset(FIELD_UI_DECL, declaration)
+        if not results.check(
+            f"{label}: UI declaration stored", result == ASSET_STORED,
+            f"ASSET_ACK {ASSET_RESULTS.get(result, result)}",
+        ):
+            return False
+        session.asset_tags[FIELD_UI_DECL] = tag
+
+    if console.state().get("foreground") == str(session.session_id):
+        return True
+    outcome = await session.acquire()
+    return results.check(f"{label}: holds the screen", outcome[0] == "foreground", str(outcome))
+
+
 async def no_render_status_arrives(link: Link, marker: int, window: float) -> list:
     """Waits `window` seconds and returns any RENDER_STATUS seen since `marker`.
 
@@ -676,11 +756,15 @@ async def run_tests(args, console: Console, results: Results) -> None:
     device = devices[0]
     print(f"Found {device.name} ({device.address})")
 
-    # Two long-lived identities. A Session outlives any one connection — the
+    # Long-lived identities. A Session outlives any one connection — the
     # reconnect scenario re-attaches session_a to a fresh link with the token
     # it was issued, which is exactly what a phone app does after a dropout.
-    session_a = Session(APP_A, "Harness A")
-    session_b = Session(APP_B, "Harness B")
+    #
+    # A is the TEXT peer and B the IMAGE peer for the whole run (see APP_A/APP_B
+    # above); C only ever pushes a shapeless declaration, to be refused.
+    session_a = Session(APP_A, "Harness Text")
+    session_b = Session(APP_B, "Harness Image")
+    session_c = Session(APP_C, "Harness Shapeless")
     # See "A note on write types" in this file's docstring: text over WWR so a
     # batch fits the device's 3 s commit window, the image left on Write so a
     # couple of hundred unflow-controlled writes can't drop their own chunks.
@@ -705,6 +789,7 @@ async def run_tests(args, console: Console, results: Results) -> None:
         await link.start_notify()
         link.attach(session_a)
         link.attach(session_b)
+        link.attach(session_c)
         print(f"  ATT MTU {client.mtu_size}, chunk payload {link.chunk_payload_size(FIELD_BODY)}B (seq-checked field)")
 
         # The capability block must match what the device reports over serial —
@@ -714,6 +799,15 @@ async def run_tests(args, console: Console, results: Results) -> None:
             "capability block matches over BLE and serial",
             caps["raw"].hex() in console_cap,
             f"serial said {console_cap!r}",
+        )
+
+        # v12's feature bit. A client is meant to read this *before* pushing, so
+        # a shape-unaware build is a diagnosable mismatch rather than a
+        # declaration that gets refused for reasons the client cannot name.
+        results.check(
+            "capability flags advertise shape-awareness (bit 4)",
+            bool(caps["flags"] & CAP_FLAG_SHAPE_AWARE),
+            f"flags {caps['flags']:#04x} — device does not claim to enforce declared shapes",
         )
 
         # Second drain of CRESET's fallout (main() does the first). The device
@@ -769,17 +863,25 @@ async def run_tests(args, console: Console, results: Results) -> None:
             # only order enrollment allows, since ACQUIRE is refused until the
             # declaration exists. A build that requires foreground for asset
             # pushes deadlocks here and this times out.
-            button_map = encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS)
-            result, tag = await session_a.push_asset(FIELD_UI_DECL, button_map)
+            result, tag = await session_a.push_asset(FIELD_UI_DECL, TEXT_DECL)
             results.check("UI declaration accepted without holding the screen",
-                          result == 0, f"result {result}")
-            results.check("stored tag is the one pushed", tag == button_map[:4])
+                          result == ASSET_STORED, f"result {ASSET_RESULTS.get(result, result)}")
+            results.check("stored tag is the one pushed", tag == TEXT_DECL[:4])
+            session_a.asset_tags[FIELD_UI_DECL] = tag
 
             outcome = await session_a.acquire()
             results.check("ACQUIRE now granted", outcome[0] == "foreground", f"got {outcome}")
             results.check("device reports the foreground peer", console.state().get("foreground") != "0")
 
             labels = console.send("CUI")
+            # The shape byte sits in front of the button count, so a device that
+            # reads it back correctly also proves it did not mistake it for one
+            # — the exact failure that a mis-offset walk produces.
+            results.check(
+                "device read back the declared content shape (TEXT)",
+                any(f"shape={SHAPE_TEXT}" in line for line in labels),
+                str(labels),
+            )
             results.check(
                 "device read back the declared labels",
                 any("label=Save" in line for line in labels),
@@ -1016,17 +1118,13 @@ async def run_tests(args, console: Console, results: Results) -> None:
             # --only enrollment,spokenfeeds) and, without this, every push
             # below times out with no clue why -- RENDER_STATUS is
             # deliberately silent for non-foreground sessions.
-            group_ready = True
-            if console.state().get("foreground") != str(session_a.session_id):
-                print("  [spokenfeeds] session is not foreground -- pushing a UI declaration and acquiring")
-                button_map = encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS)
-                await session_a.push_asset(FIELD_UI_DECL, button_map)
-                outcome = await session_a.acquire()
-                group_ready = results.check(
-                    "spokenfeeds: session holds the screen (foreground)",
-                    outcome[0] == "foreground",
-                    f"spokenfeeds needs the screen; ACQUIRE failed: got {outcome}",
-                )
+            #
+            # SpokenFeeds is a TEXT app (it pushes only title/body), so the
+            # declaration this puts back is TEXT_DECL -- the same shape session_a
+            # carries everywhere else in this file.
+            group_ready = await ensure_declared_foreground(
+                session_a, console, results, TEXT_DECL, "spokenfeeds"
+            )
 
             rng = random.Random(0xF3ED)
             commit_to_render_ms: list[float] = []
@@ -1087,6 +1185,7 @@ async def run_tests(args, console: Console, results: Results) -> None:
             await link.start_notify()
             link.attach(session_a)
             link.attach(session_b)
+            link.attach(session_c)
 
             reply = await asyncio.wait_for(session_a.hello(), timeout=10.0)
             results.check("known peer gets HELLO_OK immediately", reply.ok,
@@ -1095,7 +1194,7 @@ async def run_tests(args, console: Console, results: Results) -> None:
             if reply.ok:
                 results.check(
                     "the stored button-map tag is reported back",
-                    session_a.asset_tags.get(FIELD_UI_DECL) == encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS)[:4],
+                    session_a.asset_tags.get(FIELD_UI_DECL) == TEXT_DECL[:4],
                     str(session_a.asset_tags),
                 )
                 outcome = await session_a.acquire()
@@ -1127,7 +1226,15 @@ async def run_tests(args, console: Console, results: Results) -> None:
                     await asyncio.sleep(0.3)
                     results.check("device reports two live sessions", console.state().get("sessions") == "2")
 
-                    await session_b.push_asset(FIELD_UI_DECL, encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS))
+                    # B is the IMAGE peer for the whole run — the [image] group
+                    # below is what actually pushes from it.
+                    result_b, tag_b = await session_b.push_asset(FIELD_UI_DECL, IMAGE_DECL)
+                    results.check(
+                        "the second app's IMAGE declaration was stored",
+                        result_b == ASSET_STORED,
+                        f"ASSET_ACK {ASSET_RESULTS.get(result_b, result_b)}",
+                    )
+                    session_b.asset_tags[FIELD_UI_DECL] = tag_b
 
                     background = session_a.expect_background()
                     outcome = await session_b.acquire()
@@ -1138,9 +1245,11 @@ async def run_tests(args, console: Console, results: Results) -> None:
                     except asyncio.TimeoutError:
                         results.check("the first app was told it was preempted", False, "no background notification arrived")
 
-                    # A push from the now-background app must not change the screen.
-                    await session_b.push_field(FIELD_TITLE, b"App B owns the screen", final=True)
-                    await asyncio.sleep(1.5)
+                    # A push from the now-background app must not change the
+                    # screen. Only app A pushes here: app B is the IMAGE peer, so
+                    # a title from it would be refused for its shape and would
+                    # test the wrong rule (and, worse, would still "pass" this
+                    # group's assertion for the wrong reason).
                     await session_a.push_field(FIELD_TITLE, b"App A should be ignored", final=True)
                     await asyncio.sleep(1.5)
                     results.check(
@@ -1165,20 +1274,22 @@ async def run_tests(args, console: Console, results: Results) -> None:
 
             # --- image push -------------------------------------------------- #
             if enabled("image"):
-                # Content/image pushes are silently dropped from a non-foreground
-                # session (CompanionBle.cpp only lets the foreground app push visible
-                # content; assets like UI declarations are the exception). The
-                # preemption block above ends with foreground handed back to session_a,
-                # so picking "session_b if it has a session" here would push from a
-                # backgrounded peer -- silently dropped, hanging forever waiting for
-                # a RENDER_STATUS that will never come. Use whichever peer the device
-                # actually reports as foreground right now.
-                current_foreground = console.state().get("foreground")
-                if session_b.session_id and str(session_b.session_id) == current_foreground:
-                    owner = session_b
-                else:
-                    owner = session_a
-                if owner.session_id:
+                # Since v12 the pusher is not "whoever holds the screen" but
+                # specifically the IMAGE-declared peer: an image from session_a
+                # is refused for its shape (asserted in [shape] below), and no
+                # amount of holding the screen changes that.
+                #
+                # Content/image pushes are also silently dropped from a
+                # non-foreground session (CompanionBle.cpp only lets the
+                # foreground app push visible content; assets like UI
+                # declarations are the exception), and the preemption block above
+                # ends with foreground handed back to session_a. So B has to be
+                # enrolled, declared and foreground before anything here -- which
+                # is also what lets this group run without [preemption], e.g.
+                # `--only enrollment,reconnect,image` (this and [shape] both sit
+                # inside the reconnect link, so that group is always required).
+                owner = session_b
+                if await ensure_declared_foreground(owner, console, results, IMAGE_DECL, "image"):
                     print("\n[image] raw packed 2bpp, full screen")
                     raw = make_test_raw_image(caps["px_wide"], caps["px_high"])
                     print(f"  {len(raw)} bytes of raw 2bpp for {caps['px_wide']}x{caps['px_high']}")
@@ -1258,6 +1369,203 @@ async def run_tests(args, console: Console, results: Results) -> None:
                                   console.state().get("screen") == "image", str(console.state()))
                     check_no_errors(console, results, "image seqgap", allowed=("CHUNK sequence gap",))
 
+            # --- v12 declared content shape ---------------------------------- #
+            #
+            # The three refusals v12 exists for, plus the one sanctioned way out
+            # of them. Every case here is a *red* case first: run it against v11
+            # firmware and each push is happily accepted, which is precisely the
+            # behaviour being removed.
+            if enabled("shape"):
+                print("\n[shape] v12: a peer may push only the fields its declared shape allows")
+
+                # --- an image pushed to a TEXT peer -------------------------- #
+                shape_raw = make_test_raw_image(caps["px_wide"], caps["px_high"])
+                if await ensure_declared_foreground(
+                    session_a, console, results, TEXT_DECL, "shape/text-peer"
+                ):
+                    screen_before = console.state().get("screen")
+                    image_to_text_id = 0x61
+                    render = session_a.expect_render(image_to_text_id)
+                    # Only a handful of CHUNKs are sent, but START still declares
+                    # the full length: the refusal is latched at START, before any
+                    # buffer is allocated, so sending the other ~200 chunks would
+                    # prove nothing and cost a minute. A build that instead
+                    # checked at END would answer something other than
+                    # RejectedShape here (a size or gap complaint), which is
+                    # exactly the distinction worth failing on.
+                    await session_a.push_field(
+                        FIELD_IMAGE, shape_raw, final=True, push_id=image_to_text_id, max_chunks=4
+                    )
+                    try:
+                        verdict = await asyncio.wait_for(render, timeout=15.0)
+                    except asyncio.TimeoutError:
+                        results.check(
+                            "an image pushed to a TEXT peer is answered RENDER_STATUS(RejectedShape)",
+                            False,
+                            f"nothing for pushId {image_to_text_id:#04x}; "
+                            f"saw {session_a.render_statuses}",
+                        )
+                    else:
+                        results.check(
+                            "an image pushed to a TEXT peer is answered RENDER_STATUS(RejectedShape)",
+                            verdict == RENDER_REJECTED_SHAPE,
+                            f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                        )
+                        results.check(
+                            "the refusal echoed the pushId it was sent with",
+                            (RENDER_REJECTED_SHAPE, image_to_text_id) in session_a.render_statuses,
+                            str(session_a.render_statuses),
+                        )
+                    results.check(
+                        "a refused image left the screen as it was",
+                        console.state().get("screen") == screen_before,
+                        f"screen went {screen_before!r} -> {console.state().get('screen')!r}",
+                    )
+
+                # --- a text batch pushed to an IMAGE peer -------------------- #
+                #
+                # The count is the assertion, not the presence. A batch is three
+                # fields, each of them illegal for an IMAGE peer, and the rule is
+                # that the device owes exactly ONE answer per push -- carried by
+                # the final-flagged field. A build that answers per rejected
+                # field passes a presence check and still breaks every client
+                # that correlates answers to pushes.
+                if await ensure_declared_foreground(
+                    session_b, console, results, IMAGE_DECL, "shape/image-peer"
+                ):
+                    screen_before = console.state().get("screen")
+                    text_to_image_id = 0x62
+                    marker = len(link.notifications)
+                    render = session_b.expect_render(text_to_image_id)
+                    await session_b.push_field(FIELD_TITLE, b"Illegal Title", push_id=text_to_image_id)
+                    await session_b.push_field(FIELD_BODY, b"Illegal body.", push_id=text_to_image_id)
+                    await session_b.push_field(
+                        FIELD_CONTENT_ID, b"harness-shape", final=True, push_id=text_to_image_id
+                    )
+                    try:
+                        verdict = await asyncio.wait_for(render, timeout=15.0)
+                    except asyncio.TimeoutError:
+                        results.check(
+                            "a text batch pushed to an IMAGE peer is answered RENDER_STATUS(RejectedShape)",
+                            False,
+                            f"nothing for pushId {text_to_image_id:#04x}; "
+                            f"saw {session_b.render_statuses}",
+                        )
+                    else:
+                        results.check(
+                            "a text batch pushed to an IMAGE peer is answered RENDER_STATUS(RejectedShape)",
+                            verdict == RENDER_REJECTED_SHAPE,
+                            f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                        )
+                    # Well past the panel settle, so a second (or third) answer
+                    # would have arrived by now if the device sent one per field.
+                    answers = [
+                        n
+                        for n in await no_render_status_arrives(link, marker, window=6.0)
+                        if n.session_id == session_b.session_id
+                    ]
+                    results.check(
+                        "the whole batch is answered exactly once, on its final field",
+                        len(answers) == 1,
+                        f"{len(answers)} RENDER_STATUS for one batch: "
+                        f"{[(RENDER_RESULTS.get(n.result, n.result), n.push_id) for n in answers]}",
+                    )
+                    results.check(
+                        "a refused text batch left the screen as it was",
+                        console.state().get("screen") == screen_before,
+                        f"screen went {screen_before!r} -> {console.state().get('screen')!r}",
+                    )
+
+                # --- a declaration with no shape byte (i.e. any v11 client) --- #
+                #
+                # This needs a peer that has never stored a declaration, which is
+                # the whole reason session_c exists: a rejected declaration
+                # leaves whatever was already stored in place, so running this
+                # against A or B would assert nothing about ACQUIRE.
+                await session_c.send_hello()
+                try:
+                    await asyncio.wait_for(asyncio.shield(session_c.pending_future()), timeout=5.0)
+                    console.press(BTN_CONFIRM)
+                except asyncio.TimeoutError:
+                    pass
+                reply_c = await session_c.wait_hello(timeout=15.0)
+                if results.check("shapeless peer enrolled", reply_c.ok,
+                                 "" if reply_c.ok else reply_c.reason_text):
+                    result_c, _tag_c = await session_c.push_asset(FIELD_UI_DECL, NO_SHAPE_DECL)
+                    results.check(
+                        "a declaration with no shape byte is refused ASSET_ACK(RejectedNoShape)",
+                        result_c == ASSET_REJECTED_NO_SHAPE,
+                        f"ASSET_ACK {ASSET_RESULTS.get(result_c, result_c)} — a v11 client must "
+                        "fail here, by name, rather than be tolerated or told 'malformed'",
+                    )
+                    # ...and because nothing was stored, the existing structural
+                    # gate does the rest. No new ACQUIRE_DENIED reason exists or
+                    # is needed: "a peer that has not declared itself cannot
+                    # reach the screen" already covers shape.
+                    outcome = await session_c.acquire()
+                    results.check(
+                        "the refused peer's ACQUIRE is then denied NO_UI_DECLARATION",
+                        outcome == ("denied", 0),
+                        f"got {outcome} — a stored declaration would mean the refusal did not "
+                        "actually reject the asset",
+                    )
+
+                # --- re-declaring while foreground switches shape ------------- #
+                #
+                # The sanctioned escape hatch: an app that genuinely needs the
+                # other shape re-declares, which reloads its button map and
+                # clears the screen. Deliberately heavyweight, and deliberately
+                # the only way. Done on B (IMAGE -> TEXT) rather than A because
+                # a title/body batch proves acceptance in seconds where an image
+                # would take a minute.
+                if session_b.session_id:
+                    if await ensure_declared_foreground(
+                        session_b, console, results, TEXT_DECL, "shape/re-declared"
+                    ):
+                        switched_id = 0x63
+                        render = session_b.expect_render(switched_id)
+                        await session_b.push_field(FIELD_TITLE, b"Now legal", push_id=switched_id)
+                        await session_b.push_field(
+                            FIELD_BODY, b"Accepted because this peer re-declared itself TEXT.",
+                            final=True, push_id=switched_id,
+                        )
+                        try:
+                            verdict = await asyncio.wait_for(render, timeout=15.0)
+                        except asyncio.TimeoutError:
+                            results.check(
+                                "the same batch is accepted after re-declaring the peer as TEXT",
+                                False,
+                                f"nothing for pushId {switched_id:#04x}; "
+                                f"saw {session_b.render_statuses}",
+                            )
+                        else:
+                            results.check(
+                                "the same batch is accepted after re-declaring the peer as TEXT",
+                                verdict == RENDER_DISPLAYED,
+                                f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                            )
+                        results.check(
+                            "the re-declared peer is showing text",
+                            console.state().get("screen") == "text",
+                            str(console.state()),
+                        )
+                    # Put B back the way the rest of this file assumes it, so a
+                    # --keep-peers rerun starts from the same place.
+                    result_b, tag_b = await session_b.push_asset(FIELD_UI_DECL, IMAGE_DECL)
+                    if result_b == ASSET_STORED:
+                        session_b.asset_tags[FIELD_UI_DECL] = tag_b
+                    results.check(
+                        f"peer B restored to its {SHAPE_NAMES[SHAPE_IMAGE]} declaration",
+                        result_b == ASSET_STORED,
+                        f"ASSET_ACK {ASSET_RESULTS.get(result_b, result_b)}",
+                    )
+
+                # The device is expected to say, out loud, that it refused
+                # something -- three times over. The exact wording belongs to the
+                # firmware, so only the word it must contain is exempted, and
+                # only for this section.
+                check_no_errors(console, results, "shape", allowed=("shape",))
+
 
 # --------------------------------------------------------------------------- #
 # --soak: connection-survival, not scenario correctness
@@ -1316,9 +1624,10 @@ async def run_soak(args, console: Console, results: Results) -> None:
                               "" if reply.ok else reply.reason_text):
             return
 
-        ui = encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS)
-        if session.asset_tags.get(FIELD_UI_DECL) != ui[:4]:
-            await session.push_asset(FIELD_UI_DECL, ui)
+        # TEXT: the soak's periodic activity is a title push, so this is the
+        # shape it has to declare to be allowed to make it.
+        if session.asset_tags.get(FIELD_UI_DECL) != TEXT_DECL[:4]:
+            await session.push_asset(FIELD_UI_DECL, TEXT_DECL)
         outcome = await session.acquire()
         results.check("soak: session holds the screen (foreground)", outcome[0] == "foreground", str(outcome))
 

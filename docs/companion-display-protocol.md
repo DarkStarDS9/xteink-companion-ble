@@ -14,7 +14,19 @@ Home/reader entry path in normal operation.
 
 ## Status
 
-**v11 — the current contract.** v6 was a **clean break**: the session handshake
+**v12 — the current contract.** v12 is itself a **clean break**, and the shortest
+statement of it is: **a peer declares what kind of content it pushes, in its UI
+declaration, and may push nothing else.** A mandatory content-shape byte
+(`TEXT`/`IMAGE`/`LIST`) sits at offset 4 of field `0x05`, ahead of the button
+count; a declaration without it is refused
+(`ASSET_ACK(REJECTED_NO_SHAPE)`) and the peer never reaches the screen, and a
+content field outside the declared shape is refused
+(`RENDER_STATUS(REJECTED_SHAPE)`) exactly once per push. Every v11 client is
+therefore refused until it declares a shape — accepted deliberately, since every
+client of this protocol is written by this project's author. See "UI declaration
+field" below and "v12 changes from v11".
+
+The v6-through-v11 contract underneath it is unchanged. v6 was a **clean break**: the session handshake
 is mandatory, and a client that pushes content without a valid session is
 ignored. A v5 client will connect, push, and see nothing happen. v10 kept that
 shape unchanged and made one further breaking change on top of it: the
@@ -58,11 +70,20 @@ implements it, never after.
 > actually use), via `companion-bench`: image push throughput, text pushes with
 > `awaitRender`, and the connection-profile ladder.
 >
+> **v12 has NOT run on hardware yet.** The declared-content-shape change
+> described below is implemented in firmware and in the Python client, and the
+> e2e harness has a `[shape]` group asserting every one of its refusals — but as
+> of 2026-08-09 that group has not been run against a device. Everything the
+> paragraphs above claim is a v11 result; treat v12's enforcement paths as
+> written-and-reviewed, not proven.
+>
 > **Still not proven**, and worth treating with the old caution:
 >
-> - **The consumer apps on v11.** Neither SpokenFeeds nor Snap2Ink has been
->   rebuilt against it. Everything above was driven by test harnesses on a Mac,
->   not by an iPhone.
+> - **v12 on hardware at all** — see immediately above.
+> - **The consumer apps on v11, let alone v12.** Neither SpokenFeeds nor Snap2Ink
+>   has been rebuilt against either. Everything above was driven by test
+>   harnesses on a Mac, not by an iPhone. Under v12's clean break, both are
+>   *refused* until they declare a shape and ship together with the firmware.
 > - **`RENDER_STATUS(Superseded)`.** Deliberately untested — the window is small
 >   enough that a test for it would be an intermittent race rather than a check
 >   (see "Superseded pushes").
@@ -511,6 +532,14 @@ ASSET_ACK result         0x00 STORED
                          0x01 REJECTED_SIZE     asset larger than the advertised limit
                          0x02 REJECTED_FORMAT   unparseable for that asset id
                          0x03 REJECTED_STORAGE  SD write failed
+                         0x04 REJECTED_NO_SHAPE the UI declaration (0x05) carried no content
+                                                shape byte, or one that is not 0x01/0x02/0x03.
+                                                Distinct from REJECTED_FORMAT on purpose -- it
+                                                is what every v11 client gets, and "missing its
+                                                shape byte" is a far better thing to read in a
+                                                log than "malformed". Nothing is stored, so the
+                                                peer's next ACQUIRE is denied NO_UI_DECLARATION
+                                                -- see "UI declaration field" (v12)
 
 RENDER_STATUS result     0x00 DISPLAYED
                          0x01 DECODE_FAILED     wrong byte count for a raw 2bpp full-screen image
@@ -523,6 +552,15 @@ RENDER_STATUS result     0x00 DISPLAYED
                          0x05 SUPERSEDED        a later push took the screen before this one
                                                 reached the panel, so it never rendered. Not an
                                                 error -- see "Superseded pushes" below
+                         0x06 REJECTED_SHAPE    the pushed field is not one this peer's declared
+                                                content shape permits (v12): an image from a TEXT
+                                                peer, a title/body/content-id/tag-state field from
+                                                an IMAGE peer, any content field from a LIST peer.
+                                                Latched when the offending START arrives -- before
+                                                any buffer is allocated -- and answered at END, so
+                                                a whole batch of illegal fields is still answered
+                                                exactly once. Nothing is rendered and the screen
+                                                is left as it was. See "UI declaration field"
 
 RENDER_STATUS pushId     Whatever the pushing client sent as END's third byte
                          for the push this answers (see "Content characteristic"
@@ -584,9 +622,14 @@ before any consumer app had adopted it, because it does not generalize: every
 future push type would need its own field id, and a client juggling two
 outstanding pushes still has to trust the device never answers them out of
 order. `pushId`, chosen by the *pushing client* and simply echoed back,
-generalizes to any future push type for free and lets a client run two pushes
-concurrently (say, an image and a text batch) without the answers being
-distinguishable only by what kind of push they were.
+generalizes to any future push type for free and distinguishes two pushes a
+`field` byte could not tell apart at all: two successive article batches from
+the same TEXT peer, where an answer must be attributable to *which article*, not
+to what kind of push it was. (Before v12 this paragraph reached for "an image
+and a text batch" as the example. A single peer can no longer push both — it
+declares one content shape — so the case `pushId` actually earns its keep in is
+two pushes of the *same* shape, plus the general rule that the device owes
+exactly one answer per push and a client has to know which push it answered.)
 
 **v10 and earlier clients must not be fed a v11 `RENDER_STATUS`.** A v10
 parser reads this notification as a fixed 3 bytes (`{opcode, sessionId,
@@ -767,17 +810,23 @@ discarded on disconnect and on a foreground handover.
 
 ### Field ids
 
-| Id | Field | Cap | Reassembled into |
-|---|---|---|---|
-| `0x01` | title | max text length (capability) | RAM |
-| `0x02` | body | max text length (capability) | RAM |
-| `0x03` | content-id | 32 bytes | RAM |
-| `0x04` | image | max image length (capability) | **streamed to SD**, never buffered in RAM |
-| `0x05` | UI declaration (buttons + tags) | 512 bytes | SD (`ui.bin`) |
-| `0x06` | icon | icon width x height / 8 bytes | SD (`icon.bin`) |
-| `0x07` | tag state | 13 bytes | RAM (foreground only) |
+| Id | Field | Cap | Reassembled into | Shape (v12) |
+|---|---|---|---|---|
+| `0x01` | title | max text length (capability) | RAM | TEXT |
+| `0x02` | body | max text length (capability) | RAM | TEXT |
+| `0x03` | content-id | 32 bytes | RAM | TEXT |
+| `0x04` | image | max image length (capability) | **streamed to SD**, never buffered in RAM | IMAGE |
+| `0x05` | UI declaration (shape + buttons + tags) | 512 bytes | SD (`ui.bin`) | *asset — never checked* |
+| `0x06` | icon | icon width x height / 8 bytes | SD (`icon.bin`) | *asset — never checked* |
+| `0x07` | tag state | 13 bytes | RAM (foreground only) | TEXT |
 
 Next free: `0x08`.
+
+The last column is v12's permitted-field table: a peer may push a content field
+only if its declared content shape matches, and anything else is answered
+`RENDER_STATUS(REJECTED_SHAPE)` — see "UI declaration field". The two asset
+fields are exempt by construction: pushing `0x05` is how a peer changes its
+shape in the first place. `LIST` peers have no permitted content field yet.
 
 Content past a field's cap is truncated (title/body/content-id) or rejected
 outright with `ASSET_ACK`/`RENDER_STATUS` (image, UI declaration, icon) — a
@@ -820,6 +869,18 @@ the *new* article's tags — a mark the user can see attached to content they
 cannot. A tag state pushed **on its own**, outside any title/body batch, is
 unaffected and still applies immediately; only tag state that arrived as part
 of the poisoned batch is discarded.
+
+**A batch containing a field the peer's shape does not permit is refused whole,
+and answered once (v12).** The refusal is latched when the offending `START`
+arrives — before any buffer is allocated — and answered at the batch's
+final-flagged `END` with `RENDER_STATUS(REJECTED_SHAPE)`, carrying that `END`'s
+`pushId`. It is deliberately *not* answered per illegal field: a three-field
+batch from a peer of the wrong shape produces exactly one notification, the
+same "one answer per push" contract every other result obeys, and a client
+counting answers against pushes must not have to special-case this one. As
+with a sequence gap, nothing is committed and the previous content stays on
+screen. And as everywhere else, `pushId 0` still means "no answer wanted" —
+a refused batch pushed with `pushId 0` is silently dropped, not reported.
 
 On the client side this is a small, fully synchronous send loop — there is no
 per-chunk ack. If reliable delivery matters, use "Write" (not "Write Without
@@ -1032,11 +1093,24 @@ For this device's measured 528 x 792 panel: `bytesPerRow = ceil(528/4) = 132`,
 so every push is exactly `132 * 792 = 104544` bytes — fixed, with no
 compression-dependent variance and no worst-case blowup risk.
 
-**Interaction with text.** An image push replaces the screen entirely — title,
-body and paging are not drawn while an image is displayed. Pushing a body
-afterwards returns the screen to text. There is no compositing of the two, and
-no "image mode" the client enters or leaves: the last completed push of either
-kind is what is on screen.
+**Interaction with text (rewritten for v12).** An image push replaces the screen
+entirely — title, body and paging are not drawn while an image is displayed —
+and there is still no compositing of the two. What changed in v12 is *which peer
+may push what*: a peer that has declared `IMAGE` may push field `0x04` and
+nothing else, and a peer that has declared `TEXT` may not push an image at all.
+Pushing a body after an image no longer "returns the screen to text"; from an
+`IMAGE` peer it is refused outright with `RENDER_STATUS` `REJECTED_SHAPE`, and
+from a `TEXT` peer the image was never accepted in the first place.
+
+So there *is* now something a client enters and leaves, and it is neither
+implicit nor per-push: it is the content shape in the peer's UI declaration. It
+changes only when the app re-declares itself, which clears the screen. Through
+v11 the model was reactive — the last completed push of either kind owned the
+screen — and this paragraph said so. That model is gone: a passive text page and
+a passive image could replace each other harmlessly, but a screen holding local
+user state (a list's cursor, its scroll offset, its not-yet-synced check-offs)
+cannot, and the firmware needs to know a peer's shape while disconnected, which
+no rule about "the last push" can supply. See "UI declaration field" above.
 
 **Tags are drawn over an image, but only if you switch one on.** A visible tag
 is rendered as a chip in the top corner of the print, over the image content —
@@ -1054,9 +1128,24 @@ image is displayed redraws only the chips, over the retained image, with a
 differential refresh. It does not re-decode or re-settle — that would cost
 seconds for a mark that moved.
 
+**v12: an `IMAGE` peer sets tags over the Status characteristic, not field
+`0x07`.** The tag-state *field* belongs to the `TEXT` shape, so an `IMAGE` peer
+pushing `0x07` — alone or batched with the image — is refused
+`REJECTED_SHAPE`. The **Status characteristic** write (see "Status
+characteristic" below) is not a content-field push and is not shape-checked, so
+it remains available to a peer of any shape, and it is how an `IMAGE` peer
+switches a chip on. Everything above about chips over the print still holds;
+only the way an `IMAGE` peer sends the state changes. This is the one place
+where v12's field/shape table costs a client something concrete, and the
+alternative — permitting `0x07` under both shapes — was not taken, because it
+would make "which fields may this peer push" no longer answerable from the shape
+alone.
+
 **On timing, if you want a "finished developing" mark.** A tag pushed *with* the
 image is drawn when the image is drawn, which is the *start* of the grayscale
-settle, not the end. If you want a mark that means "this print has finished
+settle, not the end — but see the note directly above: for an `IMAGE` peer that
+"pushed with the image" path is gone, and a Status write is the only way in.
+If you want a mark that means "this print has finished
 resolving", set it with a standalone Status write after `RENDER_STATUS(DISPLAYED)`
 arrives — that notification is sent after the settle completes, and the redraw it
 triggers is the cheap chips-only one described above. The device will not infer
@@ -1066,14 +1155,15 @@ interpreting.
 
 ### UI declaration field (`0x05`)
 
-Everything the app declares about its own on-device UI: what its buttons do and
-what they are called, and what tags exist and what they are called. One asset,
-one digest.
+Everything the app declares about its own on-device UI: **what kind of content
+it pushes**, what its buttons do and what they are called, and what tags exist
+and what they are called. One asset, one digest.
 
 ```
 bytes 0..3   asset digest (opaque, stored verbatim — see "Asset digests")
 
-byte 4       button entry count N
+byte 4       content shape              <- MANDATORY, new in v12
+byte 5       button entry count N
 N x {  buttonId : 1
        routing  : 1
        labelLen : 1
@@ -1087,6 +1177,58 @@ M x {  tagId    : 1
 byte         tag render style           <- optional; absent means BORDERED
 byte         capabilities bitmask       <- optional; absent means none set
 ```
+
+#### Content shape (byte 4) — mandatory
+
+```
+0x01  TEXT    may push title (0x01), body (0x02), content-id (0x03), tag state (0x07)
+0x02  IMAGE   may push image (0x04)
+0x03  LIST    a list document; no content field exists for it on the wire yet
+```
+
+A peer declares **one** shape and may push only the content fields belonging to
+it, for as long as that declaration stands. A field outside it is refused with
+`RENDER_STATUS` `REJECTED_SHAPE` (see below); nothing is rendered and nothing is
+stored.
+
+`0x00` and anything above `0x03` are **invalid, not reserved**. An unknown shape
+is refused rather than tolerated, because tolerating it would mean falling back
+to "render whatever arrives", which is exactly the behaviour v12 removes.
+
+**Mandatory means mandatory: there is no unset value and no default.** A
+declaration without this byte does not parse, so it is not stored, and is
+answered `ASSET_ACK` `REJECTED_NO_SHAPE` (`0x04`). The peer then has no stored
+declaration at all, which the existing structural gate already covers: its
+`ACQUIRE` is denied `NO_UI_DECLARATION`. No new `ACQUIRE_DENIED` reason exists,
+because none is needed — *a peer that has not declared itself cannot reach the
+screen* simply extends to cover shape.
+
+**Why it is here and not on `ACQUIRE`.** The device has to know a peer's shape
+while **disconnected** — the idle icon grid opens a peer's stored content with
+no session in existence — and a per-session byte cannot answer that. This asset
+is already per-peer, already persisted, already versioned by a digest, and
+already read while disconnected. Shape and buttons also belong together: a list
+peer's Up/Down/Confirm meanings are a consequence of it being a list peer.
+
+**Why it is at the front and not appended.** The declaration's trailing fields
+signal absence by the buffer running out, so a *mandatory* field cannot sit
+behind optional ones — given a single trailing byte, a decoder cannot tell a
+shape from a tag render style. Byte 4 is free precisely because v12 is a clean
+break, and it leaves the trailing-optional convention intact for the two fields
+that legitimately use it.
+
+**Changing shape is possible, deliberately and only deliberately.** Re-pushing
+this declaration with a different shape while foreground is the sanctioned way,
+and it is not free: a re-pushed declaration triggers a foreground change, which
+reloads the button map and **clears the screen**. That is the intended cost
+model. An app that genuinely needs both shapes (a reader that wants to show one
+hero image) can do it; it just cannot do it by accident, and the device always
+knows the current answer without inspecting content.
+
+**The declaration and icon fields are never shape-checked.** Pushing field
+`0x05` is precisely how a peer changes its shape, and both it and the icon
+(`0x06`) are accepted from a non-foreground session. Shape-checking either would
+deadlock a peer whose stored shape is wrong out of ever fixing it.
 
 **Why one asset and not two.** Buttons and tags are the same kind of thing — near
 static strings the device stores and draws without understanding — and they
@@ -1215,6 +1357,14 @@ whether a peer happens to have pushed an image before: an app that supports
 photos but hasn't pushed one yet (e.g. just after pairing) still belongs in
 the picker, so the user can see that it has no photos yet rather than the app
 being invisible until its first push.
+
+**`IMAGE_GALLERY` and the v12 content shape are not the same thing, and both
+stay.** The shape byte says what a peer may *push*; this bit says whether it
+wants a *tile in the on-device gallery picker*. They will normally agree — an
+`IMAGE` peer sets the bit — but the bit is not derived from the shape and the
+firmware does not infer one from the other. A `TEXT` peer that sets it is not an
+error; it simply gets a picker tile it will never fill, which is a strictly
+better failure than the device quietly deciding what an app meant.
 
 Max 512 bytes total for the whole declaration, which is far more than 7 buttons
 and 6 tags need.
@@ -1372,19 +1522,23 @@ string or a short opaque token. Treat 32 bytes as the contract.
 ## Capability characteristic — introspection
 
 A single read-only value clients query instead of hardcoding assumptions about
-the device. **23 bytes**, unchanged in layout since v6 — v7, v8, v9 and v10
-each only bumped the version number itself (byte 0), for field `0x04`'s
+the device. **23 bytes**, unchanged in layout since v6 — v7 through v11 each
+only bumped the version number itself (byte 0), for field `0x04`'s
 payload format change, the `HELLO`/UI-declaration additions, the image
-`CHUNK` sequence number, and the title/body `CHUNK` sequence number
-respectively; see "v7 changes from v6", "v8 changes from v7", "v9 changes
-from v8" and "v10 changes from v9":
+`CHUNK` sequence number, the title/body `CHUNK` sequence number, and
+`RENDER_STATUS`/`pushId` respectively. v12 additionally sets a **new feature
+flag bit** in byte 5; the layout is still 23 bytes. See "v7 changes from v6"
+onward:
 
 ```
-byte 0        protocol version = 11
+byte 0        protocol version = 12
 byte 1        screen width in characters, at the font Companion Mode uses
 byte 2        screen height in characters (lines per page)
 bytes 3..4    max text field length, uint16 LE — title/body only
-byte 5        feature flags: bit0 image, bit1 UI declaration, bit2 icons, bit3 sessions
+byte 5        feature flags: bit0 image, bit1 UI declaration, bit2 icons, bit3 sessions,
+              bit4 declared content shape (v12) — the device enforces the UI
+              declaration's shape byte, so a client can tell before pushing
+              anything that its declaration needs one
 bytes 6..9    max image field length, uint32 LE
 byte 10       max concurrent sessions (4)
 byte 11       icon width in pixels
@@ -1404,13 +1558,22 @@ future revision. It is the one thing a client can rely on before it knows
 whether it can talk to the device at all.
 
 That makes it the graceful-degradation path across the v5 break, which is the
-whole reason to guarantee it. A v10 client should:
+whole reason to guarantee it. A client should:
 
 1. Read the characteristic immediately after connecting.
-2. Check byte 0. If it is not 10, tell the user *"this reader's firmware is too
-   old for this version of <app>"* (or too new) and stop. Do not attempt the
-   handshake, and do not guess at the layout — the 23-byte value shares nothing
-   past byte 4 with v5's 5-byte one.
+2. Check byte 0. If it is not the version the client speaks, tell the user
+   *"this reader's firmware is too old for this version of <app>"* (or too new)
+   and stop. Do not attempt the handshake, and do not guess at the layout — the
+   23-byte value shares nothing past byte 4 with v5's 5-byte one.
+
+**This is how a v11 client detects the v12 break before it hits it.** Byte 0
+reads 12 and byte 5's bit 4 is set; a client that checks either one knows its UI
+declaration needs a content shape byte. A client that checks neither still fails
+cleanly rather than mysteriously: its declaration is refused
+`ASSET_ACK(REJECTED_NO_SHAPE)`, nothing is stored, and its `ACQUIRE` is then
+denied `NO_UI_DECLARATION` — which is already the documented "push field `0x05`,
+then retry" path. It will retry with the same shapeless declaration forever, but
+it will do so while being told exactly what is wrong, on every attempt.
 
 The reverse direction fails quietly, and clients should know it: a **v5 client
 talking to a v6-or-later device gets no error**. Its content writes are dropped (no
@@ -1443,6 +1606,11 @@ the two commit together.
 
 Writes from a non-foreground session are ignored, and a `tagId` the peer never
 declared is ignored.
+
+**Not shape-checked (v12).** This is a Status-characteristic write, not a
+content-field push, so it is available to a peer of any declared content shape.
+That is deliberate and it is the only way an `IMAGE` peer sets a tag at all,
+since field `0x07` belongs to the `TEXT` shape — see "Image field" above.
 
 ## On-screen behaviour
 
@@ -1514,7 +1682,7 @@ means:
   peers/<peerKey>/
     token.bin                16-byte pairing token
     icon.bin                 1-bpp sleep-screen icon
-    ui.bin                   UI declaration (button routing/labels + tag labels)
+    ui.bin                   UI declaration (content shape + button routing/labels + tag labels)
     data/                    per-peer scratch: staged image, event logs
 ```
 
@@ -1527,6 +1695,70 @@ growth would make `peers.json` unbounded, and it is parsed into RAM.
 ---
 
 ## Version history
+
+### v12 changes from v11 — **breaking**
+
+1. **The UI declaration (`0x05`) gains a mandatory content-shape byte at offset
+   4**, immediately after the digest and *before* the button entry count, which
+   therefore moves from offset 4 to offset 5. Values: `0x01` TEXT, `0x02` IMAGE,
+   `0x03` LIST. `0x00` and anything above `0x03` are invalid, not reserved. See
+   "UI declaration field" above for why it sits at the front rather than joining
+   the optional trailing bytes, and why it lives here rather than on `ACQUIRE`.
+2. **A peer may push only the content fields its declared shape permits.** TEXT:
+   title (`0x01`), body (`0x02`), content-id (`0x03`), tag state (`0x07`).
+   IMAGE: image (`0x04`). LIST: nothing yet — no list content field exists on
+   the wire. The asset fields, declaration (`0x05`) and icon (`0x06`), are
+   **never** shape-checked.
+3. **New `RENDER_STATUS` result `0x06 REJECTED_SHAPE`.** Latched at the
+   offending `START`, before any buffer is allocated, and answered at `END`.
+   A whole batch of illegal fields is answered **exactly once**, on its
+   final-flagged field, and only when that `END` carried a non-zero `pushId` —
+   the same one-answer-per-push contract every other result obeys.
+4. **New `ASSET_ACK` result `0x04 REJECTED_NO_SHAPE`.** A declaration with no
+   shape byte, or an unknown one, is refused at store time. Nothing is stored,
+   so the peer's `ACQUIRE` is then denied by the existing `NO_UI_DECLARATION`
+   gate. **No new `ACQUIRE_DENIED` reason was added** — the existing structural
+   rule, *a peer that has not declared itself cannot reach the screen*, extends
+   to cover shape for free.
+5. **Re-pushing the declaration is the only way to change shape**, and it
+   triggers a foreground change that clears the screen. Deliberately
+   heavyweight; deliberately explicit.
+6. **Capability byte 0 bumped from 11 to 12, and byte 5 gains flag bit 4**
+   (declared content shape). No capability bytes moved; the block is still 23
+   bytes.
+
+**Why breaking, not additive, and why no compatibility path.** A v11 client's
+declaration has no shape byte, so under v12 it is refused outright and that
+client never reaches the screen; a v12 declaration fed to v11 firmware is worse
+than refused, since v11 reads the shape byte as its button count and walks the
+rest of the asset off its own layout. An earlier draft of this change proposed a
+permissive `LEGACY` value for an absent byte. It was rejected: **every client of
+this protocol is written by this project's author** (CompanionKit, SpokenFeeds,
+Snap2Ink), so there is no third party to strand, and the only thing a shim would
+buy is a permissive mode nobody wants plus a `LEGACY` branch in the firmware
+forever. The break is also what makes the shape *useful* — with no legacy peers,
+the device always knows the foreground peer's shape, which is what lets it stop
+holding buffers a peer cannot use.
+
+**A v11 client fails cleanly, not mysteriously.** In order: it can read
+capability byte 0 (`12`) and flag bit 4 before pushing anything and stop;
+failing that, its declaration is answered `ASSET_ACK(REJECTED_NO_SHAPE)` — a
+result distinct from `REJECTED_FORMAT` precisely so the log says "missing its
+shape byte" rather than "malformed"; failing that, its `ACQUIRE` is denied
+`NO_UI_DECLARATION`, which is already the documented "push field `0x05`, then
+retry" path. At no point does it push content into silence.
+
+**Why the model changed at all.** Through v11 the device was purely reactive:
+the last completed push owned the screen, and there was explicitly "no image
+mode the client enters or leaves". That was fine for two *passive* shapes —
+text and image replace each other harmlessly and re-pushing restores the
+previous state exactly. It stops being fine for a shape that holds local user
+state (a list's cursor, scroll offset, and not-yet-synced check-offs), which a
+stray title/body push from the same app would silently clobber, and for a shape
+that claims most of the device's buttons, whose meanings must be known before
+the peer's map is applied rather than negotiated per screen. It also cannot
+answer the shape question *while disconnected*, which the on-device icon grid
+needs. Design record: `docs/companion-declared-shape-design.md`.
 
 ### v11 changes from v10 — **breaking**
 
@@ -1783,7 +2015,14 @@ READ_LATER) and added the Status characteristic.
   enrollment, reconnect, `ACQUIRE` gating, atomic content batches and their
   `RENDER_STATUS`, both sequence-gap paths, tags, preemption between two apps on
   one link, and a full-screen image push diffed pixel-for-pixel against
-  `CMD:SCREENSHOT`. See `docs/companion-test-console.md`. CompanionKit's framer
+  `CMD:SCREENSHOT`. Its `[shape]` group covers v12: the two enrolled peers now
+  carry *different* declared shapes (a TEXT peer and an IMAGE peer, since one
+  peer pushing both is no longer a legal client), and it asserts
+  `REJECTED_SHAPE` in both directions — including that a three-field batch to
+  the wrong-shaped peer produces **exactly one** answer, not one per field —
+  plus `REJECTED_NO_SHAPE` on a shapeless declaration with the `ACQUIRE` denial
+  that follows it, and the re-declare-while-foreground escape hatch.
+  See `docs/companion-test-console.md`. CompanionKit's framer
   and handshake codec additionally have `swift test` unit tests; the rest of
   what runs on-device is verified by the checklist below.
 
@@ -1817,6 +2056,16 @@ UI declaration gating:
     zeros. Push nothing and `ACQUIRE` — accepted.
 11. Push a declaration with a new digest and different labels: the hint row
     changes, and `CMD:CUI` reads back both the buttons and the tags.
+11b. **(v12)** From a peer that has never stored a declaration, push field `0x05`
+    with the shape byte omitted (a v11-shaped declaration): confirm
+    `ASSET_ACK(REJECTED_NO_SHAPE)`, that `CMD:CUI` still reports no stored
+    declaration for that peer, and that `ACQUIRE` is then denied
+    `NO_UI_DECLARATION`. Repeat with a shape byte of `0x00` and of `0x04`:
+    both are refused the same way, not tolerated.
+11c. **(v12)** Push a valid declaration and confirm `CMD:CUI` reads back
+    `shape=` alongside the button count — the shape byte sits in front of that
+    count, so a device reading one back correctly also proves it did not mistake
+    it for the other.
 12. Map a button to `LOCAL_PAGE_NEXT` and confirm it pages on-device with no BLE
     event; map the same button to `REMOTE` and confirm it now notifies instead.
 13. Map POWER to `NONE` and confirm POWER still sleeps the device.
@@ -1876,9 +2125,22 @@ Images:
 27b. **(v11)** Send a 2-byte `END` (no `pushId`) on any field: confirm the
     device logs a rejection and the field is dropped rather than tolerated —
     see "Framing" above.
-28. Push a body after an image and confirm the screen returns to text.
+28. **(v12; inverts the pre-v12 test, which was "push a body after an image and
+    confirm the screen returns to text")** Push a body to an `IMAGE`-declared
+    peer with a non-zero `pushId`: confirm `RENDER_STATUS(REJECTED_SHAPE,
+    pushId)` and that the image is still on screen. Then push the same body as
+    a three-field batch (title, body, final-flagged content-id) and confirm
+    **exactly one** `RENDER_STATUS` arrives for the batch, not one per field.
+28a. **(v12)** Push an image to a `TEXT`-declared peer with a non-zero `pushId`:
+    confirm `RENDER_STATUS(REJECTED_SHAPE, pushId)` and that the text page is
+    untouched. Then re-push that peer's UI declaration with shape `IMAGE`,
+    confirm the screen clears (a foreground change), and confirm the same image
+    is now accepted and renders.
 28b. With a tag visible, push an image and confirm the chip is drawn over the
-    print; hide every tag, re-push, and confirm the print is untouched.
+    print; hide every tag, re-push, and confirm the print is untouched. **(v12)**
+    Set the tag with a **Status characteristic** write, not field `0x07`: an
+    `IMAGE` peer pushing `0x07` is refused `REJECTED_SHAPE`, while the Status
+    write is not shape-checked and still applies.
 28c. **(v9)** Push an image over Write Without Response with correctly
     incrementing CHUNK sequence numbers: confirm `IMAGE_CHUNK_ACK` notifies
     roughly every 32 chunks and the transfer still ends in

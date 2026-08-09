@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-The single Python implementation of the Companion Display Protocol (v11).
+The single Python implementation of the Companion Display Protocol (v12).
 
 `docs/companion-display-protocol.md` is authoritative for the wire format; this
 module is its one Python transcription. Both Python clients in this repo —
@@ -19,7 +19,8 @@ breaks both clients loudly rather than one of them quietly.
 What lives here: GATT UUIDs, content/session opcodes, field ids, the
 notification decoder, capability parsing, the HELLO/ACQUIRE/RELEASE handshake,
 host-side token persistence, and the START/CHUNK/END framer (including the v9
-image / v10 title-body sequence numbers and the v11 `pushId` on END).
+image / v10 title-body sequence numbers, the v11 `pushId` on END, and v12's
+mandatory declared content shape).
 
 What deliberately does not live here: anything a *particular* client decides —
 which buttons it declares, what it prints, how it correlates its own pushes,
@@ -43,7 +44,7 @@ from bleak import BleakClient
 
 # The version this module implements. Checked against capability byte 0 by
 # parse_capabilities(); bump it in the same commit as the doc and the firmware.
-PROTOCOL_VERSION = 11
+PROTOCOL_VERSION = 12
 
 # --------------------------------------------------------------------------- #
 # GATT
@@ -108,7 +109,23 @@ DENIED_REASONS = {
 }
 ACQUIRE_DENIED_REASONS = {0x00: "no UI declaration stored", 0x01: "unknown session"}
 BACKGROUND_REASONS = {0x00: "preempted", 0x01: "released", 0x02: "link lost"}
-ASSET_RESULTS = {0x00: "stored", 0x01: "rejected: size", 0x02: "rejected: format", 0x03: "rejected: storage"}
+
+ASSET_STORED = 0x00
+ASSET_REJECTED_SIZE = 0x01
+ASSET_REJECTED_FORMAT = 0x02
+ASSET_REJECTED_STORAGE = 0x03
+# v12: the declaration parsed, but its mandatory content-shape byte was absent
+# or not one of the three known values. Distinct from RejectedFormat on purpose
+# -- during the v11->v12 migration "your declaration is missing its shape byte"
+# is a far better thing to read than "malformed".
+ASSET_REJECTED_NO_SHAPE = 0x04
+ASSET_RESULTS = {
+    ASSET_STORED: "stored",
+    ASSET_REJECTED_SIZE: "rejected: size",
+    ASSET_REJECTED_FORMAT: "rejected: format",
+    ASSET_REJECTED_STORAGE: "rejected: storage",
+    ASSET_REJECTED_NO_SHAPE: "rejected: no content shape declared",
+}
 
 RENDER_DISPLAYED = 0x00
 RENDER_DECODE_FAILED = 0x01
@@ -116,6 +133,10 @@ RENDER_REJECTED_SIZE = 0x02
 RENDER_STORAGE_FAILED = 0x03
 RENDER_SEQUENCE_GAP = 0x04
 RENDER_SUPERSEDED = 0x05
+# v12: the pushed field does not match the shape this peer declared. Latched at
+# START and answered at END, so a whole batch of mismatched fields is answered
+# exactly once -- on its final-flagged field, and only when pushId != 0.
+RENDER_REJECTED_SHAPE = 0x06
 RENDER_RESULTS = {
     RENDER_DISPLAYED: "displayed",
     RENDER_DECODE_FAILED: "decode failed",
@@ -123,7 +144,45 @@ RENDER_RESULTS = {
     RENDER_STORAGE_FAILED: "storage failed",
     RENDER_SEQUENCE_GAP: "sequence gap (dropped/reordered chunk, or a batch that lost a field)",
     RENDER_SUPERSEDED: "superseded (a later push took the screen first)",
+    RENDER_REJECTED_SHAPE: "rejected: field does not match this peer's declared content shape",
 }
+
+# --------------------------------------------------------------------------- #
+# Declared content shape (v12)
+#
+# A mandatory byte in the UI declaration, at asset offset 4 / body offset 0 --
+# immediately after the digest, before the button count. It says which content
+# fields this peer is permitted to push for the whole of its enrollment, and it
+# is what the firmware consults instead of inferring a mode from whatever field
+# happened to arrive last.
+#
+# 0x00 and anything above 0x03 are INVALID, not reserved: an unknown shape is
+# refused (ASSET_REJECTED_NO_SHAPE) rather than tolerated, because tolerating
+# it would mean falling back to the reactive model v12 replaces.
+# --------------------------------------------------------------------------- #
+
+SHAPE_TEXT = 0x01  # title (0x01), body (0x02), content-id (0x03), tag-state (0x07)
+SHAPE_IMAGE = 0x02  # image (0x04)
+SHAPE_LIST = 0x03  # todo-list document; no content field exists for it yet
+SHAPE_NAMES = {SHAPE_TEXT: "TEXT", SHAPE_IMAGE: "IMAGE", SHAPE_LIST: "LIST"}
+
+# Which content fields each shape permits. Asset fields (0x05 declaration,
+# 0x06 icon) are never shape-checked -- a peer of any shape declares itself and
+# supplies its icon.
+SHAPE_FIELDS = {
+    SHAPE_TEXT: (FIELD_TITLE, FIELD_BODY, FIELD_CONTENT_ID, FIELD_TAG_STATE),
+    SHAPE_IMAGE: (FIELD_IMAGE,),
+    SHAPE_LIST: (),
+}
+
+# Capability-block flag bits (byte 5). Bit 4 is v12's: the device enforces
+# declared shapes, so a client can tell before pushing anything whether its
+# declaration needs a shape byte.
+CAP_FLAG_IMAGE = 0x01
+CAP_FLAG_BUTTON_MAP = 0x02
+CAP_FLAG_ICONS = 0x04
+CAP_FLAG_SESSIONS = 0x08
+CAP_FLAG_SHAPE_AWARE = 0x10
 
 BTN_BACK, BTN_CONFIRM, BTN_LEFT, BTN_RIGHT, BTN_UP, BTN_DOWN, BTN_POWER = range(7)
 BUTTON_NAMES = {0: "BACK", 1: "CONFIRM", 2: "LEFT", 3: "RIGHT", 4: "UP", 5: "DOWN", 6: "POWER"}
@@ -153,17 +212,36 @@ def encode_ui_declaration(
     tags: Iterable[tuple[int, str]] = (),
     style: int | None = None,
     capabilities: int | None = None,
+    *,
+    shape: int | None,
 ) -> bytes:
-    """Field 0x05: the digest, the button map, and the tag labels.
+    """Field 0x05: the digest, the content shape, the button map, the tag labels.
+
+    `shape` (v12) is mandatory on the wire and therefore mandatory here — one of
+    SHAPE_TEXT / SHAPE_IMAGE / SHAPE_LIST. It is keyword-only and has no
+    default on purpose: a default would let a caller ship a shape it never
+    chose, and a v11-era positional call (`encode_ui_declaration(MAP, TAGS)`)
+    fails loudly here instead of silently reading TAGS as the shape.
+
+    `shape=None` emits a v11-shaped declaration with no shape byte at all. No
+    real client wants that; it exists so a test can provoke the device's
+    ASSET_REJECTED_NO_SHAPE path, which is also exactly what a stale v11 client
+    hits against v12 firmware.
 
     `style` (v6) and `capabilities` (v8) are the optional trailing bytes and
     are positional, not tagged — asking for capabilities without a style byte
     is impossible on the wire, so passing `capabilities` alone emits the
-    default style (BORDERED) ahead of it.
+    default style (BORDERED) ahead of it. The shape byte deliberately is *not*
+    one of these: a mandatory field cannot sit behind optional ones whose
+    absence is signalled by the buffer running out, which is why it goes at the
+    front rather than the end.
     """
     entries = list(entries)
     tags = list(tags)
-    body = bytes([len(entries)])
+    if shape is not None and shape not in SHAPE_NAMES:
+        raise ValueError(f"content shape {shape:#04x} is not one of {sorted(SHAPE_NAMES)}")
+    body = b"" if shape is None else bytes([shape])
+    body += bytes([len(entries)])
     for button, routing, label in entries:
         encoded = label.encode("utf-8")
         body += bytes([button, routing, len(encoded)]) + encoded
@@ -215,7 +293,12 @@ def parse_capabilities(raw: bytes, minimum_version: int = PROTOCOL_VERSION, who:
     `minimum_version` is the caller's floor, not necessarily this module's: the
     pusher only exercises the stable-since-v6 subset for most of what it sends
     and gates the newer fields individually, while the e2e harness asserts on
-    v11 behaviour throughout and has no reason to run against anything older.
+    v12 behaviour throughout and has no reason to run against anything older.
+
+    v12 is a clean break rather than an additive version: a client that pushes a
+    declaration with no content shape is refused whatever it can otherwise
+    speak, so `flags & CAP_FLAG_SHAPE_AWARE` (or simply version >= 12) is worth
+    reading before the first push rather than after the first refusal.
     """
     if len(raw) < 23:
         raise SystemExit(
