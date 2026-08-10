@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -303,6 +304,53 @@ TEST(CompanionTodoDiff, EncodedEntriesMatchEntryAtByteForByte) {
     EXPECT_EQ(bytes[at], static_cast<uint8_t>(id & 0xFF));
     EXPECT_EQ(bytes[at + 1], static_cast<uint8_t>(id >> 8));
     EXPECT_EQ(bytes[at + 2], checked ? 1u : 0u);
+  }
+}
+
+TEST(CompanionTodoDiff, PageWalkAtProtocolPageSizeReproducesEveryEntry) {
+  // The LIST_STATE pull is a page-at-a-time walk of exactly these bytes:
+  // the device seeks to kHeaderLen + kEntryLen * offset and copies raw. That
+  // arithmetic lives in CompanionPeerStore.cpp, which cannot be host-built --
+  // but the property it depends on can be checked here, which is the point of
+  // encode()'s wire-identical entry layout. If this test fails, no amount of
+  // seeking on the device can produce a correct pull.
+  constexpr uint16_t kEntriesPerNotify = 30;  // companionble::kListStateEntriesPerNotify
+
+  Diff diff;
+  diff.setRevision(7);
+  // Deliberately more than two pages, and deliberately not a multiple of the
+  // page size: a walk that only ever ends on a page boundary never exercises
+  // the short final page, which is where an off-by-one hides.
+  constexpr uint16_t kTotal = kEntriesPerNotify * 2 + 5;
+  for (uint16_t i = 0; i < kTotal; ++i) ASSERT_TRUE(diff.applyToggle(static_cast<uint16_t>(1000 + i), i % 3 == 0, nullptr));
+  const std::vector<uint8_t> bytes = encodeToVector(diff);
+
+  std::vector<std::pair<uint16_t, bool>> walked;
+  size_t pages = 0;
+  for (uint16_t offset = 0;; offset += kEntriesPerNotify) {
+    const uint16_t remaining = offset >= diff.count() ? 0 : static_cast<uint16_t>(diff.count() - offset);
+    const uint16_t n = remaining < kEntriesPerNotify ? remaining : kEntriesPerNotify;
+    ++pages;
+    // The 11-byte LIST_STATE header plus the entries this page carries, which
+    // is what must stay inside the session characteristic's 103-byte floor.
+    EXPECT_LE(11u + 3u * n, 103u);
+    if (n == 0) break;
+    const size_t at = kHeaderLen + kEntryLen * offset;
+    for (uint16_t k = 0; k < n; ++k) {
+      const size_t entry = at + kEntryLen * k;
+      walked.emplace_back(static_cast<uint16_t>(bytes[entry] | (bytes[entry + 1] << 8)), bytes[entry + 2] != 0);
+    }
+  }
+  // Three full-or-partial pages plus the n = 0 terminator the phone stops on.
+  EXPECT_EQ(pages, 4u);
+
+  ASSERT_EQ(walked.size(), static_cast<size_t>(kTotal));
+  for (uint16_t k = 0; k < kTotal; ++k) {
+    uint16_t id = 0;
+    bool checked = false;
+    ASSERT_TRUE(diff.entryAt(k, &id, &checked));
+    EXPECT_EQ(walked[k].first, id);
+    EXPECT_EQ(walked[k].second, checked);
   }
 }
 

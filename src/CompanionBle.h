@@ -114,6 +114,19 @@ inline constexpr size_t kMaxContentIdLen = 32;
 // full story of why the JSON detour existed and why it was removed.
 inline constexpr size_t kMaxListDocLen = 16 * 1024;
 
+// Entries carried by one LIST_STATE notification. 30 x 3 bytes plus the
+// 11-byte header is 101, which fits inside the 103-byte session-characteristic
+// floor the protocol doc already requires of every central -- so a phone pulls
+// the whole diff without negotiating a larger MTU, and the device never has to
+// query one.
+//
+// FIXED, NOT DERIVED FROM THE NEGOTIATED MTU, for the reason the protocol doc
+// already gives for kMaxContentIdLen ("treat 32 bytes as the contract"): a
+// constant is host-testable and identical for every client, whereas a
+// per-connection page size makes the pagination boundary -- the one thing a
+// pull's correctness turns on -- a property of whichever central connected.
+inline constexpr uint16_t kListStateEntriesPerNotify = 30;
+
 // Concurrent sessions on one link. Four apps on one phone driving one screen is
 // already generous; the cap exists because the session table is fixed-size, and
 // only the foreground session has a reassembly buffer, so this number does not
@@ -242,6 +255,11 @@ inline constexpr uint8_t kUiCapabilityImageGallery = 0x01;
 // land apart. v12 is the declared-content-shape break: a peer's UI declaration
 // carries a mandatory shape byte, and a push that does not match it is refused
 // with RenderResult::RejectedShape rather than silently taking the screen.
+// v12 also carries the ToDo List check-off sync-back conversation
+// (LIST_STATE_AVAIL / LIST_STATE_GET / LIST_STATE on the Session
+// characteristic): no new content field, three opcodes and the capability bit
+// in byte 5 that clients use to detect it. handleHello() rejects on strict
+// inequality, so every client moves in lockstep.
 inline constexpr uint8_t kProtocolVersion = 12;
 
 // Content characteristic field identifiers, matching docs/companion-display-protocol.md.
@@ -270,7 +288,11 @@ inline constexpr uint8_t kFieldTagState = 0x07;
 // streamed to SD like the image field. Permitted only under
 // ContentShape::List (see CompanionUiDeclaration.cpp's fieldMatchesShape()).
 inline constexpr uint8_t kFieldListDoc = 0x08;
-// Next free: 0x09.
+// Next free: 0x09. Syncing the on-device check-off diff back to the phone
+// (LIST_STATE_AVAIL/LIST_STATE_GET/LIST_STATE) is a
+// Session-characteristic conversation, not a content push: it is initiated by
+// the device, answered piecewise by the phone, and carries no screen-owning
+// content, none of which the START/CHUNK/END field framing models.
 
 // The top bit of a START packet's field byte marks "this is the last field of
 // an atomic content push". The device buffers each field's END as before, but
@@ -434,6 +456,24 @@ bool notifyButtonEvent(ButtonId button, uint16_t durationTicks, bool isFinal);
 // version bump (10 -> 11) in the first place. See
 // docs/companion-display-protocol.md's RENDER_STATUS section.
 void notifyRenderStatus(RenderResult result, uint8_t pushId);
+
+// Tells `peerKey`'s session, if it has one, that the device is holding
+// check-off edits it has not seen: LIST_STATE_AVAIL {opcode, sessionId,
+// revision, count}. The phone then pulls them page by page with
+// LIST_STATE_GET; the device holds no cursor between pages.
+//
+// THE GATE IS "HAS A NON-EMPTY DIFF", and nothing else -- no capability bit
+// for "this app does lists". A peer that never pushed a list document has no
+// lists.bin, therefore no reachable on-device toggle, therefore structurally
+// no diff, so the count check subsumes the capability check and cannot get out
+// of step with it. A LIST peer with nothing to sync gets silence rather than a
+// count-0 message the phone would have to interpret.
+//
+// Costs one SD header read (7 bytes) per call and materialises no Diff --
+// see CompanionPeerStore::readListStateEntries(). Safe to call from either
+// task; every call site is an event that already happened (a peer was
+// admitted, took the foreground, or the user pressed Confirm).
+void notifyListStateAvail(const char* peerKey);
 
 // Answers a pending pairing prompt. Called from the main loop when the user
 // presses CONFIRM/BACK, or when the prompt times out. Writing the peer record

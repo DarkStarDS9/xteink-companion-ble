@@ -47,7 +47,11 @@ the wire format. Consumer apps depend on it.
   earlier PNG-based format, dropped because PNGdec's ~44 KB working set never fit alongside NimBLE
   on this part), `0x05` UI declaration, `0x06` icon, `0x07` tag state, `0x08` list document (ToDo
   List, `LIST` shape only — see `src/CompanionTodoDocument.h` and
-  `docs/companion-todo-list-design.md`; Phase A, read-only). Next free: `0x09`.
+  `docs/companion-todo-list-design.md`). Next free: `0x09`.
+- The wire is at **v12**. `0x08` is no longer read-only: the device toggles items locally and syncs
+  the diff back over the Session characteristic (`LIST_STATE_AVAIL` / `LIST_STATE_GET` /
+  `LIST_STATE`, opcodes `0x8B` / `0x05` / `0x8C`), which is why `0x09` is still free — a sync-back is
+  a conversation, not a content push, so it needs no field id.
 - The v6 shape — sessions, phone:app pairing, per-peer SD storage, button labels/routing — is in
   [docs/companion-multi-app-design.md](docs/companion-multi-app-design.md) and implemented in
   firmware, though unproven on real hardware (see the protocol doc's status warning). It was a

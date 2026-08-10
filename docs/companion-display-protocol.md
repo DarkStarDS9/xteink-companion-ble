@@ -14,8 +14,7 @@ Home/reader entry path in normal operation.
 
 ## Status
 
-**v12 — the current contract.** v12 is itself a **clean break**, and the shortest
-statement of it is: **a peer declares what kind of content it pushes, in its UI
+**v12 — the current contract.** The shortest statement of it is: **a peer declares what kind of content it pushes, in its UI
 declaration, and may push nothing else.** A mandatory content-shape byte
 (`TEXT`/`IMAGE`/`LIST`) sits at offset 4 of field `0x05`, ahead of the button
 count; a declaration without it is refused
@@ -25,6 +24,11 @@ content field outside the declared shape is refused
 therefore refused until it declares a shape — accepted deliberately, since every
 client of this protocol is written by this project's author. See "UI declaration
 field" below and "v12 changes from v11".
+
+v12 also carries the ToDo List check-off sync-back: the device announces that it
+holds on-device edits (`LIST_STATE_AVAIL`) and the phone pulls them a window at
+a time (`LIST_STATE_GET` → `LIST_STATE`), all on the Session characteristic and
+with no new content field. See "List-state sync-back" below.
 
 The v6-through-v11 contract underneath it is unchanged. v6 was a **clean break**: the session handshake
 is mandatory, and a client that pushes content without a valid session is
@@ -100,10 +104,8 @@ implements it, never after.
 > not a version bump, just v12's reservation finished. Implemented: the wire
 > codec, ingest to `lists.bin` (the verbatim wire bytes, not a JSON re-encoding
 > -- see the "Storage layout" section below), `Screen::List` rendering with
-> paging/list-switching, and the offline icon-grid/picker entry point. **Not**
-> implemented: anything from `docs/companion-todo-list-design.md` phase B or C
-> — there is no offline check-off, no `list_state.json`, and no `LIST_STATE`
-> notify; Phase A is read-only. The e2e harness's `[list]` group
+> paging/list-switching, and the offline icon-grid/picker entry point. The e2e
+> harness's `[list]` group
 > (`scripts/companion_e2e_test.py`) ran against the same real X3 on 2026-08-10
 > and passed **17/17**, covering: a list doc pushed to a TEXT peer answered
 > `RejectedShape`; the LIST peer's declaration stored and holding the screen; a
@@ -113,6 +115,13 @@ implements it, never after.
 > and specifically `DecodeFailed`; a `checked=2` document refused; an over-cap
 > (>16 KB) document refused and specifically `RejectedSize`; and no unexpected
 > `[ERR]` log lines.
+>
+> **The list-state sync-back is hardware-verified.** The availability notify,
+> the paginated pull and `list_state.bin` are implemented, host-tested
+> (`test/companion_todo_diff/`) and exercised end-to-end against the same real
+> X3: the full `scripts/companion_e2e_test.py` suite passed **159 passed, 0
+> failed, 0 skipped** on three consecutive runs, with the device's own `[ERR]`
+> log scanned and clean throughout.
 >
 > **Still not proven**, and worth treating with the old caution:
 >
@@ -501,10 +510,26 @@ again.
 notifications **before** writing `HELLO`. Every message is a single write or a
 single notification — this characteristic is never chunked.
 
+**The list-state sync-back reaffirms that sentence rather than relaxing it.** It
+has to move a payload — a shopping list's worth of
+check-offs — that does not fit in one message, and the obvious shape for it
+(one notification carrying every entry) is exactly what the rule forbids. It is
+therefore a **paginated pull**: the device announces availability in one whole
+message, the phone asks for a window in one whole message, and the device
+answers each ask with one whole message. A sequence of independent messages is
+not chunking. Each `LIST_STATE` is individually parseable, carries its own
+`revision`/`offset`/`total`, and means something on its own; no message is a
+fragment of another, and a client that drops one loses that window rather than
+desynchronising a reassembly. That is what keeps the invariant true — there is
+still no reassembly state on this characteristic, in either direction.
+
 `HELLO` (up to 103 bytes) and `HELLO_OK` (up to 30 bytes) exceed BLE's minimum
 MTU, so a handshake needs an ATT MTU of at least 106. The device requests 185
 and both iOS and Android negotiate well above the floor in practice; a central
-that cannot get past 23 cannot use v8 at all.
+that cannot get past 23 cannot use v8 at all. Every message added since is sized
+against that same 103-byte floor, `LIST_STATE` (101 bytes at its largest)
+included, so no message on this characteristic has ever required an MTU a
+`HELLO` did not already require.
 
 ### Phone → device (write)
 
@@ -516,6 +541,7 @@ that cannot get past 23 cannot use v8 at all.
 0x02 BYE        sessionId
 0x03 ACQUIRE    sessionId
 0x04 RELEASE    sessionId
+0x05 LIST_STATE_GET sessionId  offset:2
 ```
 
 `protocolVersion` (v12) is the client's own protocol version — the current
@@ -575,6 +601,9 @@ when one app on a shared link is done but the other is still using the device.
 0x88 RENDER_STATUS  sessionId  result:1  pushId:1              -- widened in v11
 0x89 IMAGE_CHUNK_ACK sessionId seq:2                          -- new in v9
 0x8A FIELD_SEQ_GAP  sessionId  field:1                        -- new in v10
+0x8B LIST_STATE_AVAIL sessionId  revision:4  count:2          -- v12
+0x8C LIST_STATE     sessionId  revision:4  offset:2  total:2
+                    n:1  n x { itemId:2  checked:1 }          -- v12
 ```
 
 ```
@@ -711,6 +740,87 @@ result}`); a text push now also emitting it, plus the appended `pushId` byte,
 both change what a v10 client would observe on the wire for an opcode it
 already knew — which is exactly why this is a protocol version bump (10 → 11),
 not a silent behavior change. See "Version history" below.
+
+### List-state sync-back — availability notify, phone-driven pull
+
+The device's ToDo List check-off diff (see "List document field" below) travels
+back to the phone entirely on this characteristic. There is **no new content
+field for it** — `0x09` is still free — because this is a conversation the
+device initiates, the phone answers piecewise, and which carries no
+screen-owning content, none of which `START`/`CHUNK`/`END` field framing
+models.
+
+```
+device -> phone  0x8B LIST_STATE_AVAIL  sessionId:1  revision:4  count:2
+                                                                       (8 bytes)
+
+phone  -> device 0x05 LIST_STATE_GET    sessionId:1  offset:2
+                                                                       (4 bytes)
+
+device -> phone  0x8C LIST_STATE        sessionId:1  revision:4  offset:2
+                                        total:2  n:1
+                                        n x { itemId:2  checked:1 }
+                                                                (11 + 3n bytes)
+```
+
+All multi-byte fields little-endian, as everywhere else on this wire.
+
+**Entries are deviations from the document at `revision`, not absolute
+checkbox states.** An entry says "the user set `itemId` to `checked`, and the
+document said otherwise"; an item the user never touched, or toggled back to
+what the document said, has no entry at all. `revision` is the document
+revision the deviations were taken against — the device never interprets it,
+and never decides whether its own diff is still applicable. Merging is the
+phone's job (see "dumb firmware, smart phone" in `CLAUDE.md`), and the phone
+finishes by pushing a new `kFieldListDoc` at a new revision, which clears the
+diff.
+
+**`n` is at most `kListStateEntriesPerNotify` = 30**, making `LIST_STATE` at
+most 101 bytes — inside the 103-byte session floor every central already has to
+clear for `HELLO`. So a full pull needs no MTU renegotiation, and the device
+never queries the negotiated MTU. **The 30 is fixed, deliberately not derived
+from the MTU**, for the reason this doc already gives for `kMaxContentIdLen`
+("treat 32 bytes as the contract"): a constant is host-testable and identical
+for every client, whereas a per-connection page size would make the pagination
+boundary — the one thing a pull's correctness turns on — a property of
+whichever central happened to connect.
+
+**The pull is stateless.** Each `LIST_STATE_GET` is an independent seek into
+the device's stored diff; no cursor is held between requests. A phone may
+repeat a window, request windows out of order, abandon a pull halfway, or start
+again from `offset 0` on the next connection, and none of that is a state the
+device has to unwind.
+
+**`n = 0` is the terminator, not an error.** A `LIST_STATE_GET` whose `offset`
+is at or past `total`, or that names a session the device does not know, or
+that arrives for a peer with no stored diff, is answered `LIST_STATE` with
+`n = 0` (`revision`/`total` as known, both `0` when they are not). The device
+logs nothing and there is no error result: "read until `n` is 0, or until
+`offset + n` reaches `total`" is the whole client-side loop.
+
+**When `LIST_STATE_AVAIL` is sent — and the gate.** The device sends it **if
+and only if** the peer has a stored diff with at least one entry. There is no
+capability bit for "this peer does ToDo lists": a non-`LIST` peer structurally
+cannot have a diff, since without a stored list document there is no on-device
+screen from which anything could be toggled, so "has a non-empty diff" is the
+entire gate. A `LIST` peer that has never had anything checked off simply hears
+nothing, which is a better answer than an empty message the phone has to
+interpret.
+
+It is sent at three moments:
+
+- **immediately after `HELLO_OK`**, before the phone can push anything;
+- **alongside `FOREGROUND`**, when the peer takes the screen;
+- **live**, when the user checks something off while that peer is connected.
+
+**The `HELLO_OK` ordering is load-bearing.** Storing a new list document clears
+the peer's diff unconditionally — the device does not get a say in whether its
+own edits still apply — and a document push requires `ACQUIRE` and the
+foreground, neither of which can happen before `HELLO_OK`. Announcing at
+`HELLO_OK` therefore means the phone always learns a diff is pending *before*
+it is capable of destroying one. A client that pushes a document before pulling
+is not corrupting anything the device can detect; it is discarding edits it was
+told about.
 
 ### Pairing and tokens
 
@@ -896,7 +1006,9 @@ discarded on disconnect and on a foreground handover.
 | `0x07` | tag state | 13 bytes | RAM (foreground only) | TEXT + IMAGE |
 | `0x08` | list document | 16 KB (`kMaxListDocLen`) | heap, transient — reassembled for the duration of one push, validated, written straight through to `lists.bin` on SD as the exact bytes received, then freed; never resident | LIST |
 
-Next free: `0x09`.
+Next free: `0x09` — the list-state sync-back did not consume it, being three
+Session-characteristic opcodes rather than a content field (see "List-state
+sync-back").
 
 The last column is v12's permitted-field table: a peer may push a content field
 only if its declared content shape matches, and anything else is answered
@@ -1531,15 +1643,15 @@ The grid is decorative, **not a launcher** — the device cannot start an app on
 the phone, so a selectable grid would promise something it can't deliver. At
 most 18 tiles are drawn (6 x 3), most-recently-seen `appId`s first.
 
-### List document field (`0x08`) — ToDo List, Phase A
+### List document field (`0x08`) — ToDo List
 
-**Phase A is read-only.** This field pushes a whole document that the device
-stores and renders (`Screen::List`); nothing on this field lets the device
-change it back. There is no check-off, no `LIST_STATE` notify, and no
-`list_state.json` — those are Phase B of
-`docs/companion-todo-list-design.md` and are **not implemented**. Treat every
-claim below as "the device can show you a list", not "the device can help you
-shop with no phone".
+**This field is push-only.** It carries a whole
+document from the phone to the device, and nothing travels back on it. The
+device's check-off edits go back over the Session characteristic instead — see
+"List-state sync-back" above — which is why the round trip needed three
+opcodes and no second content field. The document in `lists.bin` is never
+mutated by the device: edits are recorded as deviations from it, so what the
+phone sent stays distinguishable from what the user did.
 
 A `LIST` peer's UI declaration permits exactly this one content field (see
 "Field ids" above) — pushed as a whole-document replace, like the UI
@@ -1586,8 +1698,14 @@ the buffer, is malformed.
   renderer.
 - **`checked` must be exactly `0` or `1`.** Any other byte value makes the
   whole document malformed (`RENDER_STATUS(DECODE_FAILED)`) rather than being
-  clamped or ignored — Phase A never writes this byte itself, so accepting a
-  bad one would mean rendering state the device cannot explain.
+  clamped or ignored — the device never writes this byte back into the stored
+  document, so accepting a bad one would mean rendering state it cannot
+  explain.
+- **`checked` here is the phone's value, not necessarily what is on screen.**
+  What the device renders is this byte overridden by any local deviation
+  recorded in `list_state.bin` (see "List-state sync-back"). Storing a new
+  document clears those deviations, so immediately after a push the two agree
+  by construction.
 
 **One cap, `kMaxListDocLen` = 16 KB, bounds the transfer's total bytes.** A
 push over this is **refused outright at `START`** — `RENDER_STATUS(REJECTED_SIZE)`
@@ -1645,8 +1763,11 @@ screen) unconditionally — **not** only what the foreground peer's own button
 map left unclaimed, the way the image gallery's `Up`/`Down` paging does. That
 is safe specifically because a `LIST` peer's shape, and therefore its need for
 all five buttons, is known and enforced before `Screen::List` is ever reached
-(see "UI declaration field"). `Confirm` is a no-op in Phase A — there is
-nothing to toggle yet.
+(see "UI declaration field"). `Confirm` toggles the item under the cursor,
+recording a deviation in `list_state.bin` and, if the peer is connected,
+announcing it with `LIST_STATE_AVAIL` — see "List-state sync-back" above. The
+toggle is purely local otherwise: no phone is required for it, which is the
+entire point of the feature.
 
 A newly stored document reaches the screen without a fresh connection: storing
 a push fires a device-internal callback naming the peer, and if that peer's
@@ -1754,9 +1875,9 @@ the device. **23 bytes**, unchanged in layout since v6 — v7 through v11 each
 only bumped the version number itself (byte 0), for field `0x04`'s
 payload format change, the `HELLO`/UI-declaration additions, the image
 `CHUNK` sequence number, the title/body `CHUNK` sequence number, and
-`RENDER_STATUS`/`pushId` respectively. v12 additionally sets a **new feature
-flag bit** in byte 5; the layout is still 23 bytes. See "v7 changes from v6"
-onward:
+`RENDER_STATUS`/`pushId` respectively. v12 additionally sets **two new feature
+flag bits** in byte 5; the layout is still 23 bytes. See "v7 changes from
+v6" onward:
 
 ```
 byte 0        protocol version = 12
@@ -1767,6 +1888,9 @@ byte 5        feature flags: bit0 image, bit1 UI declaration, bit2 icons, bit3 s
               bit4 declared content shape (v12) — the device enforces the UI
               declaration's shape byte, so a client can tell before pushing
               anything that its declaration needs one
+              bit5 list-state sync-back (v12) — the device announces and serves
+              the on-device check-off diff on the Session characteristic
+              (LIST_STATE_AVAIL / LIST_STATE_GET / LIST_STATE)
 bytes 6..9    max image field length, uint32 LE
 byte 10       max concurrent sessions (4)
 byte 11       icon width in pixels
@@ -1793,6 +1917,13 @@ whole reason to guarantee it. A client should:
    *"this reader's firmware is too old for this version of <app>"* (or too new)
    and stop. Do not attempt the handshake, and do not guess at the layout — the
    23-byte value shares nothing past byte 4 with v5's 5-byte one.
+
+**Under v12 a stale client no longer gets that far.** `HELLO` carries
+`protocolVersion` and the device rejects on strict inequality
+(`HELLO_DENIED(PROTOCOL_MISMATCH)`), so byte 0 reading `12` is the check a
+client should make, and the handshake is the backstop if it does not. Byte 5
+reads `0x3F`: bit 4 says the device enforces the declared content shape, bit 5
+that it serves the list-state sync-back conversation.
 
 **This is how a v11 client detects the v12 break before it hits it.** Byte 0
 reads 12 and byte 5's bit 4 is set; a client that checks either one knows its UI
@@ -1918,8 +2049,14 @@ means:
     ui.bin                   UI declaration (content shape + button routing/labels + tag labels)
     lists.bin                 ToDo List document (field 0x08, LIST shape only) -- the exact wire bytes
                               pushed, verbatim, same as ui.bin/icon.bin above, not a JSON re-encoding.
-                              Phase A: read-only, whole-document replace via temp-file-then-rename;
-                              see "List document field"
+                              Whole-document replace via temp-file-then-rename, never mutated by the
+                              device; see "List document field"
+    list_state.bin            the on-device check-off diff against lists.bin: a 7-byte header
+                              (formatVersion, revision, count) followed by count x { itemId:2, checked:1 },
+                              ascending by itemId. Entries are byte-identical to LIST_STATE's wire body,
+                              so serving a pull is a header read plus a seek to 7 + 3*offset -- no
+                              materialised structure, nothing resident. Cleared whenever a new document
+                              lands; see "List-state sync-back"
     data/                    per-peer scratch: staged image, event logs
 ```
 
@@ -1969,9 +2106,37 @@ growth would make `peers.json` unbounded, and it is parsed into RAM.
 5. **Re-pushing the declaration is the only way to change shape**, and it
    triggers a foreground change that clears the screen. Deliberately
    heavyweight; deliberately explicit.
-6. **Capability byte 0 bumped from 11 to 12, and byte 5 gains flag bit 4**
-   (declared content shape). No capability bytes moved; the block is still 23
-   bytes.
+6. **Three new Session-characteristic opcodes** carry the ToDo List check-off
+   diff back to the phone: `LIST_STATE_AVAIL` (`0x8B`, device → phone),
+   `LIST_STATE_GET` (`0x05`, phone → device) and `LIST_STATE` (`0x8C`,
+   device → phone). See "List-state sync-back" above for the layouts and the
+   semantics.
+7. **No new content field for the sync-back.** `0x09` is still free. It is a
+   conversation on the Session characteristic, not a push: the device starts
+   it, the phone answers it piecewise, and nothing in it owns the screen —
+   none of which `START`/`CHUNK`/`END` framing describes.
+8. **Availability notify plus a phone-driven pull, not a single notification.**
+   The design this replaces (`docs/companion-todo-list-design.md` §4 as
+   originally written) was one notify carrying the whole diff. It cannot
+   exist: a realistic shopping list's diff is 150–200 entries × 3 bytes, and
+   this characteristic's documented floor is 103 bytes and is **never
+   chunked**. Bursting a run of notifies instead would put the whole diff at
+   the mercy of NimBLE's finite msys mbuf pool — the same hazard that already
+   makes `IMAGE_CHUNK_ACK` fire once per 32 chunks rather than per chunk. The
+   pull keeps every message whole and self-describing, so the never-chunked
+   invariant holds unchanged; see the note under "Session characteristic".
+9. **The sync-back's gate is "has a non-empty diff", not a capability bit.** A
+   non-`LIST` peer cannot have a diff — no stored document means no screen to
+   toggle anything from — so no client-declared "supports ToDo lists" flag was
+   added or is needed.
+10. **`list_state.bin`, not `list_state.json`.** The device's diff is stored in
+    exactly the byte encoding `LIST_STATE` carries, so a pull is a header read
+    and a seek with no materialised structure. See "Storage layout" above and
+    `docs/companion-todo-list-design.md` §3.
+11. **Capability byte 0 bumped from 11 to 12, and byte 5 gains flag bits 4 and
+    5** (declared content shape; list-state sync-back), taking byte 5 from
+    `0x0F` to `0x3F`. No capability bytes moved; the block is still 23
+    bytes.
 
 **Why breaking, not additive, and why no compatibility path.** A v11 client's
 declaration has no shape byte, so under v12 it is refused outright and that

@@ -41,6 +41,14 @@ constexpr uint8_t kSessHello = 0x01;
 constexpr uint8_t kSessBye = 0x02;
 constexpr uint8_t kSessAcquire = 0x03;
 constexpr uint8_t kSessRelease = 0x04;
+// v12: fetch one page of this peer's stored check-off diff, starting at entry
+// index `offset`. The phone drives the whole pull -- the device announces that
+// a diff exists (kSessListStateAvail) and then answers requests. A GET past
+// the end, for an unknown session, or for a peer with no diff is answered with
+// n = 0 rather than an error: that reply IS the phone's terminator, and making
+// the normal end of every walk an error case would mean a clean pull could not
+// be told from a broken one.
+constexpr uint8_t kSessListStateGet = 0x05;
 
 // Session characteristic opcodes, device -> phone.
 constexpr uint8_t kSessHelloOk = 0x81;
@@ -69,6 +77,21 @@ constexpr uint8_t kSessImageChunkAck = 0x89;
 // so this is the only signal the phone ever gets that a text push landed
 // corrupt; the device drops the field rather than displaying garbage.
 constexpr uint8_t kSessFieldSeqGap = 0x8A;
+// v12: this peer has on-device check-off edits the phone has not pulled --
+// {opcode, sessionId, revision(4), count(2)}, 8 bytes.
+constexpr uint8_t kSessListStateAvail = 0x8B;
+// v12: one page of that diff, answering a kSessListStateGet.
+//
+// WHY A PAGINATED PULL AND NOT THE SINGLE NOTIFY docs/companion-todo-list-
+// design.md section 4 originally specified: a realistic shopping list is
+// 150-200 deviations, 3 bytes each, and this characteristic's floor is 103
+// bytes and is never chunked (docs/companion-display-protocol.md). Splitting
+// one logical message across notifications would have broken that invariant;
+// a sequence of independently-parseable whole messages does not. Bursting the
+// pages unprompted would also have put a few hundred notifications into
+// NimBLE's finite msys pool at once -- the same hazard kImageChunkAckInterval
+// below exists to avoid -- so the phone asks for them one at a time instead.
+constexpr uint8_t kSessListState = 0x8C;
 
 // How often (in chunks) to send kSessImageChunkAck during an image push. Not
 // flow control -- iOS's own canSendWriteWithoutResponse/
@@ -314,6 +337,17 @@ Session* sessionById(uint8_t id) {
   return session.active ? &session : nullptr;
 }
 
+// The live session for a peer, or kNoSession. One peerKey can hold at most one
+// session at a time -- it is the (appId, installId) pair, so a second HELLO
+// from the same install is the same app reconnecting, not a second app.
+uint8_t sessionIdForPeer(const char* peerKey) {
+  if (peerKey == nullptr || peerKey[0] == '\0') return kNoSession;
+  for (uint8_t i = 0; i < kMaxSessions; ++i) {
+    if (g_sessions[i].active && strcmp(g_sessions[i].peerKey, peerKey) == 0) return static_cast<uint8_t>(i + 1);
+  }
+  return kNoSession;
+}
+
 uint8_t allocateSession(const char* peerKey) {
   for (uint8_t i = 0; i < kMaxSessions; ++i) {
     if (g_sessions[i].active) continue;
@@ -406,7 +440,13 @@ void setForeground(uint8_t sessionId) {
     const std::string name = session ? companionpeer::displayName(session->peerKey) : std::string();
     g_foregroundCb(session ? session->peerKey : "", name.c_str());
   }
-  if (session) notifyForeground(sessionId);
+  if (session) {
+    notifyForeground(sessionId);
+    // Repeated here as well as at admission because an app that was backgrounded
+    // while the user kept ticking boxes is exactly the case a connect-time-only
+    // announcement misses.
+    notifyListStateAvail(session->peerKey);
+  }
 }
 
 void dropSession(uint8_t sessionId, BackgroundReason reason) {
@@ -892,8 +932,12 @@ void computeCapabilityValue(const GfxRenderer& renderer, int fontId) {
   g_capabilityValue[offset++] = static_cast<uint8_t>(kMaxFieldLen & 0xFF);
   g_capabilityValue[offset++] = static_cast<uint8_t>((kMaxFieldLen >> 8) & 0xFF);
   // bit0 image, bit1 button map, bit2 icons, bit3 sessions,
-  // bit4 declared content shape (v12)
-  g_capabilityValue[offset++] = 0x1F;
+  // bit4 declared content shape (v12), bit5 ToDo List state sync-back (v12) --
+  // the bit a client tests to know this device announces and serves the
+  // on-device check-off diff, rather than inferring it from the version alone.
+  // The 23-byte layout is unchanged by v12: a new capability is a bit in this
+  // byte, never a new byte, so a client's offsets stay put across versions.
+  g_capabilityValue[offset++] = 0x3F;
   g_capabilityValue[offset++] = static_cast<uint8_t>(kMaxImageFieldLen & 0xFF);
   g_capabilityValue[offset++] = static_cast<uint8_t>((kMaxImageFieldLen >> 8) & 0xFF);
   g_capabilityValue[offset++] = static_cast<uint8_t>((kMaxImageFieldLen >> 16) & 0xFF);
@@ -936,6 +980,13 @@ void admitPeer(uint16_t helloTag, const char* peerKey, const uint8_t token[16]) 
   }
   companionpeer::touch(peerKey);
   notifyHelloOk(helloTag, sessionId, peerKey, token);
+  // ORDER MATTERS, and this is the reason it is here rather than anywhere
+  // later: pushing a document requires ACQUIRE -> foreground, which cannot
+  // happen before HELLO_OK has handed out the sessionId. Announcing here
+  // therefore guarantees the phone learns a diff is pending BEFORE it can
+  // possibly destroy it -- storeListDocument() clears list_state.bin
+  // unconditionally on every document that lands.
+  notifyListStateAvail(peerKey);
 }
 
 void handleHello(const uint8_t* data, size_t len) {
@@ -1080,6 +1131,44 @@ class SessionCharCallbacks : public NimBLECharacteristicCallbacks {
         }
         session->declaredShape = static_cast<uint8_t>(shape);
         setForeground(sessionId);
+        break;
+      }
+
+      case kSessListStateGet: {
+        // opcode(1) sessionId(1) offset(2, LE)
+        if (len < 4) return;
+        const uint8_t sessionId = data[1];
+        const uint16_t offset = static_cast<uint16_t>(data[2] | (data[3] << 8));
+
+        // STATELESS: every GET re-opens the file and seeks. Holding a cursor
+        // would make a dropped notification or an abandoned walk corrupt the
+        // next one, and would need per-session teardown; a seek costs one open
+        // and buys idempotent, freely-repeatable, freely-reordered requests.
+        uint8_t payload[11 + 3 * kListStateEntriesPerNotify];
+        uint32_t revision = 0;
+        uint16_t total = 0;
+        size_t entries = 0;
+        const Session* session = sessionById(sessionId);
+        if (session != nullptr) {
+          entries = companionpeer::readListStateEntries(session->peerKey, offset, kListStateEntriesPerNotify,
+                                                        payload + 11, &revision, &total);
+        }
+        // An unknown session, a peer with no diff and a walk that has run off
+        // the end all answer n = 0, and none of them logs: that reply is the
+        // phone's terminator, not a fault.
+        size_t at = 0;
+        payload[at++] = kSessListState;
+        payload[at++] = sessionId;
+        payload[at++] = static_cast<uint8_t>(revision & 0xFF);
+        payload[at++] = static_cast<uint8_t>((revision >> 8) & 0xFF);
+        payload[at++] = static_cast<uint8_t>((revision >> 16) & 0xFF);
+        payload[at++] = static_cast<uint8_t>((revision >> 24) & 0xFF);
+        payload[at++] = static_cast<uint8_t>(offset & 0xFF);
+        payload[at++] = static_cast<uint8_t>((offset >> 8) & 0xFF);
+        payload[at++] = static_cast<uint8_t>(total & 0xFF);
+        payload[at++] = static_cast<uint8_t>((total >> 8) & 0xFF);
+        payload[at++] = static_cast<uint8_t>(entries);
+        notifySession(payload, at + 3 * entries);
         break;
       }
 
@@ -2044,6 +2133,29 @@ void notifyRenderStatus(RenderResult result, uint8_t pushId) {
   if (pushId == 0) return;
   if (g_foreground == kNoSession) return;
   const uint8_t payload[4] = {kSessRenderStatus, g_foreground, static_cast<uint8_t>(result), pushId};
+  notifySession(payload, sizeof(payload));
+}
+
+void notifyListStateAvail(const char* peerKey) {
+  const uint8_t sessionId = sessionIdForPeer(peerKey);
+  if (sessionId == kNoSession) return;
+
+  // Header-only read: maxEntries 0 with a null buffer fills revision/total and
+  // copies nothing, so the gate costs one open and 7 bytes and never
+  // materialises the 1096-byte Diff.
+  uint32_t revision = 0;
+  uint16_t count = 0;
+  companionpeer::readListStateEntries(peerKey, 0, 0, nullptr, &revision, &count);
+  if (count == 0) return;
+
+  const uint8_t payload[8] = {kSessListStateAvail,
+                              sessionId,
+                              static_cast<uint8_t>(revision & 0xFF),
+                              static_cast<uint8_t>((revision >> 8) & 0xFF),
+                              static_cast<uint8_t>((revision >> 16) & 0xFF),
+                              static_cast<uint8_t>((revision >> 24) & 0xFF),
+                              static_cast<uint8_t>(count & 0xFF),
+                              static_cast<uint8_t>((count >> 8) & 0xFF)};
   notifySession(payload, sizeof(payload));
 }
 

@@ -123,6 +123,7 @@ from companion_protocol import (
     BTN_LEFT,
     BTN_RIGHT,
     CAPABILITY_CHAR_UUID,
+    CAP_FLAG_LIST_STATE_SYNC,
     CAP_FLAG_SHAPE_AWARE,
     DENIED_REASONS,
     FIELD_BODY,
@@ -145,6 +146,9 @@ from companion_protocol import (
     ROUTING_PAGE_PREV,
     ROUTING_REMOTE,
     SERVICE_UUID,
+    LIST_STATE_ENTRIES_PER_NOTIFY,
+    LIST_STATE_MAX_NOTIFY_LEN,
+    SESS_LIST_STATE_AVAIL,
     SESS_RENDER_STATUS,
     SHAPE_IMAGE,
     SHAPE_LIST,
@@ -889,6 +893,21 @@ async def no_render_status_arrives(link: Link, marker: int, window: float) -> li
     return [n for n in link.notifications[marker:] if n.opcode == SESS_RENDER_STATUS]
 
 
+async def list_state_avails_since(link: Link, marker: int, window: float = 0.0) -> list:
+    """LIST_STATE_AVAIL notifications seen since `marker`, optionally after a wait.
+
+    Read off link.notifications rather than off a Session, deliberately: the
+    load-bearing case is the one sent immediately after HELLO_OK, which is on
+    the wire before this side has finished assigning itself the sessionId the
+    Session router matches on. Same reason and same shape as
+    no_render_status_arrives() above -- it is also the only way to assert an
+    AVAIL does *not* arrive, which is what the gate is.
+    """
+    if window:
+        await asyncio.sleep(window)
+    return [n for n in link.notifications[marker:] if n.opcode == SESS_LIST_STATE_AVAIL]
+
+
 async def run_tests(args, console: Console, results: Results) -> None:
     selected = set(args.only.split(",")) if args.only else None
 
@@ -957,6 +976,15 @@ async def run_tests(args, console: Console, results: Results) -> None:
             "capability flags advertise shape-awareness (bit 4)",
             bool(caps["flags"] & CAP_FLAG_SHAPE_AWARE),
             f"flags {caps['flags']:#04x} — device does not claim to enforce declared shapes",
+        )
+
+        # The list-state sync-back's feature bit, in the same byte and for
+        # the same reason: the capability block grew a flag, not a field, so
+        # every offset a client already reads stays where it was.
+        results.check(
+            "capability flags advertise list-state sync-back (bit 5)",
+            bool(caps["flags"] & CAP_FLAG_LIST_STATE_SYNC),
+            f"flags {caps['flags']:#04x} — device does not claim to sync list state back",
         )
 
         # Second drain of CRESET's fallout (main() does the first). The device
@@ -2311,6 +2339,269 @@ async def run_tests(args, console: Console, results: Results) -> None:
                         console, results, "list-toggle",
                         allowed=("shape", "0x08", "list doc", "decode", "size"),
                     )
+
+                    # --- Phase B slice 4: LIST_STATE sync-back --------------- #
+                    #
+                    # The device announces that it is holding edits
+                    # (LIST_STATE_AVAIL) and the phone pulls them a page at a
+                    # time (LIST_STATE_GET -> LIST_STATE). Every message is one
+                    # whole notification; the pull is paginated, which is a
+                    # different thing from a chunked message and is what keeps
+                    # the session characteristic's "never chunked" rule intact.
+                    #
+                    # Runs last in the group because it needs a diff to exist,
+                    # and it leaves one behind for its own gate assertions to
+                    # clear.
+
+                    # Two deviations to sync. The document was just re-pushed
+                    # clean, so the cursor is at flat index 0.
+                    console.press(BTN_CONFIRM)
+                    console.press(BTN_DOWN)
+                    console.press(BTN_CONFIRM)
+                    serial_revision, serial_entries = console.await_list_state(2)
+                    if results.check(
+                        "list-sync: two edits staged for the pull",
+                        len(serial_entries) == 2,
+                        f"revision {serial_revision}, entries {serial_entries}",
+                    ):
+                        # A session-level teardown, not a link-level one: this
+                        # group runs inside the enclosing `async with
+                        # BleakClient`, and BYE + HELLO re-enters admitPeer()
+                        # -- the function that actually carries the announcement
+                        # -- by exactly the same door a fresh connection does.
+                        marker = len(link.notifications)
+                        await session_c.bye()
+                        await asyncio.sleep(0.5)
+                        reply = await asyncio.wait_for(session_c.hello(), timeout=15.0)
+                        results.check(
+                            "list-sync: the LIST peer re-handshakes",
+                            reply.ok, "" if reply.ok else reply.reason_text,
+                        )
+                        # THE ORDERING ASSERTION. This has to be on the wire
+                        # before the phone could have pushed anything, because a
+                        # push clears the diff unconditionally -- an
+                        # announcement that arrived later would be racing the
+                        # thing it is meant to protect. A push needs ACQUIRE ->
+                        # foreground, which cannot precede HELLO_OK, so an AVAIL
+                        # sent inside admitPeer() is provably early enough.
+                        avails = await list_state_avails_since(link, marker, window=1.5)
+                        results.check(
+                            "list-sync: HELLO_OK is followed by LIST_STATE_AVAIL",
+                            len(avails) >= 1,
+                            f"{len(avails)} AVAIL notifications since HELLO",
+                        )
+                        if avails:
+                            results.check(
+                                "list-sync: AVAIL carries the stored revision and count",
+                                avails[0].count == 2 and avails[0].revision == serial_revision,
+                                f"revision {avails[0].revision} count {avails[0].count}, "
+                                f"serial says revision {serial_revision} count 2",
+                            )
+
+                        # Foreground back, so CLIST (which reports the
+                        # *foreground* peer's diff) can be compared against the
+                        # wire below.
+                        outcome = await session_c.acquire()
+                        results.check(
+                            "list-sync: the LIST peer retook the screen after re-HELLO",
+                            outcome[0] == "foreground", str(outcome),
+                        )
+
+                        # THE ENCODER ASSERTION. CLIST decodes list_state.bin
+                        # into text; the wire path seeks into the same file and
+                        # copies raw entry bytes out. They are two independent
+                        # readers of one file, so an encoder or offset bug shows
+                        # up here as a disagreement and nowhere else.
+                        page = await session_c.list_state_get(0)
+                        wire_entries = [(item, int(checked)) for item, checked in page.entries]
+                        results.check(
+                            "list-sync: LIST_STATE(offset=0) matches CLIST exactly",
+                            page.total == 2 and wire_entries == serial_entries,
+                            f"wire total {page.total} {wire_entries} vs serial {serial_entries}",
+                        )
+                        results.check(
+                            "list-sync: LIST_STATE echoes the offset and revision it was asked for",
+                            page.offset == 0 and page.revision == serial_revision,
+                            f"offset {page.offset} revision {page.revision}",
+                        )
+
+                        # offset == total is where every walk ends. n = 0 is the
+                        # terminator, not a fault.
+                        end = await session_c.list_state_get(2)
+                        results.check(
+                            "list-sync: a GET at the end answers n=0",
+                            end.entries == [] and end.total == 2,
+                            f"total {end.total} entries {end.entries}",
+                        )
+
+                        # ...and so is a wildly out-of-range one. A device that
+                        # treated this as an error would log, which
+                        # check_no_errors below would then fail on -- that
+                        # coupling is deliberate: it is how "must not log an
+                        # error" gets asserted at all.
+                        far = await session_c.list_state_get(9999)
+                        results.check(
+                            "list-sync: a GET far past the end answers n=0, not an error",
+                            far.entries == [] and far.total == 2,
+                            f"total {far.total} entries {far.entries}",
+                        )
+
+                        # --- PAGINATION ------------------------------------- #
+                        #
+                        # The assertion that a single-notify design could never
+                        # have passed: more deviations than fit in one
+                        # notification. LIST_STATE_ENTRIES_PER_NOTIFY is fixed
+                        # by the protocol rather than derived from the
+                        # negotiated MTU, so the page boundary is the same here
+                        # as on any phone, and asserting on it means something.
+                        paged_count = LIST_STATE_ENTRIES_PER_NOTIFY + 5
+                        paged_doc = encode_list_doc([{
+                            "id": 1, "title": "Long", "groups": [{
+                                "id": 1, "label": "", "items": [
+                                    {"id": 100 + i, "text": f"Item {i}", "checked": 0}
+                                    for i in range(paged_count)
+                                ],
+                            }],
+                        }], revision=9)
+                        paged_id = 0x7C
+                        verdict = await session_c.push_list_doc(paged_doc, push_id=paged_id)
+                        if results.check(
+                            "list-sync: the over-one-page document is accepted",
+                            verdict == RENDER_DISPLAYED,
+                            f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                        ):
+                            # Confirm toggles the item under the cursor, Down
+                            # advances it -- the real button seam, so this walks
+                            # the same path a user's thumb does.
+                            for _ in range(paged_count):
+                                console.press(BTN_CONFIRM)
+                                console.press(BTN_DOWN)
+                            serial_revision, serial_entries = console.await_list_state(paged_count)
+                            results.check(
+                                "list-sync: more deviations than fit one notification are staged",
+                                len(serial_entries) == paged_count,
+                                f"{len(serial_entries)} entries",
+                            )
+
+                            revision, total, entries, page_lengths = await session_c.pull_list_state()
+                            wire_entries = [(item, int(checked)) for item, checked in entries]
+                            results.check(
+                                "list-sync: the paginated walk reassembles CLIST's dump exactly",
+                                total == len(serial_entries) and wire_entries == serial_entries,
+                                f"wire total {total}, {len(wire_entries)} entries; "
+                                f"serial {len(serial_entries)}",
+                            )
+                            results.check(
+                                "list-sync: the walk took more than one page",
+                                len(page_lengths) >= 3,
+                                f"page lengths {page_lengths}",
+                            )
+                            # The whole reason the page size is 30: 11 + 3*30 =
+                            # 101 bytes, inside the 103-byte session
+                            # characteristic floor every central must support.
+                            # A notification over that is a protocol violation
+                            # even if this particular macOS link would carry it.
+                            results.check(
+                                "list-sync: no LIST_STATE notification exceeded the 103-byte floor",
+                                all(n <= LIST_STATE_MAX_NOTIFY_LEN for n in page_lengths),
+                                f"page lengths {page_lengths}, cap {LIST_STATE_MAX_NOTIFY_LEN}",
+                            )
+                            results.check(
+                                "list-sync: the pulled revision is the pushed document's",
+                                revision == serial_revision,
+                                f"wire {revision} vs serial {serial_revision}",
+                            )
+
+                        # --- THE GATE --------------------------------------- #
+                        #
+                        # AVAIL is sent if and only if a non-empty diff exists.
+                        # There is no "supports lists" capability bit to get out
+                        # of step with reality: a peer that never pushed a
+                        # document has no list file, so no reachable toggle, so
+                        # structurally no diff.
+                        marker = len(link.notifications)
+                        await session_a.bye()
+                        await asyncio.sleep(0.5)
+                        reply = await asyncio.wait_for(session_a.hello(), timeout=15.0)
+                        if results.check(
+                            "list-sync: the TEXT peer re-handshakes",
+                            reply.ok, "" if reply.ok else reply.reason_text,
+                        ):
+                            stray = await list_state_avails_since(link, marker, window=2.0)
+                            results.check(
+                                "list-sync: a TEXT peer gets no LIST_STATE_AVAIL",
+                                not [n for n in stray if n.session_id == session_a.session_id],
+                                str([(n.session_id, n.count) for n in stray]),
+                            )
+
+                        # A LIST peer that has never pushed a document is the
+                        # case a capability bit would have got wrong: it can do
+                        # lists, and still has nothing to sync. It must get
+                        # silence, not a count-0 message the phone has to
+                        # interpret. Declared but never acquired -- an asset
+                        # push needs no foreground, and taking the screen with
+                        # no document is not what is under test here.
+                        if session_b.session_id:
+                            result, tag = await session_b.push_asset(FIELD_UI_DECL, LIST_DECL)
+                            if results.check(
+                                "list-sync: the second peer is declared LIST",
+                                result == ASSET_STORED,
+                                f"ASSET_ACK {ASSET_RESULTS.get(result, result)}",
+                            ):
+                                session_b.asset_tags[FIELD_UI_DECL] = tag
+                                marker = len(link.notifications)
+                                await session_b.bye()
+                                await asyncio.sleep(0.5)
+                                reply = await asyncio.wait_for(session_b.hello(), timeout=15.0)
+                                if results.check(
+                                    "list-sync: the document-less LIST peer re-handshakes",
+                                    reply.ok, "" if reply.ok else reply.reason_text,
+                                ):
+                                    stray = await list_state_avails_since(link, marker, window=2.0)
+                                    results.check(
+                                        "list-sync: a LIST peer with no document gets no AVAIL",
+                                        not [n for n in stray if n.session_id == session_b.session_id],
+                                        str([(n.session_id, n.count) for n in stray]),
+                                    )
+
+                        # --- SYNCED, THEN RE-PUSHED ------------------------- #
+                        #
+                        # The phone has pulled; the phone then pushes the
+                        # document back with those ticks folded in. storeList-
+                        # Document() clears the diff, so there is nothing left
+                        # to announce and the device must stop announcing --
+                        # otherwise every foreground change would tell the phone
+                        # to re-pull edits it has already applied.
+                        synced_id = 0x7D
+                        verdict = await session_c.push_list_doc(SAMPLE_LIST_DOC_REV2, push_id=synced_id)
+                        results.check(
+                            "list-sync: the phone's post-pull document is accepted",
+                            verdict == RENDER_DISPLAYED,
+                            f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                        )
+                        revision, entries = console.await_list_state(0)
+                        results.check(
+                            "list-sync: the push cleared the diff",
+                            entries == [],
+                            f"revision {revision}, entries {entries}",
+                        )
+                        # A foreground round-trip is the other announcement
+                        # point, so it is the one that proves the gate holds
+                        # there too and not just at HELLO.
+                        marker = len(link.notifications)
+                        await session_c.release()
+                        await asyncio.sleep(0.5)
+                        outcome = await session_c.acquire()
+                        results.check(
+                            "list-sync: the LIST peer took the screen again",
+                            outcome[0] == "foreground", str(outcome),
+                        )
+                        stray = await list_state_avails_since(link, marker, window=2.0)
+                        results.check(
+                            "list-sync: nothing is announced once the diff is empty",
+                            not stray,
+                            str([(n.session_id, n.count) for n in stray]),
+                        )
 
                 # NEEDS RECONCILIATION: exact wording is firmware's to pick, so
                 # only substrings this comment can reasonably predict are

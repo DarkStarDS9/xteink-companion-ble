@@ -20,7 +20,7 @@ What lives here: GATT UUIDs, content/session opcodes, field ids, the
 notification decoder, capability parsing, the HELLO/ACQUIRE/RELEASE handshake,
 host-side token persistence, and the START/CHUNK/END framer (including the v9
 image / v10 title-body sequence numbers, the v11 `pushId` on END, and v12's
-mandatory declared content shape).
+mandatory declared content shape and its LIST_STATE pull).
 
 What deliberately does not live here: anything a *particular* client decides —
 which buttons it declares, what it prints, how it correlates its own pushes,
@@ -98,6 +98,7 @@ CHUNK_SEQ_LEN = 2  # + uint16 seq, for SEQ_CHUNK_FIELDS
 # --------------------------------------------------------------------------- #
 
 SESS_HELLO, SESS_BYE, SESS_ACQUIRE, SESS_RELEASE = 0x01, 0x02, 0x03, 0x04
+SESS_LIST_STATE_GET = 0x05  # v12
 
 SESS_HELLO_OK = 0x81
 SESS_HELLO_PENDING = 0x82
@@ -113,6 +114,21 @@ SESS_ASSET_ACK = 0x87
 SESS_RENDER_STATUS = 0x88
 SESS_IMAGE_CHUNK_ACK = 0x89  # v9, diagnostic only
 SESS_FIELD_SEQ_GAP = 0x8A  # v10
+# v12: the ToDo List check-off sync-back. AVAIL is unsolicited (after HELLO_OK,
+# alongside FOREGROUND, and live as the user ticks boxes) and only ever sent
+# when the device is actually holding edits; LIST_STATE answers a GET. The pull
+# is paginated into whole, independently-parseable notifications precisely so
+# the session characteristic's "never chunked" rule still holds -- see
+# docs/companion-display-protocol.md.
+SESS_LIST_STATE_AVAIL = 0x8B
+SESS_LIST_STATE = 0x8C
+
+# Entries per LIST_STATE notification. Fixed by the protocol, not derived from
+# the negotiated MTU, so this constant is the contract and not a guess.
+LIST_STATE_ENTRIES_PER_NOTIFY = 30
+# 11-byte header + 30 * 3. The assertion that this never grows is what keeps
+# the pull inside the 103-byte session-characteristic floor.
+LIST_STATE_MAX_NOTIFY_LEN = 11 + 3 * LIST_STATE_ENTRIES_PER_NOTIFY
 
 DENIED_REASONS = {
     0x00: "user rejected",
@@ -206,6 +222,7 @@ CAP_FLAG_BUTTON_MAP = 0x02
 CAP_FLAG_ICONS = 0x04
 CAP_FLAG_SESSIONS = 0x08
 CAP_FLAG_SHAPE_AWARE = 0x10
+CAP_FLAG_LIST_STATE_SYNC = 0x20  # v12
 
 BTN_BACK, BTN_CONFIRM, BTN_LEFT, BTN_RIGHT, BTN_UP, BTN_DOWN, BTN_POWER = range(7)
 BUTTON_NAMES = {0: "BACK", 1: "CONFIRM", 2: "LEFT", 3: "RIGHT", 4: "UP", 5: "DOWN", 6: "POWER"}
@@ -471,6 +488,11 @@ class SessionNotification:
     seq: int | None = None
     token: bytes | None = None
     asset_tags: dict[int, bytes] | None = None
+    revision: int | None = None
+    count: int | None = None
+    offset: int | None = None
+    total: int | None = None
+    entries: list[tuple[int, bool]] | None = None
 
     @property
     def is_hello_reply(self) -> bool:
@@ -517,6 +539,17 @@ def decode_session_notification(data: bytes) -> SessionNotification:
         note.seq = struct.unpack_from("<H", data, 2)[0]
     elif opcode == SESS_FIELD_SEQ_GAP:
         note.field_id = data[2]
+    elif opcode == SESS_LIST_STATE_AVAIL:
+        note.revision = struct.unpack_from("<I", data, 2)[0]
+        note.count = struct.unpack_from("<H", data, 6)[0]
+    elif opcode == SESS_LIST_STATE:
+        note.revision = struct.unpack_from("<I", data, 2)[0]
+        note.offset = struct.unpack_from("<H", data, 6)[0]
+        note.total = struct.unpack_from("<H", data, 8)[0]
+        n = data[10]
+        note.entries = [
+            (struct.unpack_from("<H", data, 11 + i * 3)[0], bool(data[13 + i * 3])) for i in range(n)
+        ]
     return note
 
 
@@ -694,6 +727,12 @@ class Session:
         self.render_statuses: list[tuple[int, int]] = []  # (result, pushId)
         self.field_seq_gaps: list[int] = []  # field ids the device dropped
         self.chunk_acks: list[int] = []  # IMAGE_CHUNK_ACK seq numbers
+        # v12: every LIST_STATE_AVAIL this session was sent, as (revision,
+        # count). Recorded rather than only awaited because the interesting
+        # assertions are about *when* one arrives and about one NOT arriving.
+        self.list_state_avails: list[tuple[int, int]] = []
+        self.on_list_state_avail: Callable[[int, int], None] | None = None
+        self._list_state_futures: dict[int, asyncio.Future] = {}
 
         # Optional hooks, so a client can print without this module doing so.
         self.on_pending: Callable[[], None] | None = None
@@ -712,6 +751,7 @@ class Session:
         self._background_future = None
         self._asset_futures.clear()
         self._render_futures.clear()
+        self._list_state_futures.clear()
 
     @property
     def _client(self) -> BleakClient:
@@ -759,6 +799,15 @@ class Session:
             self.field_seq_gaps.append(note.field_id)
             if self.on_field_seq_gap:
                 self.on_field_seq_gap(note.field_id)
+        elif note.opcode == SESS_LIST_STATE_AVAIL:
+            self.list_state_avails.append((note.revision, note.count))
+            if self.on_list_state_avail:
+                self.on_list_state_avail(note.revision, note.count)
+        elif note.opcode == SESS_LIST_STATE:
+            # Keyed by offset, not FIFO: the device is stateless across a pull,
+            # so a client is free to have several GETs outstanding, and a reply
+            # is identified by the offset it echoes.
+            self.link.resolve(self._list_state_futures.pop(note.offset, None), note)
 
     # -- handshake ----------------------------------------------------------- #
 
@@ -827,6 +876,45 @@ class Session:
 
     async def bye(self) -> None:
         await self._client.write_gatt_char(SESSION_CHAR_UUID, bytes([SESS_BYE, self.session_id]), response=True)
+
+    # -- v12: ToDo List check-off sync-back ---------------------------------- #
+
+    async def list_state_get(self, offset: int, timeout: float = 5.0) -> SessionNotification:
+        """One LIST_STATE page starting at entry `offset`.
+
+        `offset` past the end, an unknown session and a peer with no stored diff
+        all answer n = 0. That is the terminator of a normal walk, not an error,
+        and the device logs nothing for it -- which is what lets check_no_errors
+        run over a test that deliberately over-reads.
+        """
+        assert self.link is not None
+        self._list_state_futures[offset] = self.link.loop.create_future()
+        await self._client.write_gatt_char(
+            SESSION_CHAR_UUID,
+            bytes([SESS_LIST_STATE_GET, self.session_id]) + struct.pack("<H", offset),
+            response=True,
+        )
+        return await asyncio.wait_for(self._list_state_futures[offset], timeout=timeout)
+
+    async def pull_list_state(self, timeout: float = 5.0) -> tuple[int, int, list[tuple[int, bool]], list[int]]:
+        """Walk the whole diff: (revision, total, entries, page_lengths).
+
+        `page_lengths` is the raw byte length of each notification, so a caller
+        can assert the pull stayed inside the session characteristic's floor --
+        the property that makes this design legal at all.
+        """
+        entries: list[tuple[int, bool]] = []
+        page_lengths: list[int] = []
+        revision, total = 0, 0
+        offset = 0
+        while True:
+            note = await self.list_state_get(offset, timeout=timeout)
+            page_lengths.append(len(note.raw))
+            revision, total = note.revision, note.total
+            if not note.entries:
+                return revision, total, entries, page_lengths
+            entries.extend(note.entries)
+            offset += len(note.entries)
 
     def expect_background(self) -> asyncio.Future:
         """Arm before doing whatever should preempt this session."""

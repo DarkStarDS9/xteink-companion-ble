@@ -12,24 +12,36 @@ holds the document in RAM for the screen's lifetime rather than re-reading SD pe
 (`scripts/companion_e2e_test.py`) that ran against a real X3 reader on 2026-08-10 and passed
 **17/17** — see `docs/companion-display-protocol.md`'s status warning for the exact assertions
 covered and the two unrelated flaky screen-state checks (not in this group) seen in an earlier run
-of the same session. **Not** landed: phases B (offline checking, `list_state.json`, `LIST_STATE`
-sync-back) and C (CompanionKit surface) below — Phase A is read-only, full stop.
+of the same session.
 
-**This shipped as part of protocol v12, not a new version.** v12 already reserved
-`ContentShape::List = 0x03` (`docs/companion-declared-shape-design.md`); this work gave that
-reservation a content field rather than bumping anything.
+**STATUS (2026-08-10, later the same day): Phase B's offline check-off and sync-back are
+implemented and hardware-verified.** Landed: the on-device diff
+(`src/CompanionTodoDiff.{h,cpp}`, host-tested in `test/companion_todo_diff/`), its per-peer storage
+(`list_state.bin` — **binary, not the JSON this document originally specified; see §3**), `Confirm`
+toggling on `Screen::List`, and the `LIST_STATE_AVAIL`/`LIST_STATE_GET`/`LIST_STATE` conversation
+on the Session characteristic. The full `scripts/companion_e2e_test.py` suite passed **159 passed,
+0 failed, 0 skipped** against a real X3 reader on three consecutive runs. **Not** landed: phase C
+(CompanionKit surface).
 
-**Two things this sketch got wrong, corrected by the implementation (see §4):**
+**Both phases are part of protocol v12, not a new version.** v12 already reserved
+`ContentShape::List = 0x03` (`docs/companion-declared-shape-design.md`); phase A gave the
+reservation a content field, and phase B's sync-back rides the Session characteristic v12 already
+defines, adding neither a content field nor a message-layout change.
+
+**Three things this sketch got wrong, corrected by the implementation (see §3 and §4):**
 
 - **No `kUiCapabilityTodoList` capability bit exists**, despite §4 introducing one for gating
   `LIST_STATE`. The shape byte alone (`ContentShape::List`) is what the implemented device checks
   and what the offline picker filters on — §4's own earlier paragraph had already talked itself out
   of a capability bit for shape declaration, then reached for one again a few lines later for
-  `LIST_STATE`. Since `LIST_STATE` itself is unimplemented (next point), so is the bit that would
-  have gated it.
-- **No `LIST_STATE` notify exists.** It is Phase B, entirely unimplemented — no offline check-off,
-  no `list_state.json`, no sync-back of any kind. §3's `list_state.json` bullet and §4's `LIST_STATE`
-  paragraph both describe this unimplemented mechanism, not current behaviour.
+  `LIST_STATE`. The implemented gate turned out to need no client declaration at all: the device
+  announces its diff when it *has* one, and only a `LIST` peer structurally can.
+- **The single-notification `LIST_STATE` this document specified cannot exist.** It does not fit
+  the Session characteristic, at any realistic list size. §4 below now carries the replacement
+  (an availability notify plus a phone-driven paginated pull) and the measurement of why the
+  original was impossible, rather than quietly swapping one design for another.
+- **`list_state.json` is `list_state.bin`.** §3's stated reason for JSON was falsified by this
+  very slice; §3 records that rather than overwriting it.
 
 **Stale line citations, not fixed here:** `src/CompanionBle.h:209` (§4) is now the `kFieldTodoList`
 family around line 92 (`kMaxListDocLen`) and 283 (`kFieldListDoc`) — the file grew underneath the
@@ -129,15 +141,26 @@ to protect — `kMaxListItems` is gone, and `lists.bin`'s bytes are the wire byt
 ```
 peers/<peerKey>/
   lists.bin          the exact wire bytes of the phone's last full kFieldListDoc push, unmodified
-  list_state.json    { revision it was taken against, checked: { itemId: bool } } — items the device
-                     has toggled locally since lists.bin's own revision was pushed (Phase B; not
-                     built in Phase A — see §9)
+  list_state.bin     u8 formatVersion=1, u32 revision, u16 count, count x { u16 itemId, u8 checked },
+                     ascending by itemId — the deviations from lists.bin the user has made on the
+                     device since that revision was pushed
 ```
 
-`list_state.json` is still the only genuinely new *kind* of file this feature needs, and remains
-JSON: unlike `lists.bin`, it has no wire format to be verbatim *of* — it is device-local, source-of-
-truth data (checked-locally-since-last-push) that has no equivalent on the wire until Phase B pushes
-it back to the phone.
+**The local diff was specified here as `list_state.json`, and shipped as `list_state.bin`.** The
+stated justification for JSON was: *"unlike `lists.bin`, it has no wire format to be verbatim of —
+it is device-local, source-of-truth data that has no equivalent on the wire until Phase B pushes it
+back to the phone."* Phase B is the slice that pushes it back, and it **gave the diff exactly one
+wire format** (`LIST_STATE`'s `{ itemId:2, checked:1 }` entries, §4), which falsifies the premise
+outright rather than merely outweighing it. Kept visible for the same reason the `lists.json`
+reversal above is: the argument was sound when written and was killed by a later slice, which is
+worth more on the record than a clean-looking document.
+
+What the byte format buys, beyond not being wrong: the on-disk entries are **byte-identical to the
+wire body**, so serving a pull is one header read and one seek to `7 + 3*offset` — no materialised
+`Diff`, no re-encoding step to keep in sync, and nothing resident. A JSON file would have had to be
+parsed into a structure (1096 bytes, §8) on every request, to answer a question the file's own
+layout can answer by arithmetic. Ascending-by-`itemId` order is what makes that offset addressing
+stable across independent pulls, so it is a format rule, not an implementation convenience.
 
 ## 4. Wire format
 
@@ -178,20 +201,84 @@ it back to the phone.
   gallery picker not-a-launcher (§8 of the multi-app design). **This is also why the shape is
   declared in the persisted UI declaration rather than on `ACQUIRE`:** that entry point runs with no
   phone connected, so the device must know a peer's shape while disconnected.
-- **New Session-characteristic notify, `LIST_STATE`**, sent once on `HELLO_OK`/`FOREGROUND` for a
-  `kUiCapabilityTodoList` peer, before the peer pushes anything: `{ revision, count, count ×
-  { itemId, checked } }` — the device's current `list_state.json` diff against whatever revision it
-  has. This is the asset-digest pattern (§5 of the multi-app design: "device reports opaque state,
-  app decides what's stale, app pushes") applied to list state instead of an asset tag. The device
-  never decides whether its diff is stale or how to merge it; the phone does, then re-pushes a new
-  `kFieldListDoc` at a new revision, which the device stores wholesale and against which it clears
-  `list_state.json`.
 
-All additive — no framing change to an existing op, no length change to an existing notification —
-so, following the pattern already used for `ASSET_ACK`/`IMAGE_STATUS`, this should not need the kind
-of breaking cutover v6 was. Still needs a version bump to advertise the new capability bit and field
-in the capability characteristic, but old clients that never set `kUiCapabilityTodoList` see none of
-this.
+### Sync-back: availability notify + phone-driven pull
+
+**This replaces the single `LIST_STATE` notify this section originally specified**, which was:
+one notification on `HELLO_OK`/`FOREGROUND` for a `kUiCapabilityTodoList` peer, carrying
+`{ revision, count, count × { itemId, checked } }` — the whole diff at once. **It is physically
+impossible on this characteristic**, and that is worth stating rather than skipping:
+
+- The Session characteristic's documented floor is **103 bytes** (`docs/companion-display-protocol.md`,
+  "Session characteristic": `HELLO` is up to 103 bytes and "a central that cannot get past 23 cannot
+  use v8 at all"), and it carries the invariant that **every message is a single write or a single
+  notification — this characteristic is never chunked**. A realistic shopping-list diff is 150–200
+  entries × 3 bytes. It does not fit, and it is not close.
+- Bursting a run of notifies instead trades a size problem for a buffer one: NimBLE's msys mbuf pool
+  is finite, and this firmware already paces `kSessImageChunkAck` at one per 32 chunks for exactly
+  that reason (`src/CompanionBle.cpp`), with `notifySession()`'s `bool` return discarded — so a
+  dropped notify in the middle of a burst would be silent, and the phone would have no way to know
+  which window it lost.
+
+**What ships instead.** The device announces availability; the phone pulls windows:
+
+```
+device -> phone  LIST_STATE_AVAIL  0x8B  sessionId:1  revision:4  count:2          =  8 bytes
+phone  -> device LIST_STATE_GET    0x05  sessionId:1  offset:2                     =  4 bytes
+device -> phone  LIST_STATE        0x8C  sessionId:1  revision:4  offset:2
+                                         total:2  n:1  n x { itemId:2, checked:1 } = 11 + 3n bytes
+```
+
+`kListStateEntriesPerNotify = 30`, so `LIST_STATE` maxes out at **101 bytes** — inside the
+already-documented 103-byte floor, which is why this needs no MTU renegotiation and no runtime MTU
+query. **The 30 is fixed, deliberately not derived from the negotiated MTU**, on the same reasoning
+the protocol doc already applies to `kMaxContentIdLen` ("treat 32 bytes as the contract"): a
+constant is host-testable and identical for every client, where a per-connection page size would
+make the pagination boundary — the one thing a pull's correctness turns on — a property of whichever
+central connected.
+
+**The never-chunked invariant survives, and that is the point of this shape, not a side effect.**
+Every message here is complete and self-describing: each `LIST_STATE` carries its own `revision`,
+`offset` and `total` and means something on its own. A sequence of independent whole messages is a
+different thing from chunking one message — nothing is a fragment, there is no reassembly state in
+either direction, and a lost message costs its window rather than desynchronising a stream. The
+protocol doc's sentence is reaffirmed there, not relaxed.
+
+**Semantics:**
+
+- **The device is stateless across a pull.** Each `GET` is an independent seek into `list_state.bin`;
+  no cursor is held. Pulls may be repeated, reordered or abandoned freely, which is what makes a
+  dropped notification cheap.
+- **`n = 0` is the terminator, not an error.** A `GET` with `offset >= total`, for an unknown
+  `sessionId`, or for a peer with no stored diff is answered `n = 0` (`revision`/`total` as known,
+  `0` when unknown). The device logs nothing.
+- **The gate is "has a non-empty diff", full stop** — no capability bit, and specifically not the
+  `kUiCapabilityTodoList` this document twice reached for. A non-`LIST` peer structurally cannot
+  have a diff (no `lists.bin` means no reachable on-device toggle), so the diff's existence *is* the
+  declaration. A `LIST` peer that never pushed a document hears nothing, which beats an empty
+  message the phone has to interpret.
+- **`LIST_STATE_AVAIL` is sent at three points:** immediately after `HELLO_OK` (`admitPeer()`),
+  alongside `FOREGROUND` (`setForeground()`), and live from the on-device toggle when the user
+  checks something off while the peer is connected.
+- **The `HELLO_OK` ordering is load-bearing.** `storeListDocument()` clears the diff unconditionally
+  on every new document, and a push requires `ACQUIRE` → foreground, which cannot precede
+  `HELLO_OK`. So the phone always learns about a pending diff *before* it is capable of destroying
+  one. A phone that pushes first anyway is discarding edits it was told about, which is its call to
+  make; the device does not arbitrate.
+- **Entries are deviations, not absolute states**, and `revision` is recorded, never interpreted —
+  the asset-digest pattern (§5 of the multi-app design: "device reports opaque state, app decides
+  what's stale, app pushes") applied to list state instead of an asset tag. The phone merges and
+  re-pushes a new `kFieldListDoc` at a new revision; the device stores it wholesale and clears the
+  diff.
+
+**No new content field.** `0x09` stays free: this is a conversation the device initiates and the
+phone answers piecewise, carrying nothing that owns the screen — none of which `START`/`CHUNK`/`END`
+framing models.
+
+**No version change.** Nothing about an existing message's layout changed, and the three opcodes
+live on the Session characteristic v12 already defines. The capability characteristic advertises
+the sync-back as byte 5 bit 5, alongside bit 4's declared content shape (byte 5 reads `0x3F`), with
+the 23-byte layout unchanged.
 
 ## 5. On-device UX
 
@@ -203,10 +290,24 @@ this.
   - Left/Right: switch between lists within the document.
   - Confirm: toggle checked on the item under cursor.
   - Back: leave `Screen::List`, back to the icon grid.
-- A toggle writes through to `list_state.json` immediately (small, infrequent writes — nothing like
-  the per-CHUNK write rate of an image push). Rendering redraws just the toggled row's checkbox glyph
-  where the panel's partial-refresh path allows it, full list redraw otherwise — a rendering detail,
+- A toggle writes through to `list_state.bin` immediately (small, infrequent writes — nothing like
+  the per-CHUNK write rate of an image push), via the same temp-file-then-rename discipline
+  `lists.bin` uses, so a mid-write failure cannot clobber previously-good edits. It records a
+  **deviation** from the document's own `checked` value: toggling an item back to what the document
+  says removes its entry rather than recording a redundant one, so a user fidgeting with one
+  checkbox cannot grow the table and "empty diff" means exactly "nothing to sync" with no comparison
+  pass. `lists.bin` itself is never edited — see `src/CompanionTodoDiff.h` for why the pushed
+  document has to stay the phone's, verbatim.
+- A toggle that needs a new entry when the table is full (`kMaxDiffEntries` = 512) is **refused and
+  reported**, not silently dropped and not silently evicting another entry: the user is told the
+  edit did not take. The cap is sized so a legal 16 KB document's every item can carry a deviation.
+- If the peer is connected, a toggle also sends `LIST_STATE_AVAIL` (§4) — the phone learns
+  immediately rather than at next connect.
+- Rendering redraws just the toggled row's checkbox glyph via the windowed-refresh path measured in
+  §9 (~430 ms against ~2979 ms for a full refresh), so no coalescing is needed — a rendering detail,
   not a protocol one.
+- What `Screen::List` draws is the document's `checked` **overridden by the diff**; the two agree by
+  construction immediately after a push, since storing a document clears the diff.
 - This is the one place a button's meaning isn't declared by the peer's `ButtonRouting` map (§7 of
   the multi-app design) — it's implicit in being on `Screen::List`, the same way gallery Up/Down and
   text pagination are already implicit in their screens rather than routed. No new `ButtonRouting`
@@ -226,7 +327,7 @@ question into: **one revision number for the entire document**, not one per list
 - The phone always pushes every list in one `kFieldListDoc`, even to change one item on one list.
   Fine at this size — the whole point of confirming this now is that a few KB of shopping-list text
   makes per-list revisioning not worth its bookkeeping.
-- `LIST_STATE`'s diff is likewise one flat `itemId -> checked` map across every list in the document,
+- The diff is likewise one flat `itemId -> checked` map across every list in the document,
   since `itemId` is already globally opaque and unique within a peer's document, not scoped to a
   list.
 - Failure mode this accepts: two lists edited offline in the same session and reconciled together is
@@ -244,8 +345,11 @@ version). New first-class Swift types, not opaque-bytes round-tripping:
   shape.
 - `TodoDocument { revision, lists: [TodoList] }` — the `kFieldListDoc` codec, alongside
   `UiDeclaration.swift`/`ContentFramer.swift`'s existing pattern.
-- `CompanionClient` gains an event for the `LIST_STATE` notify (mirrors how asset digests already
-  surface) and a `pushTodoDocument(_:)` call. The merge logic — combining the device's reported diff
+- `CompanionClient` gains an event for `LIST_STATE_AVAIL` (mirrors how asset digests already
+  surface), a pull that loops `LIST_STATE_GET` until `n = 0` and hands back one assembled
+  `[itemId: Bool]` of deviations, and a `pushTodoDocument(_:)` call. The pagination belongs here,
+  not in app code: every consumer app would otherwise reimplement the same loop and the same
+  terminator rule. The merge logic — combining the device's reported diff
   with the app's own edits into a new revision — lives here, in the app-facing package, per "the
   device never merges" in §4/§6.
 
@@ -254,7 +358,8 @@ version). New first-class Swift types, not opaque-bytes round-tripping:
 | Item | Where it lives | Cost |
 |---|---|---|
 | Document (`lists.bin`) | SD | 0 RAM at rest |
-| Local diff (`list_state.json`) | SD | 0 RAM |
+| Local diff (`list_state.bin`) | SD | 0 RAM |
+| `companiontodo::Diff` while a toggle is applied | heap, materialised for one edit and dropped | 1096 bytes, transient — **0 permanently resident**. Bit-packed `checked` rather than a `struct{u16,u8}[512]` the compiler would pad to 2048. Serving a pull materialises nothing at all: a header read plus a seek (§3) |
 | In-flight document reassembly (a push arriving) | heap, `makeUniqueNoThrow`, freed right after validating and writing to SD | ≤ `kMaxListDocLen` = 16 KB, transient — **not** a fixed global buffer (see §4's note on why this deliberately does not copy the title/body pattern) |
 | Document buffer while `Screen::List` is up | heap, `makeUniqueNoThrow`, held by `CompanionModeActivity`, sized to the stored document, freed the moment the screen is left | ≤ `kMaxListDocLen` = 16 KB, held for the screen's lifetime rather than re-read from SD per keypress — see §3's "current choice" and `docs/companion-display-protocol.md`'s "List document field" |
 | List/cursor nav state | RAM, foreground peer only | comparable to the ~200 B gallery nav state (§11 of the multi-app design) |
@@ -300,11 +405,17 @@ way for `Screen::List` to hold a cursor or claim its buttons — see §4 above a
   document on screen, paginated, no offline checking yet. Provable with the existing host-harness
   discipline (`scripts/companion_e2e_test.py`) since it's push-and-render, same shape as text/image
   pushes today.
-- **B — Offline checking + `LIST_STATE` sync-back.** §5–§6. The genuinely new mechanism. Needs its
-  own host-harness coverage for the round trip (push document → simulate local toggle by writing
-  `list_state.json` directly in a test build → reconnect → assert `LIST_STATE` reports it), per this
-  repo's "every fix starts red" / no-phone-as-test-harness rules — this is protocol and firmware
-  timing behavior, not something that needs a phone to prove.
+- **B — Offline checking + sync-back.** §5–§6. The genuinely new mechanism, and still v12: three
+  Session-characteristic opcodes, no content field, no message-layout change.
+  **The test path in this bullet was superseded.** It proposed simulating a local toggle by writing
+  `list_state.json` directly in a test build, which would have proven the storage and wire halves
+  while stepping around the only part that is new: the button seam. The harness instead injects
+  `CMD:CBTN` through the **actual** button path, so a `Confirm` that never reaches `Diff::applyToggle()`
+  fails the test rather than being bypassed by it. Round trip: push document → `CMD:CBTN` a toggle →
+  assert `LIST_STATE_AVAIL` → pull with `LIST_STATE_GET` → assert the entries, the `n = 0`
+  terminator, and that a re-push clears the diff. Per this repo's "every fix starts red" /
+  no-phone-as-test-harness rules — this is protocol and firmware behaviour, not something that needs
+  a phone to prove.
 - **C — CompanionKit surface.** §7. Can start once A's wire format is stable; does not need B to land
   first, since the merge logic it owns is exercised by the harness fake in B, not required to be a
   real iOS app for either A or B to be provable.

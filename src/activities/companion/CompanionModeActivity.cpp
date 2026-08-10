@@ -1258,6 +1258,11 @@ bool CompanionModeActivity::handleListNav() {
       listDiff->applyToggle(target->itemId, target->documentChecked, nullptr);
       return true;
     }
+    // Announce only after the write succeeded, so the phone is never told to
+    // pull a state the card does not hold. A peer that is connected while the
+    // user works through the list learns each edit live instead of only at its
+    // next HELLO.
+    companionble::notifyListStateAvail(listPeerKey.c_str());
 
     RenderLock lock;
     // Full re-walk rather than poking the one row: the row vector is rebuilt
