@@ -1162,20 +1162,34 @@ void CompanionModeActivity::showTransientMessage(const std::string& text, Screen
 // Confirm on the idle icon grid. Builds pickerPeerKeys from every enrolled
 // peer (companionpeer::listPeers() — ungrouped, unlike the decorative grid's
 // listIconTiles(), since two installs of the same app must stay two separate
-// tiles here) that declared the image-gallery capability, capped at
-// kMaxIconTiles the same as the decorative grid's tile budget. Falls back to
-// a transient message rather than entering an empty picker.
+// tiles here) that declared either the image-gallery capability or the LIST
+// content shape, capped at kMaxIconTiles the same as the decorative grid's
+// tile budget. Falls back to a transient message rather than entering an
+// empty picker.
+//
+// One shared picker for both, not two separate entry points: this is the
+// same "local SD browse of content the app already pushed" argument for
+// both (docs/companion-multi-app-design.md §8's gallery-picker-is-not-a-
+// launcher reasoning, and docs/companion-todo-list-design.md §4's identical
+// argument for a LIST peer's document) — the tile grid is one idle-screen
+// affordance for "browse what an app already gave the device," and which
+// peers qualify is an ORed capability/shape check, not a second UI.
+// selectGalleryPickerPeer() is what actually branches on shape once a tile
+// is chosen.
 void CompanionModeActivity::enterGalleryPicker() {
   char keys[companionpeer::kMaxPeers][companionpeer::kPeerKeyLen];
   const size_t total = companionpeer::listPeers(keys, companionpeer::kMaxPeers);
 
   pickerPeerKeys.clear();
   for (size_t i = 0; i < total && pickerPeerKeys.size() < companionpeer::kMaxIconTiles; ++i) {
-    if (companionpeer::isImageCapable(keys[i])) pickerPeerKeys.emplace_back(keys[i]);
+    companionble::ContentShape shape = companionble::ContentShape::Text;
+    const bool isListPeer =
+        companionpeer::readDeclaredShape(keys[i], &shape) && shape == companionble::ContentShape::List;
+    if (companionpeer::isImageCapable(keys[i]) || isListPeer) pickerPeerKeys.emplace_back(keys[i]);
   }
 
   if (pickerPeerKeys.empty()) {
-    showTransientMessage(tr(STR_COMPANION_NO_GALLERY_APPS), Screen::IconGrid);
+    showTransientMessage(tr(STR_COMPANION_PICKER_EMPTY), Screen::IconGrid);
     return;
   }
 
@@ -1185,14 +1199,28 @@ void CompanionModeActivity::enterGalleryPicker() {
   requestUpdate();
 }
 
-// Confirm on the picker grid: load the highlighted peer's stored gallery —
-// purely a local SD read, no BLE involved regardless of whether that peer is
-// currently connected — and show it, or say there's nothing to show yet.
+// Confirm on the picker grid: for a LIST peer, open its stored ToDo List
+// document (the offline entry point docs/companion-todo-list-design.md §4
+// and docs/companion-declared-shape-design.md §3 describe -- entirely a
+// local SD read, no BLE involved regardless of whether that peer is
+// currently connected, exactly like the gallery case below). Otherwise, load
+// the highlighted peer's stored gallery, or say there's nothing to show yet.
 void CompanionModeActivity::selectGalleryPickerPeer() {
   if (pickerCursor >= pickerPeerKeys.size()) return;
   const std::string peerKey = pickerPeerKeys[pickerCursor];
-  loadGalleryForPeer(peerKey);
 
+  companionble::ContentShape shape = companionble::ContentShape::Text;
+  if (companionpeer::readDeclaredShape(peerKey.c_str(), &shape) && shape == companionble::ContentShape::List) {
+    RenderLock lock;
+    // Back returns to this picker, not straight to the icon grid -- the user
+    // came from here and most likely wants to look at another peer's tile
+    // next, same as leaving a gallery reached through the picker does below.
+    enterListDocument(peerKey, Screen::GalleryPicker);
+    requestUpdate();
+    return;
+  }
+
+  loadGalleryForPeer(peerKey);
   if (galleryImages.empty()) {
     showTransientMessage(tr(STR_COMPANION_GALLERY_EMPTY), Screen::GalleryPicker);
     return;
