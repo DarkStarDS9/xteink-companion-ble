@@ -793,8 +793,18 @@ async def ensure_declared_foreground(
     # elsewhere: settle to the post-handoff state before returning, or a caller
     # comparing screen-before/screen-after would be comparing against a stale
     # read rather than the state its own push actually ran against.
-    console.await_screen("waiting_app")
-    return True
+    #
+    # The settle's outcome has to be checked, not discarded: a timeout here
+    # means the handoff is still in flight, and the caller's "screen before"
+    # would then be a value that resolves on its own mid-test -- surfacing as
+    # a bogus "the screen changed" failure several checks later, somewhere
+    # that has nothing to do with this function.
+    settled = console.await_screen("waiting_app")
+    return results.check(
+        f"{label}: settles on the post-handoff screen",
+        settled == "waiting_app",
+        f"screen is {settled!r}",
+    )
 
 
 async def no_render_status_arrives(link: Link, marker: int, window: float) -> list:
@@ -1417,7 +1427,14 @@ async def run_tests(args, console: Console, results: Results) -> None:
                     results.check("IMAGE_CHUNK_ACK arrived during the transfer",
                                   len(owner.chunk_acks) >= 1, str(owner.chunk_acks))
                     print(f"  transfer + develop took {time.time() - started:.1f}s")
-                    results.check("device is showing an image", console.state().get("screen") == "image")
+                    # RENDER_STATUS comes back over BLE; `screen` is set on the
+                    # main loop task behind the RenderLock the develop pass is
+                    # still holding, so a bare read the moment the future
+                    # resolves samples the panel mid-refresh. Poll toward it --
+                    # a device that never got there still fails, just later.
+                    screen_after_image = console.await_screen("image")
+                    results.check("device is showing an image", screen_after_image == "image",
+                                  f"screen is {screen_after_image!r}")
 
                     # The checks above are the device's own self-report (a
                     # notification and a screen-state string) -- a decode bug
@@ -1462,14 +1479,20 @@ async def run_tests(args, console: Console, results: Results) -> None:
                             verdict == RENDER_SEQUENCE_GAP,
                             f"result {RENDER_RESULTS.get(verdict, verdict)}",
                         )
-                    # One live read for both the comparison and the message --
-                    # console.state() is a real serial round trip, so two
-                    # separate calls here can straddle a transient (see the
-                    # equivalent fix in the [shape] group's screen-unchanged
-                    # checks).
-                    state_after_gap = console.state()
+                    # Two settles, not one. The gap's answer is a BLE
+                    # notification while `screen` moves on the main loop task,
+                    # so reading the moment the future resolves would sample
+                    # the panel mid-abort -- and polling alone would not help,
+                    # because the first poll can still be satisfied by the
+                    # pre-gap "image" the device is about to change away from.
+                    # Sleep well past the panel settle (the [shape] group's
+                    # sibling check uses the same 6s for the same reason), then
+                    # poll toward the expected value, so a device that really
+                    # did drop the screen fails rather than flakes.
+                    await asyncio.sleep(6.0)
+                    screen_after_gap = console.await_screen("image")
                     results.check("the previous screen is retained after a gapped image",
-                                  state_after_gap.get("screen") == "image", str(state_after_gap))
+                                  screen_after_gap == "image", f"screen is {screen_after_gap!r}")
                     check_no_errors(console, results, "image seqgap", allowed=("CHUNK sequence gap",))
 
             # --- v12 declared content shape ---------------------------------- #
