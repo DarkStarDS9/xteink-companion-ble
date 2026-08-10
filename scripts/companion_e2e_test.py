@@ -22,7 +22,7 @@ Then:
 
     python scripts/companion_e2e_test.py --port /dev/cu.usbmodem21201
     python scripts/companion_e2e_test.py --port ... --only enrollment,preemption
-    python scripts/companion_e2e_test.py --port ... --only enrollment,reconnect,shape
+    python scripts/companion_e2e_test.py --port ... --only enrollment,reconnect,shape,list
     python scripts/companion_e2e_test.py --port ... --keep-peers   # skip the CRESET
     python scripts/companion_e2e_test.py --port ... --only enrollment,buttonmap,spokenfeeds \
         --articles 5 --render-timeout 10
@@ -127,13 +127,17 @@ from companion_protocol import (
     FIELD_BODY,
     FIELD_CONTENT_ID,
     FIELD_IMAGE,
+    FIELD_LIST_DOC,
     FIELD_TAG_STATE,
     FIELD_TITLE,
     FIELD_UI_DECL,
     HELLO_DENIED_PROTOCOL_MISMATCH,
+    MAX_LIST_DOC_LEN,
     PROTOCOL_VERSION,
+    RENDER_DECODE_FAILED,
     RENDER_DISPLAYED,
     RENDER_REJECTED_SHAPE,
+    RENDER_REJECTED_SIZE,
     RENDER_SEQUENCE_GAP,
     RENDER_RESULTS,
     ROUTING_PAGE_NEXT,
@@ -142,10 +146,12 @@ from companion_protocol import (
     SERVICE_UUID,
     SESS_RENDER_STATUS,
     SHAPE_IMAGE,
+    SHAPE_LIST,
     SHAPE_NAMES,
     SHAPE_TEXT,
     Link,
     Session,
+    encode_list_doc,
     encode_tag_state,
     encode_ui_declaration,
     pack_2bpp,
@@ -187,6 +193,52 @@ IMAGE_DECL = encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS, shape=SHAPE_IMAGE)
 # What every v11 client sends: no shape byte at all. Not a client this harness
 # imitates anywhere except in the one case that asserts it is refused.
 NO_SHAPE_DECL = encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS, shape=None)
+
+# A LIST peer's button map is deliberately empty, not DEFAULT_MAP. Every entry
+# in DEFAULT_MAP (LEFT/RIGHT page, CONFIRM/BACK remote-routed "Save"/"Back") is
+# one of exactly the buttons docs/companion-todo-list-design.md §5 says
+# Screen::List claims implicitly and locally -- Up/Down (cursor), Left/Right
+# (switch list), Confirm (toggle checked), Back (leave the screen) -- "the one
+# place a button's meaning isn't declared by the peer's ButtonRouting map ...
+# no new ButtonRouting enum value needed". Declaring any of them here would
+# claim a routing (e.g. CONFIRM -> ROUTING_REMOTE "Save") the device is never
+# going to honour, since list navigation intercepts those buttons before the
+# peer's map is ever consulted. Tags are empty too: §5 of
+# docs/companion-declared-shape-design.md is explicit that LIST permits no
+# overlay, so there is nothing for a declared tag label to attach to.
+LIST_DECL = encode_ui_declaration([], shape=SHAPE_LIST)
+
+# A small multi-list/multi-group/multi-item document, exercising every level
+# of the nesting the wire format describes (docs/companion-todo-list-design.md
+# §4): two lists, an ungrouped bucket (empty label) alongside a labelled
+# group, and both checked states.
+SAMPLE_LIST_DOC = encode_list_doc(
+    [
+        {
+            "id": 1,
+            "title": "Groceries",
+            "groups": [
+                {"id": 1, "label": "", "items": [
+                    {"id": 1, "text": "Milk", "checked": 0},
+                    {"id": 2, "text": "Eggs", "checked": 1},
+                ]},
+                {"id": 2, "label": "Produce", "items": [
+                    {"id": 3, "text": "Apples", "checked": 0},
+                ]},
+            ],
+        },
+        {
+            "id": 2,
+            "title": "Hardware",
+            "groups": [
+                {"id": 1, "label": "", "items": [
+                    {"id": 1, "text": "Batteries AA", "checked": 0},
+                ]},
+            ],
+        },
+    ],
+    revision=1,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -1708,6 +1760,255 @@ async def run_tests(args, console: Console, results: Results) -> None:
                 # firmware, so only what each log line is known to contain is
                 # exempted, and only for this section.
                 check_no_errors(console, results, "shape", allowed=("shape", "asset 0x05 rejected"))
+
+            # --- v12 (Phase A): the LIST shape and its document field ------- #
+            #
+            # A separate group from [shape] rather than folded into it, because
+            # it needs its own third declared peer (session_c, otherwise idle
+            # after the [shape] group's shapeless-declaration case leaves it
+            # enrolled but with nothing stored) and its own content field
+            # (FIELD_LIST_DOC) and codec (encode_list_doc) that [shape] knows
+            # nothing about. What IS shared with [shape] is asserted here, not
+            # duplicated there: LIST participates in the same
+            # declared-shape-refuses-the-wrong-field mechanism TEXT/IMAGE
+            # already proved, so this group only adds the LIST-specific
+            # permutations -- a LIST peer refusing TEXT content, a TEXT peer
+            # refusing the list doc, and LIST's stricter no-overlay rule.
+            if enabled("list"):
+                print("\n[list] v12 Phase A: FIELD_LIST_DOC (0x08) and the LIST content shape")
+
+                # --- the list doc pushed to a TEXT peer is refused ----------- #
+                #
+                # Uses session_a, already TEXT-declared and possibly still
+                # foreground from [shape] above; ensure_declared_foreground()
+                # is a no-op re-ACQUIRE in that case (digest already matches).
+                if await ensure_declared_foreground(
+                    session_a, console, results, TEXT_DECL, "list/text-peer"
+                ):
+                    screen_before = console.state().get("screen")
+                    doc_to_text_id = 0x71
+                    render = session_a.expect_render(doc_to_text_id)
+                    await session_a.push_field(
+                        FIELD_LIST_DOC, SAMPLE_LIST_DOC, final=True, push_id=doc_to_text_id
+                    )
+                    try:
+                        verdict = await asyncio.wait_for(render, timeout=15.0)
+                    except asyncio.TimeoutError:
+                        results.check(
+                            "a list doc pushed to a TEXT peer is answered RENDER_STATUS(RejectedShape)",
+                            False,
+                            f"nothing for pushId {doc_to_text_id:#04x}; "
+                            f"saw {session_a.render_statuses}",
+                        )
+                    else:
+                        results.check(
+                            "a list doc pushed to a TEXT peer is answered RENDER_STATUS(RejectedShape)",
+                            verdict == RENDER_REJECTED_SHAPE,
+                            f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                        )
+                    screen_after = console.state().get("screen")
+                    results.check(
+                        "a refused list doc left the TEXT peer's screen as it was",
+                        screen_after == screen_before,
+                        f"screen went {screen_before!r} -> {screen_after!r}",
+                    )
+
+                # --- a well-formed document, pushed to a LIST peer ----------- #
+                #
+                # session_c: enrolled already (the [shape] group's shapeless-
+                # declaration case ran a HELLO on it), but its declaration push
+                # there was deliberately refused, so nothing is stored -- this
+                # is the first declaration that actually lands on it.
+                if await ensure_declared_foreground(
+                    session_c, console, results, LIST_DECL, "list/peer"
+                ):
+                    doc_id = 0x72
+                    verdict = await session_c.push_list_doc(SAMPLE_LIST_DOC, push_id=doc_id)
+                    results.check(
+                        "a well-formed multi-list document is accepted and rendered",
+                        verdict == RENDER_DISPLAYED,
+                        f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                    )
+                    # NEEDS RECONCILIATION once the firmware side of this
+                    # design lands (Screen::List, docs/companion-todo-list-
+                    # design.md §5): "list" is this harness's guess at the
+                    # console's screen name for it, following the existing
+                    # "text"/"image" convention (CompanionModeActivity::
+                    # screenName()). If the firmware instead reports something
+                    # else, this is the one line to update.
+                    state_after_doc = console.state()
+                    results.check(
+                        "the device reports the list screen",
+                        state_after_doc.get("screen") == "list",
+                        str(state_after_doc),
+                    )
+
+                    # --- text content pushed to a LIST peer is refused ------- #
+                    screen_before = console.state().get("screen")
+                    text_to_list_id = 0x73
+                    render = session_c.expect_render(text_to_list_id)
+                    await session_c.push_field(
+                        FIELD_TITLE, b"Illegal on a LIST peer", final=True, push_id=text_to_list_id
+                    )
+                    try:
+                        verdict = await asyncio.wait_for(render, timeout=15.0)
+                    except asyncio.TimeoutError:
+                        results.check(
+                            "a title pushed to a LIST peer is answered RENDER_STATUS(RejectedShape)",
+                            False,
+                            f"nothing for pushId {text_to_list_id:#04x}; "
+                            f"saw {session_c.render_statuses}",
+                        )
+                    else:
+                        results.check(
+                            "a title pushed to a LIST peer is answered RENDER_STATUS(RejectedShape)",
+                            verdict == RENDER_REJECTED_SHAPE,
+                            f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                        )
+                    screen_after = console.state().get("screen")
+                    results.check(
+                        "a refused title push left the LIST peer's screen as it was",
+                        screen_after == screen_before,
+                        f"screen went {screen_before!r} -> {screen_after!r}",
+                    )
+
+                    # --- tag state has no overlay on LIST, unlike TEXT/IMAGE - #
+                    #
+                    # The one field TEXT and IMAGE both permit as an overlay
+                    # ([shape] group above) is exactly the one LIST does not:
+                    # docs/companion-declared-shape-design.md §5, "tag state
+                    # stays legal for every content shape but LIST ... there is
+                    # no list screen to overlay".
+                    tag_to_list_id = 0x74
+                    render = session_c.expect_render(tag_to_list_id)
+                    await session_c.push_field(
+                        FIELD_TAG_STATE, encode_tag_state([(0, 2)]), final=True, push_id=tag_to_list_id
+                    )
+                    try:
+                        verdict = await asyncio.wait_for(render, timeout=15.0)
+                    except asyncio.TimeoutError:
+                        results.check(
+                            "tag state pushed to a LIST peer is answered RENDER_STATUS(RejectedShape)",
+                            False,
+                            f"nothing for pushId {tag_to_list_id:#04x}; "
+                            f"saw {session_c.render_statuses}",
+                        )
+                    else:
+                        results.check(
+                            "tag state pushed to a LIST peer is answered RENDER_STATUS(RejectedShape)",
+                            verdict == RENDER_REJECTED_SHAPE,
+                            f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                        )
+
+                    # --- malformed documents are refused, not accepted ------- #
+                    #
+                    # Two distinct kinds of malformed: truncated mid-structure
+                    # (a length prefix promises bytes that never arrive), and
+                    # structurally complete but carrying a value the wire
+                    # format declares illegal (checked must be 0 or 1 only).
+                    # The primary assertion for both is deliberately weak --
+                    # "not displayed" -- because the exact refusal code is a
+                    # firmware-side judgement call this harness cannot make for
+                    # it; the more specific guess below is its own separate,
+                    # clearly-named check so a wrong guess doesn't mask the
+                    # primary (and more important) pass/fail.
+                    truncated_doc = SAMPLE_LIST_DOC[:20]
+                    truncated_id = 0x75
+                    verdict = await session_c.push_list_doc(truncated_doc, push_id=truncated_id)
+                    results.check(
+                        "a truncated list document is refused, not displayed",
+                        verdict != RENDER_DISPLAYED,
+                        f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                    )
+                    # NEEDS RECONCILIATION: guessing RENDER_DECODE_FAILED by
+                    # analogy with how a malformed image is answered -- a list
+                    # doc is reassembled in RAM and parsed the same way, per
+                    # docs/companion-todo-list-design.md §4. Confirm once the
+                    # firmware side lands.
+                    results.check(
+                        "a truncated list document is specifically DecodeFailed",
+                        verdict == RENDER_DECODE_FAILED,
+                        f"result {RENDER_RESULTS.get(verdict, verdict)} (guessed code -- see comment)",
+                    )
+
+                    bad_checked_doc = encode_list_doc(
+                        [{"id": 9, "title": "Bad", "groups": [
+                            {"id": 1, "label": "", "items": [
+                                {"id": 1, "text": "checked=2 is illegal", "checked": 2},
+                            ]},
+                        ]}],
+                        revision=2,
+                    )
+                    bad_checked_id = 0x76
+                    verdict = await session_c.push_list_doc(bad_checked_doc, push_id=bad_checked_id)
+                    results.check(
+                        "a document with checked=2 is refused, not displayed",
+                        verdict != RENDER_DISPLAYED,
+                        f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                    )
+
+                    # --- an over-cap document is refused --------------------- #
+                    #
+                    # One list, one group, enough single-character items to
+                    # clear MAX_LIST_DOC_LEN (16 KiB) comfortably -- each item
+                    # is 4 bytes of header plus 1 byte of text, so ~3300 items
+                    # covers it with margin.
+                    oversize_items = [
+                        {"id": i & 0xFFFF, "text": "x", "checked": 0}
+                        for i in range(1, 3400)
+                    ]
+                    oversize_doc = encode_list_doc(
+                        [{"id": 1, "title": "Too Big", "groups": [
+                            {"id": 1, "label": "", "items": oversize_items},
+                        ]}],
+                        revision=3,
+                    )
+                    results.check(
+                        "the oversize fixture actually exceeds MAX_LIST_DOC_LEN",
+                        len(oversize_doc) > MAX_LIST_DOC_LEN,
+                        f"{len(oversize_doc)} bytes vs cap {MAX_LIST_DOC_LEN}",
+                    )
+                    # Declared oversize length lives in START, same as the
+                    # image-to-text case in [shape] above: the refusal is
+                    # expected to latch there, before any buffer is allocated,
+                    # so only a handful of CHUNKs are sent rather than paying
+                    # for the whole ~17 KB transfer to prove it.
+                    oversize_id = 0x77
+                    render = session_c.expect_render(oversize_id)
+                    await session_c.push_field(
+                        FIELD_LIST_DOC, oversize_doc, final=True, push_id=oversize_id, max_chunks=4
+                    )
+                    try:
+                        verdict = await asyncio.wait_for(render, timeout=15.0)
+                    except asyncio.TimeoutError:
+                        results.check(
+                            "an over-cap list document is refused, not displayed",
+                            False,
+                            f"nothing for pushId {oversize_id:#04x}; saw {session_c.render_statuses}",
+                        )
+                        verdict = None
+                    else:
+                        results.check(
+                            "an over-cap list document is refused, not displayed",
+                            verdict != RENDER_DISPLAYED,
+                            f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                        )
+                    # NEEDS RECONCILIATION: guessing RENDER_REJECTED_SIZE by
+                    # analogy with the image field's own size cap. Confirm once
+                    # the firmware side lands.
+                    results.check(
+                        "an over-cap list document is specifically RejectedSize",
+                        verdict == RENDER_REJECTED_SIZE,
+                        f"result {RENDER_RESULTS.get(verdict, verdict)} (guessed code -- see comment)",
+                    )
+
+                # NEEDS RECONCILIATION: exact wording is firmware's to pick, so
+                # only substrings this comment can reasonably predict are
+                # exempted -- see the equivalent note closing [shape] above.
+                check_no_errors(
+                    console, results, "list",
+                    allowed=("shape", "0x08", "list doc", "decode", "size"),
+                )
 
 
 # --------------------------------------------------------------------------- #

@@ -65,7 +65,18 @@ OP_START, OP_CHUNK, OP_END = 0x01, 0x02, 0x03
 
 FIELD_TITLE, FIELD_BODY, FIELD_CONTENT_ID = 0x01, 0x02, 0x03
 FIELD_IMAGE, FIELD_UI_DECL, FIELD_ICON, FIELD_TAG_STATE = 0x04, 0x05, 0x06, 0x07
+# v12 (ToDo List Phase A): the whole document, revision + lists + groups +
+# items, per docs/companion-todo-list-design.md §4. Reassembled in RAM like
+# title/body, not streamed to SD like image -- it is small (cap 16 KiB, see
+# MAX_LIST_DOC_LEN) and pushed rarely, as a full replace. Next free after
+# this is 0x09.
+FIELD_LIST_DOC = 0x08
 FINAL_FLAG = 0x80
+
+# docs/companion-todo-list-design.md §4: the whole list document is
+# reassembled in RAM, capped well inside the ~166 KB of headroom measured
+# there.
+MAX_LIST_DOC_LEN = 16 * 1024
 
 # Fields whose CHUNKs carry the 2-byte little-endian sequence number: image
 # since v9, title/body since v10. Every other field's CHUNK payload still
@@ -165,7 +176,7 @@ RENDER_RESULTS = {
 
 SHAPE_TEXT = 0x01  # title (0x01), body (0x02), content-id (0x03), tag-state (0x07)
 SHAPE_IMAGE = 0x02  # image (0x04), tag-state (0x07)
-SHAPE_LIST = 0x03  # todo-list document; no content field exists for it yet
+SHAPE_LIST = 0x03  # todo-list document (0x08), no overlay
 SHAPE_NAMES = {SHAPE_TEXT: "TEXT", SHAPE_IMAGE: "IMAGE", SHAPE_LIST: "LIST"}
 
 # Which content fields each shape permits. Asset fields (0x05 declaration,
@@ -173,12 +184,14 @@ SHAPE_NAMES = {SHAPE_TEXT: "TEXT", SHAPE_IMAGE: "IMAGE", SHAPE_LIST: "LIST"}
 # supplies its icon. Tag state (0x07) is exempt in a different way: it is an
 # overlay drawn over whatever content is on screen, not content of its own, so
 # both TEXT and IMAGE permit it and an IMAGE peer can push image + tag as a
-# single atomic batch. LIST permits nothing yet, 0x07 included -- there is no
-# list screen to overlay.
+# single atomic batch. LIST permits only its own document (0x08) -- 0x07
+# included in what it does NOT permit, per
+# docs/companion-declared-shape-design.md §5: there is no overlay on
+# Screen::List.
 SHAPE_FIELDS = {
     SHAPE_TEXT: (FIELD_TITLE, FIELD_BODY, FIELD_CONTENT_ID, FIELD_TAG_STATE),
     SHAPE_IMAGE: (FIELD_IMAGE, FIELD_TAG_STATE),
-    SHAPE_LIST: (),
+    SHAPE_LIST: (FIELD_LIST_DOC,),
 }
 
 # Capability-block flag bits (byte 5). Bit 4 is v12's: the device enforces
@@ -277,6 +290,63 @@ def encode_tag_state(states: Iterable[tuple[int, int]]) -> bytes:
 def encode_icon_bits(bits: bytes) -> bytes:
     """Field 0x06: the digest followed by the 1-bpp bitmap."""
     return asset_tag(bits) + bits
+
+
+def encode_list_doc(lists: Iterable[dict], revision: int = 1) -> bytes:
+    """Field 0x08 (v12, ToDo List Phase A): revision, then lists, groups, items.
+
+    docs/companion-todo-list-design.md §4 is the authoritative layout; every
+    multi-byte value (revision, listId, groupId, itemId) is little-endian, the
+    same convention `encode_hello`/`push_field` already use elsewhere in this
+    module (`struct.pack("<H"/"<I", ...)`).
+
+        revision : u32
+        count L : u8, then L times:
+            listId : u16, titleLen : u8, title
+            group count G : u8, then G times:
+                groupId : u16, labelLen : u8, label   (empty label = ungrouped)
+                item count I : u8, then I times:
+                    itemId : u16, checked : u8, textLen : u8, text
+
+    `lists` is the ergonomic Python shape this is built from -- a sequence of
+    dicts, nesting groups and items the same way the wire format does:
+
+        encode_list_doc([
+            {"id": 1, "title": "Groceries", "groups": [
+                {"id": 1, "label": "", "items": [
+                    {"id": 1, "text": "Milk", "checked": 0},
+                    {"id": 2, "text": "Eggs", "checked": 1},
+                ]},
+            ]},
+        ], revision=7)
+
+    Deliberately permissive on `checked`: any int that fits in one byte is
+    packed as-is, with no 0/1 validation here. The wire format says "checked
+    (0 or 1 ONLY)"; a client that wants to prove the *firmware* enforces that
+    constraint needs an encoder that will build the illegal byte instead of
+    silently coercing it, so `encode_list_doc([...{"checked": 2}...])`
+    produces exactly that. A truncated document needs no special support
+    either -- slice the returned bytes, e.g. `encode_list_doc(GOOD)[:20]`.
+    """
+    lists = list(lists)
+    out = struct.pack("<I", revision) + bytes([len(lists)])
+    for lst in lists:
+        title = lst["title"].encode("utf-8")
+        groups = list(lst.get("groups", ()))
+        out += struct.pack("<H", lst["id"]) + bytes([len(title)]) + title + bytes([len(groups)])
+        for grp in groups:
+            label = grp.get("label", "").encode("utf-8")
+            items = list(grp.get("items", ()))
+            out += struct.pack("<H", grp["id"]) + bytes([len(label)]) + label + bytes([len(items)])
+            for item in items:
+                text = item["text"].encode("utf-8")
+                out += (
+                    struct.pack("<H", item["id"])
+                    + bytes([item.get("checked", 0)])
+                    + bytes([len(text)])
+                    + text
+                )
+    return out
 
 
 def encode_hello(hello_tag: int, app_id: bytes, install_id: bytes, token: bytes | None,
@@ -872,6 +942,20 @@ class Session:
         """
         future = self.expect_render(push_id)
         await self.push_field(FIELD_IMAGE, raw_bitmap, final=True, push_id=push_id, progress=progress)
+        return await asyncio.wait_for(future, timeout=timeout)
+
+    async def push_list_doc(self, doc: bytes, push_id: int = 1, timeout: float = 30.0) -> int:
+        """Push field 0x08 and wait for RENDER_STATUS. Returns the result byte.
+
+        A list document is CONTENT, answered by RENDER_STATUS like title/body/
+        image -- not an asset like the UI declaration/icon, which answer
+        ASSET_ACK (see `push_asset`). Unlike `push_image` there is no panel
+        settle to wait out (no grayscale two-pass here), so the default
+        timeout is much shorter; pass a larger one for a document large enough
+        that the transfer itself, not the render, dominates.
+        """
+        future = self.expect_render(push_id)
+        await self.push_field(FIELD_LIST_DOC, doc, final=True, push_id=push_id)
         return await asyncio.wait_for(future, timeout=timeout)
 
     async def set_tag(self, tag_id: int, state: int) -> None:
