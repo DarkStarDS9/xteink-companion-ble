@@ -14,6 +14,16 @@ Home/reader entry path in normal operation.
 
 ## Status
 
+> **Versioning rule: never bump the protocol version unless explicitly told to.**
+> Every client of this protocol is written by this project's author and they release in lockstep, so
+> there is no deployed client to strand and backward compatibility is not a requirement. v12 is
+> treated as **still in development**, not as a published contract: an additive change folds into
+> v12's definition and this document is rewritten to describe v12 as always having included it,
+> rather than earning a new version number. A capability feature bit inside the unchanged 23-byte
+> layout is an acceptable discovery mechanism and does not by itself justify a bump. Everything the
+> ToDo List functionality needed is v12. Resetting the version to **v1** before this is announced
+> publicly is under consideration — don't do it unprompted, but don't design against it either.
+
 **v12 — the current contract.** The shortest statement of it is: **a peer declares what kind of content it pushes, in its UI
 declaration, and may push nothing else.** A mandatory content-shape byte
 (`TEXT`/`IMAGE`/`LIST`) sits at offset 4 of field `0x05`, ahead of the button

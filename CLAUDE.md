@@ -39,8 +39,21 @@ memory comes from — streaming to an SD scratch file is usually the answer.
 [docs/companion-display-protocol.md](docs/companion-display-protocol.md) is **authoritative** for
 the wire format. Consumer apps depend on it.
 
-- Changing framing, field ids, or the capability characteristic is a **breaking change** — bump the
-  version and update the doc in the same commit.
+- **Never bump the protocol version unless you are explicitly told to.** This overrides every
+  instinct you have about versioning, and it overrode a v13 bump this file's earlier wording had
+  invited (2026-08-10, ToDo List Phase B). We are the only consumers — CompanionKit, SpokenFeeds,
+  Snap2Ink are all this project's own and release in lockstep — so there is no deployed client to
+  strand and **backward compatibility is not a requirement**. Treat the current version as still in
+  development: an additive change folds into v12's definition, and the docs are rewritten to describe
+  v12 as always having included it. A capability feature bit inside an unchanged 23-byte layout is
+  fine as a discovery mechanism and does not by itself justify a bump.
+  - Everything the ToDo List functionality needed — the `LIST_STATE` sync-back opcodes and the
+    byte-5 feature bit — is **v12**. Not v13.
+  - Still update `docs/companion-display-protocol.md` in the same commit as any wire change. That
+    part was never about the version number.
+  - Under consideration: **resetting the version to v1** once the dust settles, before this is
+    announced or presented. Do not do it unprompted, but do not write anything that would make it
+    painful either.
 - Field ids live in [src/CompanionBle.h](src/CompanionBle.h). Implemented: `0x01` title, `0x02` body,
   `0x03` content-id, `0x04` image (raw packed 2bpp, full screen, no header — see
   `RawBitmapToFramebufferConverter` and the protocol doc's "Image field" section; this replaced an
