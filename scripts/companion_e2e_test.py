@@ -874,11 +874,24 @@ async def ensure_declared_foreground(
     # would then be a value that resolves on its own mid-test -- surfacing as
     # a bogus "the screen changed" failure several checks later, somewhere
     # that has nothing to do with this function.
-    settled = console.await_screen("waiting_app")
+    # Which screen a handoff settles *on* is a function of the declared shape,
+    # not a constant. applyForegroundChange() routes a peer whose stored
+    # declaration says LIST straight to Screen::List -- its document may already
+    # be on SD from a previous session, so there is nothing to wait for and no
+    # placeholder to show (CompanionModeActivity.cpp, the readDeclaredShape()
+    # branch of applyForegroundChange). Every other shape falls through to the
+    # Screen::Text placeholder the console reports as "waiting_app".
+    #
+    # The shape byte is the first byte of the declaration body, i.e. straight
+    # after the 4-byte asset digest; a declaration with no shape byte at all
+    # (NO_SHAPE_DECL) is refused before it can ever reach a foreground change,
+    # so it can only be the non-LIST case here.
+    expected_screen = "list" if declaration[4:5] == bytes([SHAPE_LIST]) else "waiting_app"
+    settled = console.await_screen(expected_screen)
     return results.check(
         f"{label}: settles on the post-handoff screen",
-        settled == "waiting_app",
-        f"screen is {settled!r}",
+        settled == expected_screen,
+        f"screen is {settled!r}, expected {expected_screen!r}",
     )
 
 
@@ -2369,6 +2382,21 @@ async def run_tests(args, console: Console, results: Results) -> None:
                         # BleakClient`, and BYE + HELLO re-enters admitPeer()
                         # -- the function that actually carries the announcement
                         # -- by exactly the same door a fresh connection does.
+                        # Drain first, or the marker measures nothing. The two
+                        # toggles above each announce an AVAIL, but they were
+                        # made through console.press() and confirmed through
+                        # console.await_list_state() -- synchronous, blocking
+                        # serial calls that never yield to the event loop. Their
+                        # notifications therefore sit undispatched in the
+                        # transport until this coroutine next awaits, which
+                        # without this sleep is the bye() below: the toggle
+                        # AVAILs land *after* the marker and masquerade as the
+                        # HELLO announcement. Observed directly as
+                        # [(2, 1), (2, 2), (2, 2)] in a window that should hold
+                        # exactly one AVAIL -- toggle-1, toggle-2, then HELLO's.
+                        # Yielding here lets the two pre-HELLO ones be counted
+                        # below the marker, where they belong.
+                        await asyncio.sleep(0.5)
                         marker = len(link.notifications)
                         await session_c.bye()
                         await asyncio.sleep(0.5)
@@ -2395,7 +2423,9 @@ async def run_tests(args, console: Console, results: Results) -> None:
                                 "list-sync: AVAIL carries the stored revision and count",
                                 avails[0].count == 2 and avails[0].revision == serial_revision,
                                 f"revision {avails[0].revision} count {avails[0].count}, "
-                                f"serial says revision {serial_revision} count 2",
+                                f"serial says revision {serial_revision} count 2; "
+                                f"all AVAILs in window: "
+                                f"{[(a.revision, a.count) for a in avails]}",
                             )
 
                         # Foreground back, so CLIST (which reports the

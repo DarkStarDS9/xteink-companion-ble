@@ -888,13 +888,21 @@ class Session:
         run over a test that deliberately over-reads.
         """
         assert self.link is not None
-        self._list_state_futures[offset] = self.link.loop.create_future()
+        # Hold the future locally rather than re-reading the dict after the
+        # write. The notification handler *pops* the offset key when the reply
+        # lands, and the reply can land during the awaited write_gatt_char --
+        # a response=True write only completes once the device has ACKed, which
+        # is ample time for a notification on the same link to arrive first.
+        # Re-indexing the dict afterwards then raised KeyError instead of
+        # returning the answer that had already arrived.
+        pending = self.link.loop.create_future()
+        self._list_state_futures[offset] = pending
         await self._client.write_gatt_char(
             SESSION_CHAR_UUID,
             bytes([SESS_LIST_STATE_GET, self.session_id]) + struct.pack("<H", offset),
             response=True,
         )
-        return await asyncio.wait_for(self._list_state_futures[offset], timeout=timeout)
+        return await asyncio.wait_for(pending, timeout=timeout)
 
     async def pull_list_state(self, timeout: float = 5.0) -> tuple[int, int, list[tuple[int, bool]], list[int]]:
         """Walk the whole diff: (revision, total, entries, page_lengths).
