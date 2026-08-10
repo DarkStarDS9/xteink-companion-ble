@@ -45,7 +45,9 @@ the wire format. Consumer apps depend on it.
   `0x03` content-id, `0x04` image (raw packed 2bpp, full screen, no header — see
   `RawBitmapToFramebufferConverter` and the protocol doc's "Image field" section; this replaced an
   earlier PNG-based format, dropped because PNGdec's ~44 KB working set never fit alongside NimBLE
-  on this part), `0x05` UI declaration, `0x06` icon, `0x07` tag state. Next free: `0x08`.
+  on this part), `0x05` UI declaration, `0x06` icon, `0x07` tag state, `0x08` list document (ToDo
+  List, `LIST` shape only — see `src/CompanionTodoDocument.h` and
+  `docs/companion-todo-list-design.md`; Phase A, read-only). Next free: `0x09`.
 - The v6 shape — sessions, phone:app pairing, per-peer SD storage, button labels/routing — is in
   [docs/companion-multi-app-design.md](docs/companion-multi-app-design.md) and implemented in
   firmware, though unproven on real hardware (see the protocol doc's status warning). It was a

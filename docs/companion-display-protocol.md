@@ -77,9 +77,20 @@ implements it, never after.
 > paragraphs above claim is a v11 result; treat v12's enforcement paths as
 > written-and-reviewed, not proven.
 >
+> **The ToDo List document field (`0x08`, LIST content shape) — Phase A only, not run on hardware.**
+> `kFieldListDoc` completes the `LIST` shape v12 reserved but left with no content field (see "List
+> document field" below); this is not a version bump, just v12's reservation finished. Implemented:
+> the wire codec, ingest to `lists.json`, `Screen::List` rendering with paging/list-switching, and the
+> offline icon-grid/picker entry point. **Not** implemented: anything from
+> `docs/companion-todo-list-design.md` phase B or C — there is no offline check-off, no
+> `list_state.json`, and no `LIST_STATE` notify; Phase A is read-only. The e2e harness's `[list]` group
+> (`scripts/companion_e2e_test.py`) is written but, like `[shape]` above, has not been run against a
+> device — treat it as written-and-reviewed, not proven, same caveat as the rest of this block.
+>
 > **Still not proven**, and worth treating with the old caution:
 >
 > - **v12 on hardware at all** — see immediately above.
+> - **The ToDo List document field — see immediately above.**
 > - **The consumer apps on v11, let alone v12.** Neither SpokenFeeds nor Snap2Ink
 >   has been rebuilt against either. Everything above was driven by test
 >   harnesses on a Mac, not by an iPhone. Under v12's clean break, both are
@@ -568,9 +579,15 @@ ASSET_ACK result         0x00 STORED
                                                 -- see "UI declaration field" (v12)
 
 RENDER_STATUS result     0x00 DISPLAYED
-                         0x01 DECODE_FAILED     wrong byte count for a raw 2bpp full-screen image
-                         0x02 REJECTED_SIZE     exceeded max image length
-                         0x03 STORAGE_FAILED    could not stage to SD
+                         0x01 DECODE_FAILED     wrong byte count for a raw 2bpp full-screen image,
+                                                or a malformed list document (0x08: truncated,
+                                                over-long counts, or a `checked` byte outside
+                                                {0,1}) -- see "List document field"
+                         0x02 REJECTED_SIZE     exceeded max image length, or a list document (0x08)
+                                                over kMaxListDocLen bytes or over kMaxListItems
+                                                items -- see "List document field"
+                         0x03 STORAGE_FAILED    could not stage to SD (image), or could not write
+                                                lists.json (list document)
                          0x04 SEQUENCE_GAP      a CHUNK's sequence number skipped ahead of what
                                                 was expected (image), or a title/body/tag batch
                                                 was discarded because one of its fields hit that
@@ -581,9 +598,11 @@ RENDER_STATUS result     0x00 DISPLAYED
                          0x06 REJECTED_SHAPE    the pushed field is not one this peer's declared
                                                 content shape permits (v12): an image from a TEXT
                                                 peer, a title/body/content-id field from an IMAGE
-                                                peer, any content field from a LIST peer. Tag state
-                                                (0x07) is an overlay and is permitted under both
-                                                TEXT and IMAGE.
+                                                peer, a list document (0x08) from a TEXT or IMAGE
+                                                peer, or any content field other than 0x08 from a
+                                                LIST peer. Tag state (0x07) is an overlay and is
+                                                permitted under both TEXT and IMAGE, but NOT LIST
+                                                -- see "List document field".
                                                 Latched when the offending START arrives -- before
                                                 any buffer is allocated -- and answered at END, so
                                                 a whole batch of illegal fields is still answered
@@ -826,8 +845,9 @@ codebases on different release cycles, which is the same failure mode.
   is stored, so if pushing one needed the foreground, a peer could never push
   the declaration that would let it become foreground. Enrollment would
   deadlock.
-- Fields `0x01` `0x02` `0x03` `0x04` `0x07` (title, body, content-id, image, tag
-  state) are dropped unless the sending session currently holds the screen.
+- Fields `0x01` `0x02` `0x03` `0x04` `0x07` `0x08` (title, body, content-id,
+  image, tag state, list document) are dropped unless the sending session
+  currently holds the screen.
 
 Frames from an unknown session are always dropped. Pushing a UI declaration
 while another app holds the screen stores it silently; it takes effect for you
@@ -847,8 +867,9 @@ discarded on disconnect and on a foreground handover.
 | `0x05` | UI declaration (shape + buttons + tags) | 512 bytes | SD (`ui.bin`) | *asset — never checked* |
 | `0x06` | icon | icon width x height / 8 bytes | SD (`icon.bin`) | *asset — never checked* |
 | `0x07` | tag state | 13 bytes | RAM (foreground only) | TEXT + IMAGE |
+| `0x08` | list document | 16 KB (`kMaxListDocLen`), also capped at 512 total items (`kMaxListItems`) | heap, transient — reassembled for the duration of one push, written straight through to `lists.json` on SD, then freed; never resident | LIST |
 
-Next free: `0x08`.
+Next free: `0x09`.
 
 The last column is v12's permitted-field table: a peer may push a content field
 only if its declared content shape matches, and anything else is answered
@@ -856,12 +877,26 @@ only if its declared content shape matches, and anything else is answered
 fields are exempt by construction: pushing `0x05` is how a peer changes its
 shape in the first place. Tag state (`0x07`) is exempt in a different way: it is
 an overlay drawn *over* whatever content is on screen rather than content of its
-own, so both content shapes permit it. `LIST` peers have no permitted content
-field yet — not even `0x07`, since there is no list screen to overlay.
+own, so both content shapes permit it. `LIST` peers permit exactly one content
+field, `0x08` — **not** `0x07`: unlike `TEXT`/`IMAGE` there is no list screen to
+overlay a tag chip onto yet, so the overlay exemption does not extend to `LIST`
+(see "List document field" below).
+
+A list document is **content, not an asset** — it is answered on `RENDER_STATUS`
+like title/body/image, never `ASSET_ACK` (which is reserved for the two fields
+above, `0x05`/`0x06`, that are per-peer state rather than screen content).
 
 Content past a field's cap is truncated (title/body/content-id) or rejected
-outright with `ASSET_ACK`/`RENDER_STATUS` (image, UI declaration, icon) — a
-truncated asset is worse than no asset.
+outright with `ASSET_ACK`/`RENDER_STATUS` (image, UI declaration, icon, list
+document) — a truncated asset is worse than no asset, and for a list document
+specifically a truncation is worse than for text: landing on a structural
+boundary would parse as a shorter but well-formed document and silently drop
+items with no error at all, so an over-cap push is refused outright
+(`RENDER_STATUS(REJECTED_SIZE)`) rather than truncated to the cap the way
+title/body are. The same refuse-don't-truncate answer covers the item-count cap
+(`kMaxListItems`), enforced separately at ingest to bound `lists.json`'s
+read-back into RAM (see "List document field" below) — a document can be legally
+short in bytes and still carry more items than that.
 
 ### Atomic multi-field pushes (`0x80` final-field flag)
 
@@ -1166,8 +1201,9 @@ content — it is a chip drawn over whatever content is on screen. So `0x07` is
 exempt from the one-shape-one-field-kind rule and is permitted under both
 `TEXT` and `IMAGE`: an `IMAGE` peer may push image + tag state as a single
 atomic batch, exactly as a `TEXT` peer pushes title + body + tag state. (`LIST`
-still permits no content field at all, `0x07` included, because there is no list
-screen to overlay yet.) The **Status characteristic** write (see "Status
+permits exactly one content field, the list document `0x08` (see "List document
+field") — `0x07` is still excluded, because there is no list screen to overlay
+a tag chip onto yet.) The **Status characteristic** write (see "Status
 characteristic" below) is not a content-field push and is not shape-checked
 either, so both routes stay open to a peer of any shape: use the field when the
 content is changing too, the Status write when only the chip is.
@@ -1212,7 +1248,8 @@ byte         capabilities bitmask       <- optional; absent means none set
 ```
 0x01  TEXT    may push title (0x01), body (0x02), content-id (0x03), tag state (0x07)
 0x02  IMAGE   may push image (0x04), tag state (0x07)
-0x03  LIST    a list document; no content field exists for it on the wire yet
+0x03  LIST    may push a list document (0x08) and nothing else -- not even tag
+              state (0x07); see "List document field"
 ```
 
 Tag state appears under both shapes on purpose: it is an overlay, not content —
@@ -1468,6 +1505,132 @@ The grid is decorative, **not a launcher** — the device cannot start an app on
 the phone, so a selectable grid would promise something it can't deliver. At
 most 18 tiles are drawn (6 x 3), most-recently-seen `appId`s first.
 
+### List document field (`0x08`) — ToDo List, Phase A
+
+**Phase A is read-only.** This field pushes a whole document that the device
+stores and renders (`Screen::List`); nothing on this field lets the device
+change it back. There is no check-off, no `LIST_STATE` notify, and no
+`list_state.json` — those are Phase B of
+`docs/companion-todo-list-design.md` and are **not implemented**. Treat every
+claim below as "the device can show you a list", not "the device can help you
+shop with no phone".
+
+A `LIST` peer's UI declaration permits exactly this one content field (see
+"Field ids" above) — pushed as a whole-document replace, like the UI
+declaration and icon assets, not as incremental add/remove-item operations.
+
+**Wire layout**, copied from `src/CompanionTodoDocument.h`, the single source
+of truth for this format:
+
+```
+u32  revision                       (little-endian)
+u8   list count L
+L x {
+  u16 listId                        (little-endian)
+  u8  titleLen, title[titleLen]     (UTF-8, not NUL-terminated)
+  u8  group count G
+  G x {
+    u16 groupId                     (little-endian)
+    u8  labelLen, label[labelLen]   (empty label == the list's "ungrouped" bucket)
+    u8  item count I
+    I x {
+      u16 itemId                    (little-endian)
+      u8  checked                   (0 or 1 ONLY; any other value is malformed)
+      u8  textLen, text[textLen]
+    }
+  }
+}
+```
+
+All multi-byte fields are little-endian, matching every other multi-byte field
+already on this wire (`START`'s payload length, the image `CHUNK` sequence
+number, the button-hold duration field) — this format follows that existing
+convention rather than introducing a new one. A document with trailing bytes
+left over after the last item, or one whose count claims run past the end of
+the buffer, is malformed.
+
+- **`listId`/`groupId`/`itemId` are device-opaque `u16`, not `u8`.** The device
+  only ever compares and echoes them, never generates or interprets one — same
+  rule as `appId`/`installId`/content-id elsewhere on this wire. They are
+  `u16` specifically because `kMaxListDocLen` (16 KB, below) comfortably admits
+  more than 255 items in one legal document; a `u8` id would silently overflow
+  inside an otherwise well-formed push.
+- **An empty group label means the list's "ungrouped" bucket** — there is no
+  separate bucket type on the wire or in storage, one less case for the
+  renderer.
+- **`checked` must be exactly `0` or `1`.** Any other byte value makes the
+  whole document malformed (`RENDER_STATUS(DECODE_FAILED)`) rather than being
+  clamped or ignored — Phase A never writes this byte itself, so accepting a
+  bad one would mean rendering state the device cannot explain.
+
+**Two caps, and they produce genuinely different answers than the same words
+mean for title/body:**
+
+- **`kMaxListDocLen` = 16 KB** bounds the transfer's total bytes. A push over
+  this is **refused outright at `START`** — `RENDER_STATUS(REJECTED_SIZE)` —
+  **not silently truncated to the cap** the way title/body are. Truncating an
+  arbitrary byte off a structured document can land exactly on a
+  list/group/item boundary and parse as a shorter but perfectly well-formed
+  document, silently dropping items with no error the app or the user would
+  ever see; refusing the whole push instead makes that failure loud.
+- **`kMaxListItems` = 512** bounds the total item count across every
+  list/group in one document, independent of byte count — the wire format's
+  cheapest possible item costs only 4 bytes (`u16` id + `checked` + a
+  zero-length `textLen`), so a legally-sized 16 KB push can carry thousands of
+  near-empty items. This is enforced separately, at ingest
+  (`storeListDocument()`, `src/CompanionPeerStore.cpp`), because the device
+  reads a stored document back into an in-memory JSON structure to render or
+  re-serve it, and an unbounded item count would make that read-back
+  unbounded too — a push that breaks no byte-cap rule could otherwise cost
+  multiples of this device's entire RAM. Over this cap is also
+  `RENDER_STATUS(REJECTED_SIZE)`, distinguishable from the byte cap only by
+  knowing which one your own push was closer to; both are size refusals, not
+  format errors.
+
+**`RENDER_STATUS` outcomes for this field:**
+
+```
+DISPLAYED       parsed and written through to lists.json
+DECODE_FAILED   malformed — truncated, over-long counts, or a bad `checked` byte
+REJECTED_SIZE   over kMaxListDocLen bytes, or over kMaxListItems items
+STORAGE_FAILED  the SD write to lists.json failed
+REJECTED_SHAPE  the pushing peer's declared content shape is not LIST (v12,
+                see "UI declaration field")
+```
+
+Ingest writes straight to SD as the pushed binary buffer is parsed — never
+building the whole document as an in-RAM JSON tree — via a temp file renamed
+onto `lists.json` only once the parse fully succeeds, so a malformed or
+over-cap push never partially overwrites a peer's existing, valid document.
+
+**On-device rendering and navigation are entirely local — no wire traffic.**
+Once a document is stored, `Screen::List` shows one list at a time: its title,
+its groups (an empty-label group draws no heading), each item's checkbox glyph
+reflecting `checked`, and a cursor, paged through a bounded visible window
+rather than holding the whole document in RAM. `Screen::List` claims
+`Up`/`Down` (move cursor, page the window), `Left`/`Right` (switch lists
+within the document) and `Back` (leave the screen) unconditionally — **not**
+only what the foreground peer's own button map left unclaimed, the way the
+image gallery's `Up`/`Down` paging does. That is safe specifically because a
+`LIST` peer's shape, and therefore its need for all five buttons, is known and
+enforced before `Screen::List` is ever reached (see "UI declaration field").
+`Confirm` is a no-op in Phase A — there is nothing to toggle yet.
+
+A newly stored document reaches the screen without a fresh connection: storing
+a push fires a device-internal callback naming the peer, and if that peer's
+document is the one currently on `Screen::List`, the activity re-reads it from
+SD on the main loop. This is entirely device-local bookkeeping, not a new wire
+message.
+
+**Offline entry point.** `CONFIRM` on a `LIST` peer's tile in the on-screen
+icon-grid picker (see "On-screen behaviour" below) opens that peer's stored
+document with no phone connected — the same "local SD browse of content the
+app already pushed" affordance the image gallery picker already offers, now
+serving a second kind of content. This is why content shape is declared in the
+persisted UI declaration rather than at `ACQUIRE`: this entry point runs while
+disconnected, so `ACQUIRE`-time state could never answer "does this peer show
+a list".
+
 ---
 
 ## Button-event characteristic — receiving input
@@ -1664,23 +1827,27 @@ Not wire format, but client-visible, and decided here so apps can rely on it:
 - **Paired peers exist, none connected, idle timeout elapsed** — the icon grid.
 - **A session holds the foreground but has pushed nothing** — "Waiting for
   `<name>`", using that peer's display name.
-- **Gallery picker** — pressing CONFIRM on the icon grid enters an interactive
-  picker over every enrolled peer that declared `IMAGE_GALLERY`, most recently
+- **Gallery/list picker** — pressing CONFIRM on the icon grid enters an
+  interactive picker over every enrolled peer that either declared
+  `IMAGE_GALLERY` **or** declared the `LIST` content shape, most recently
   seen first (not grouped by `appId`, unlike the icon grid: two installs of
-  the same app have two separate galleries and stay two separate tiles, each
-  labelled with `userName` — see "Phone → device (write)" above — falling
-  back to `name`). UP/DOWN move the cursor, CONFIRM loads the highlighted
-  peer's stored gallery (a local SD read — the peer need not be currently
-  connected), BACK returns to the icon grid. If no peer has declared the
-  capability, CONFIRM on the icon grid shows a brief "No photo apps paired
-  yet" message instead of entering an empty picker. If the selected peer has
-  no stored images, a brief "No images yet" message is shown and the picker
-  stays up. None of this involves the phone or any wire message — it is
-  firmware-local browsing of already-pushed photos, the same "dumb firmware"
-  local browsing as the existing UP/DOWN image-gallery navigation described
-  under "UI declaration field" above, just entered a different way. It is
-  *not* a launcher: the device cannot and does not start anything on the
-  phone.
+  the same app stay two separate tiles, each labelled with `userName` — see
+  "Phone → device (write)" above — falling back to `name`). UP/DOWN move the
+  cursor; CONFIRM branches on the highlighted peer's declared shape — a
+  `LIST` peer opens its stored ToDo List document (`Screen::List`, see "List
+  document field" above), any other qualifying peer loads its stored image
+  gallery — both a local SD read, the peer need not be currently connected.
+  BACK from either returns to this picker, not straight to the icon grid.
+  If no peer qualifies at all, CONFIRM on the icon grid shows a brief "No
+  photo apps paired yet" message instead of entering an empty picker. If a
+  selected image-gallery peer has no stored images, a brief "No images yet"
+  message is shown and the picker stays up. None of this involves the phone
+  or any wire message — it is firmware-local browsing of content the app
+  already pushed (the same "dumb firmware" local browsing as the existing
+  UP/DOWN image-gallery navigation described under "UI declaration field"
+  above, now covering a second kind of pushed content), just entered a
+  different way. It is *not* a launcher: the device cannot and does not
+  start anything on the phone.
 
 ### Deep sleep and boot
 
@@ -1716,6 +1883,8 @@ means:
     token.bin                16-byte pairing token
     icon.bin                 1-bpp sleep-screen icon
     ui.bin                   UI declaration (content shape + button routing/labels + tag labels)
+    lists.json                ToDo List document (field 0x08, LIST shape only) -- Phase A: read-only,
+                              whole-document replace via temp-file-then-rename; see "List document field"
     data/                    per-peer scratch: staged image, event logs
 ```
 
@@ -1739,11 +1908,18 @@ growth would make `peers.json` unbounded, and it is parsed into RAM.
    the optional trailing bytes, and why it lives here rather than on `ACQUIRE`.
 2. **A peer may push only the content fields its declared shape permits.** TEXT:
    title (`0x01`), body (`0x02`), content-id (`0x03`), tag state (`0x07`).
-   IMAGE: image (`0x04`), tag state (`0x07`). LIST: nothing yet — no list
-   content field exists on the wire. Tag state is permitted under both shapes
-   because it is an overlay drawn over the content, not content itself. The
-   asset fields, declaration (`0x05`) and icon (`0x06`), are **never**
+   IMAGE: image (`0x04`), tag state (`0x07`). LIST: the list document (`0x08`)
+   and nothing else, not even tag state — see "List document field". Tag
+   state is permitted under TEXT and IMAGE because it is an overlay drawn over
+   the content, not content itself; LIST has no screen to overlay it onto yet.
+   The asset fields, declaration (`0x05`) and icon (`0x06`), are **never**
    shape-checked.
+   
+   `LIST = 0x03` was reserved by this same v12 change with no content field
+   wired to it yet; `kFieldListDoc` (`0x08`) completed that reservation in a
+   later change with no version bump — v12 already described the shape,
+   `0x08` just gave it something to carry. See "List document field" above
+   and `docs/companion-todo-list-design.md`.
 3. **New `RENDER_STATUS` result `0x06 REJECTED_SHAPE`.** Latched at the
    offending `START`, before any buffer is allocated, and answered at `END`.
    A whole batch of illegal fields is answered **exactly once**, on its
@@ -2025,9 +2201,12 @@ READ_LATER) and added the Status characteristic.
   characteristics, session table, content reassembly, image streaming to SD,
   button-event notify, capability characteristic);
   `src/CompanionPeerStore.{h,cpp}` (peer directory, tokens, asset digests, UI
-  declaration, icons); `src/activities/companion/CompanionModeActivity.{h,cpp}` (the
+  declaration, icons, ToDo List document storage); `src/CompanionTodoDocument.{h,cpp}`
+  (the host-buildable wire parser for field `0x08`), `src/CompanionListJsonWriter.{h,cpp}`
+  (buffered, host-buildable JSON serialization for `lists.json`), `src/CompanionTodoNav.{h,cpp}`
+  (host-buildable cursor/paging/list-switching state machine); `src/activities/companion/CompanionModeActivity.{h,cpp}` (the
   on-device screen: pagination, pairing prompt, button routing, image render,
-  sleep grid). See `docs/companion-mode-implementation-notes.md` for the
+  sleep grid, `Screen::List`). See `docs/companion-mode-implementation-notes.md` for the
   bring-up log.
 - **Swift client**: `CompanionKit` (https://github.com/DarkStarDS9/CompanionKit)
   — a SwiftPM package implementing discovery, the handshake,
@@ -2056,10 +2235,19 @@ READ_LATER) and added the Status characteristic.
   `REJECTED_SHAPE` in both directions — including that a three-field batch to
   the wrong-shaped peer produces **exactly one** answer, not one per field —
   plus `REJECTED_NO_SHAPE` on a shapeless declaration with the `ACQUIRE` denial
-  that follows it, and the re-declare-while-foreground escape hatch.
+  that follows it, and the re-declare-while-foreground escape hatch. Its
+  `[list]` group covers the ToDo List document field (`0x08`): a successful
+  push and render, both size refusals (`kMaxListDocLen`, `kMaxListItems`), and
+  a malformed document — like `[shape]`, **written but not executed against a
+  device**, and deliberately not folded into `[shape]` since it needs a third
+  declared peer and a field `[shape]` knows nothing about.
   See `docs/companion-test-console.md`. CompanionKit's framer
   and handshake codec additionally have `swift test` unit tests; the rest of
-  what runs on-device is verified by the checklist below.
+  what runs on-device is verified by the checklist below. The host-only
+  parser and nav-state seams (`test/companion_todo_document/`,
+  `test/companion_todo_nav/`, `test/companion_list_json_writer/`) are the one
+  part of the ToDo List feature that has actually run, since they need no
+  hardware at all.
 
 ## Manual verification checklist (on hardware)
 

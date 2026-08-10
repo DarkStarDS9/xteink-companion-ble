@@ -1,8 +1,43 @@
 # ToDo List Mode — Design Sketch
 
-**STATUS: sketch, not adopted.** Nothing here is wire-final. Written to be picked up as a phase A
-implementation plan once reviewed, in the style of `docs/companion-multi-app-design.md`, which this
-builds directly on top of rather than beside.
+**STATUS (2026-08-10): §10 phase A is implemented in firmware, protocol doc and host harness;
+nothing has run on hardware.** Landed: the `kFieldListDoc` (`0x08`) wire codec and its
+host-buildable parser (`src/CompanionTodoDocument.{h,cpp}`), per-peer storage
+(`src/CompanionPeerStore.{h,cpp}`'s `lists.json`, streamed write, ingest-time item cap),
+`Screen::List` rendering and local navigation (`src/CompanionTodoNav.{h,cpp}`,
+`src/activities/companion/CompanionModeActivity.cpp`), and the offline icon-grid/picker entry
+point. Host-tested (`test/companion_todo_document/`, `test/companion_todo_nav/`,
+`test/companion_list_json_writer/`) and covered by an e2e `[list]` harness group
+(`scripts/companion_e2e_test.py`) that is written but **not run against a device** — see
+`docs/companion-display-protocol.md`'s status warning, same honesty this doc's own prior status
+line asked for. **Not** landed: phases B (offline checking, `list_state.json`, `LIST_STATE`
+sync-back) and C (CompanionKit surface) below — Phase A is read-only, full stop.
+
+**This shipped as part of protocol v12, not a new version.** v12 already reserved
+`ContentShape::List = 0x03` (`docs/companion-declared-shape-design.md`); this work gave that
+reservation a content field rather than bumping anything.
+
+**Two things this sketch got wrong, corrected by the implementation (see §4):**
+
+- **No `kUiCapabilityTodoList` capability bit exists**, despite §4 introducing one for gating
+  `LIST_STATE`. The shape byte alone (`ContentShape::List`) is what the implemented device checks
+  and what the offline picker filters on — §4's own earlier paragraph had already talked itself out
+  of a capability bit for shape declaration, then reached for one again a few lines later for
+  `LIST_STATE`. Since `LIST_STATE` itself is unimplemented (next point), so is the bit that would
+  have gated it.
+- **No `LIST_STATE` notify exists.** It is Phase B, entirely unimplemented — no offline check-off,
+  no `list_state.json`, no sync-back of any kind. §3's `list_state.json` bullet and §4's `LIST_STATE`
+  paragraph both describe this unimplemented mechanism, not current behaviour.
+
+**Stale line citations, not fixed here:** `src/CompanionBle.h:209` (§4) is now the `kFieldTodoList`
+family around line 92 (`kMaxListDocLen`) and 283 (`kFieldListDoc`) — the file grew underneath the
+citation. `src/activities/companion/CompanionModeActivity.h:26-35` (§1, §5) is now roughly lines
+44-54 for the `Screen` enum. Treat every line number in this document as approximate; the code is
+the truth, not the citation.
+
+Nothing here is wire-final beyond what §10 phase A actually shipped. Written to be picked up as a
+phase A implementation plan once reviewed, in the style of `docs/companion-multi-app-design.md`,
+which this builds directly on top of rather than beside.
 
 Primary use case: shopping lists. Sync from the phone, then walk the store with just the reader,
 checking items off with no phone in hand, and have the check-offs land back on the phone next time
