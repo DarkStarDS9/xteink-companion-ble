@@ -107,10 +107,13 @@ bool fieldMatchesShape(uint8_t field, uint8_t declaredShape) {
       // gone, so the overlay field is permitted under both content shapes.
       return field == companionble::kFieldImage || field == companionble::kFieldTagState;
     case companionble::ContentShape::List:
-      // No list content field exists on the wire yet (see
-      // docs/companion-todo-list-design.md), so a LIST peer pushing any content
-      // field today is pushing something it could not render.
-      return false;
+      // The list document is the only content a LIST peer may push. Tag state
+      // (0x07) is deliberately NOT permitted here, unlike TEXT/IMAGE: per
+      // docs/companion-declared-shape-design.md section 5, tag state is an
+      // overlay drawn over existing content, and there is no list screen to
+      // overlay yet -- forward-dating that is unproven, so LIST stays
+      // single-field for now.
+      return field == companionble::kFieldListDoc;
   }
   // Not reachable for a shape that came out of an Ok parse, which is the only
   // way a shape is ever cached. Refuse rather than admit: an unknown shape is

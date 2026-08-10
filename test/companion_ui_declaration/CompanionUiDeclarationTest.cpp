@@ -405,14 +405,25 @@ TEST(CompanionShapeEnforcement, ImagePeerMayPushTheImageFieldAndNoTextField) {
   EXPECT_TRUE(companionui::fieldMatchesShape(companionble::kFieldTagState, kImage));
 }
 
-TEST(CompanionShapeEnforcement, ListPeerHasNoContentFieldYet) {
-  // Deliberate: the list document has no wire field of its own yet, so a LIST
-  // peer pushing anything is pushing something it could not render. This test
-  // is expected to change when that field is added -- not to be deleted.
+TEST(CompanionShapeEnforcement, ListPeerMayPushOnlyTheListDocField) {
+  EXPECT_TRUE(companionui::fieldMatchesShape(companionble::kFieldListDoc, kList));
   for (const uint8_t field : {companionble::kFieldTitle, companionble::kFieldBody, companionble::kFieldContentId,
-                              companionble::kFieldImage, companionble::kFieldTagState}) {
+                              companionble::kFieldImage}) {
     EXPECT_FALSE(companionui::fieldMatchesShape(field, kList)) << "field " << std::hex << int(field);
   }
+}
+
+TEST(CompanionShapeEnforcement, ListPeerMayNotPushTagStateUnlikeTextAndImage) {
+  // Unlike the text/image overlay case, LIST has no screen to overlay a tag
+  // over yet (docs/companion-declared-shape-design.md section 5), so tag
+  // state stays refused here even though it is permitted under both other
+  // shapes.
+  EXPECT_FALSE(companionui::fieldMatchesShape(companionble::kFieldTagState, kList));
+}
+
+TEST(CompanionShapeEnforcement, TextAndImagePeersMayNotPushTheListDocField) {
+  EXPECT_FALSE(companionui::fieldMatchesShape(companionble::kFieldListDoc, kText));
+  EXPECT_FALSE(companionui::fieldMatchesShape(companionble::kFieldListDoc, kImage));
 }
 
 TEST(CompanionShapeEnforcement, UnknownOrUncachedShapePermitsNothing) {
@@ -430,6 +441,7 @@ TEST(CompanionShapeEnforcement, EveryKnownShapeAcceptsAtLeastOneFieldOrIsDeliber
   }
   EXPECT_TRUE(companionui::fieldMatchesShape(companionble::kFieldBody, kText));
   EXPECT_TRUE(companionui::fieldMatchesShape(companionble::kFieldImage, kImage));
+  EXPECT_TRUE(companionui::fieldMatchesShape(companionble::kFieldListDoc, kList));
 }
 
 TEST(CompanionShapeEnforcement, AParsedDeclarationsShapeDrivesTheTableDirectly) {

@@ -89,6 +89,20 @@ inline constexpr size_t kIconBytes = (static_cast<size_t>(kIconWidthPx) * kIconH
 // docs/companion-display-protocol.md for the full budget math.
 inline constexpr size_t kMaxContentIdLen = 32;
 
+// Max bytes accepted for a ToDo List document push (kFieldListDoc). Like the
+// text fields (kMaxFieldLen) and unlike the image field, this bounds an
+// in-RAM reassembly buffer -- but deliberately NOT a resident one: per
+// docs/companion-todo-list-design.md section 4/8, a list document is
+// heap-allocated via makeUniqueNoThrow for the duration of one push, written
+// straight through to lists.json on SD, and freed immediately after, rather
+// than living in a fixed global buffer the way titleBuf_/bodyBuf_ do. 16 KB is
+// chosen against the actual measured headroom rather than picked round: at
+// design time, steady-state DRAM usage was 154,857 / 321,296 bytes (48.2%),
+// leaving ~166 KB (docs/companion-todo-list-design.md section 4/8, from
+// `pio run -e default`'s size report) -- even the full 16 KB, transient and
+// never resident, is a rounding error against that.
+inline constexpr size_t kMaxListDocLen = 16 * 1024;
+
 // Concurrent sessions on one link. Four apps on one phone driving one screen is
 // already generous; the cap exists because the session table is fixed-size, and
 // only the foreground session has a reassembly buffer, so this number does not
@@ -237,7 +251,15 @@ inline constexpr uint8_t kFieldIcon = 0x06;
 // framing as title/body so it can ride the kFinalFieldFlag batch, which is what
 // makes content and its tag state commit in a single redraw.
 inline constexpr uint8_t kFieldTagState = 0x07;
-// Next free: 0x08.
+// The ToDo List document: revision + every list/group/item for the peer, in
+// one whole-document replace -- no incremental add/remove-item ops, matching
+// how kFieldUiDeclaration and the icon are always full replaces. See
+// CompanionTodoDocument.h for the wire layout and docs/companion-todo-list-design.md
+// section 4 for why it is reassembled in RAM like title/body rather than
+// streamed to SD like the image field. Permitted only under
+// ContentShape::List (see CompanionUiDeclaration.cpp's fieldMatchesShape()).
+inline constexpr uint8_t kFieldListDoc = 0x08;
+// Next free: 0x09.
 
 // The top bit of a START packet's field byte marks "this is the last field of
 // an atomic content push". The device buffers each field's END as before, but
