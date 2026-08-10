@@ -133,7 +133,6 @@ from companion_protocol import (
     FIELD_UI_DECL,
     HELLO_DENIED_PROTOCOL_MISMATCH,
     MAX_LIST_DOC_LEN,
-    MAX_LIST_ITEMS,
     PROTOCOL_VERSION,
     RENDER_DECODE_FAILED,
     RENDER_DISPLAYED,
@@ -1999,57 +1998,6 @@ async def run_tests(args, console: Console, results: Results) -> None:
                     # the firmware side lands.
                     results.check(
                         "an over-cap list document is specifically RejectedSize",
-                        verdict == RENDER_REJECTED_SIZE,
-                        f"result {RENDER_RESULTS.get(verdict, verdict)} (guessed code -- see comment)",
-                    )
-
-                    # --- an over-item-count-but-under-byte-cap document is also
-                    # refused ------------------------------------------------- #
-                    #
-                    # Distinct from the oversize-bytes case just above: this
-                    # document is comfortably under MAX_LIST_DOC_LEN (each item
-                    # is only 4 bytes: 2-byte id, 1 checked byte, 1
-                    # zero-length textLen), but carries more than
-                    # MAX_LIST_ITEMS items -- the firmware's read-back path
-                    # (loadListDocument()) materializes the stored document
-                    # into a live in-RAM JSON tree, not streamed, so item
-                    # count must be bounded at ingest independent of the byte
-                    # cap. See kMaxListItems's comment in src/CompanionBle.h.
-                    too_many_items = [
-                        {"id": i & 0xFFFF, "text": "", "checked": 0}
-                        for i in range(1, MAX_LIST_ITEMS + 2)
-                    ]
-                    too_many_items_doc = encode_list_doc(
-                        [{"id": 1, "title": "Too Many", "groups": [
-                            {"id": 1, "label": "", "items": too_many_items},
-                        ]}],
-                        revision=4,
-                    )
-                    results.check(
-                        "the too-many-items fixture stays under MAX_LIST_DOC_LEN",
-                        len(too_many_items_doc) < MAX_LIST_DOC_LEN,
-                        f"{len(too_many_items_doc)} bytes vs cap {MAX_LIST_DOC_LEN}",
-                    )
-                    results.check(
-                        "the too-many-items fixture actually exceeds MAX_LIST_ITEMS",
-                        len(too_many_items) > MAX_LIST_ITEMS,
-                        f"{len(too_many_items)} items vs cap {MAX_LIST_ITEMS}",
-                    )
-                    too_many_items_id = 0x78
-                    verdict = await session_c.push_list_doc(too_many_items_doc, push_id=too_many_items_id)
-                    results.check(
-                        "a too-many-items list document is refused, not displayed",
-                        verdict != RENDER_DISPLAYED,
-                        f"result {RENDER_RESULTS.get(verdict, verdict)}",
-                    )
-                    # NEEDS RECONCILIATION: guessing RENDER_REJECTED_SIZE, the
-                    # same code the over-cap-bytes case above expects -- both
-                    # are a size refusal from the phone's point of view, even
-                    # though the firmware distinguishes them internally
-                    # (ListStoreResult::RejectedSize vs the byte-cap latch at
-                    # START). Confirm once the firmware side lands.
-                    results.check(
-                        "a too-many-items list document is specifically RejectedSize",
                         verdict == RENDER_REJECTED_SIZE,
                         f"result {RENDER_RESULTS.get(verdict, verdict)} (guessed code -- see comment)",
                     )

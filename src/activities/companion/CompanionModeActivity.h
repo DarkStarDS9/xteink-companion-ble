@@ -1,11 +1,13 @@
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "CompanionBle.h"
 #include "CompanionPeerStore.h"
 #include "CompanionTestConsole.h"
+#include "CompanionTodoDocument.h"
 #include "CompanionTodoNav.h"
 #include "activities/Activity.h"
 
@@ -177,8 +179,8 @@ class CompanionModeActivity final : public Activity {
   // ToDo List (Screen::List) -- docs/companion-todo-list-design.md §5, §8.
   // ---------------------------------------------------------------------
 
-  // Rebuilt by reloadListView() from a single companionpeer::
-  // loadListDocument() walk every time the view changes (nav press, new
+  // Rebuilt by reloadListView() from a single companiontodo::parseDocument()
+  // walk of listDocBuf (below) every time the view changes (nav press, new
   // document, foreground/peer change) -- never per render(), per that
   // function's own cost note. Bounded by listNav.visibleCapacity() (a
   // handful of rows, sized to the viewport) -- never the whole document. See
@@ -191,6 +193,20 @@ class CompanionModeActivity final : public Activity {
   std::string listDocTitle;     // the current list's title
   std::string listPeerKey;      // whose document is loaded -- see enterListDocument()
   bool listDocLoaded = false;   // false: peer has no (parseable) document at all
+  // The peer's lists.bin (companionpeer::readListDocument()), held in RAM for
+  // the whole time Screen::List is up over it, sized exactly to the stored
+  // document (<= companionble::kMaxListDocLen, 16 KB) via makeUniqueNoThrow.
+  // reloadListView() walks THIS with companiontodo::parseDocument() on every
+  // nav press rather than re-opening SD each time -- the previous design read
+  // and re-parsed from SD on every single cursor keypress, a real
+  // heap-fragmentation risk on this no-PSRAM part over a long browse. Loaded
+  // by enterListDocument() and by the gotListDoc handler when a fresh
+  // document lands for the peer already on screen; freed by
+  // freeListDocBuf(), called from every path that leaves Screen::List --
+  // audited in this feature's commit message. A <=16 KB buffer must never
+  // outlive the screen it was read for.
+  std::unique_ptr<uint8_t[]> listDocBuf;
+  size_t listDocBufLen = 0;
   // Where Back returns to -- IconGrid for the picker entry point (no live
   // session), Text for a live LIST peer that pushed a document while
   // foreground (applyForegroundChange() landed here directly).
@@ -289,10 +305,25 @@ class CompanionModeActivity final : public Activity {
   // "nothing yet" message and returns false, without switching screens, if
   // the peer has no (parseable) document -- fine to call speculatively.
   bool enterListDocument(const std::string& peerKey, Screen returnTo);
-  // Re-walks the current peer's stored document (companionpeer::
-  // loadListDocument(), a full SD open + JSON parse -- see that function's
-  // doc comment) to refresh listNav's counts and listVisibleRows for
-  // whatever list/window listNav is currently pointed at. Called once per
+  // Reads listPeerKey's stored document (companionpeer::listDocumentSize() +
+  // readListDocument()) into listDocBuf, replacing whatever was held before.
+  // This is the only place that touches SD for the list document; everything
+  // else (reloadListView() and its Visitor walks) reads listDocBuf in RAM.
+  // Called from enterListDocument() and from the gotListDoc handler when a
+  // fresh document lands for the peer already on screen. Leaves listDocBuf
+  // null (and listDocLoaded false, via the reloadListView() call every
+  // caller makes right after) if the peer has no document or the read
+  // failed -- fine to call speculatively, same as enterListDocument().
+  void loadListDocBuf();
+  // Frees listDocBuf. Called from every path that can leave Screen::List --
+  // Back, a foreground handover to a different peer, a live push that takes
+  // the screen out from under a locally-browsed (picker) document, and
+  // Activity::onExit() -- see this feature's commit message for the full
+  // audit. A <=16 KB buffer must not survive the screen it was read for.
+  void freeListDocBuf();
+  // Re-walks listDocBuf (companiontodo::parseDocument(), pure in-RAM parsing
+  // -- no SD, no allocation) to refresh listNav's counts and listVisibleRows
+  // for whatever list/window listNav is currently pointed at. Called once per
   // view change -- never from render() itself. `recountTotals` controls how
   // many passes that costs: Up/Down inside one list can never change that
   // list's own item count or the document's list count, so

@@ -19,6 +19,7 @@
 #include "CompanionUiDeclaration.h"
 #include "Epub/converters/ImageDecoderFactory.h"
 #include "MappedInputManager.h"
+#include "Memory.h"
 #include "activities/reader/ReaderUtils.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -315,6 +316,7 @@ void CompanionModeActivity::onEnter() {
   listDocTitle.clear();
   listPeerKey.clear();
   listDocLoaded = false;
+  freeListDocBuf();  // defensive; onExit() already frees this on the normal path
   clearUiDeclaration();
   cachedFontId = kCompanionFontId;
   computeViewport();
@@ -376,6 +378,7 @@ void CompanionModeActivity::onExit() {
   g_screenNameActivity = nullptr;
 #endif
   companionble::stop();
+  freeListDocBuf();  // leaving the activity entirely -- see the header's audit note
 
   portENTER_CRITICAL(&g_mux);
   g_pendingStatusReady = false;
@@ -852,6 +855,7 @@ void CompanionModeActivity::applyForegroundChange() {
     listDocTitle.clear();
     listPeerKey.clear();
     listDocLoaded = false;
+    freeListDocBuf();  // a different peer just took the screen -- see the header's audit note
     updateTitleLayout();
 
     // A LIST peer lands on Screen::List directly rather than the
@@ -926,6 +930,10 @@ void CompanionModeActivity::handlePendingImage(const std::string& stagedPath, co
   galleryPickerBrowsing = false;  // a live push always wins over picker browsing
   browsingPeerKey.clear();
   refreshGalleryForForeground();
+  // A live push always wins, even over a DIFFERENT peer's document being
+  // locally browsed through the offline picker (screen == List here does not
+  // imply peerKey == listPeerKey) -- see the header's audit note.
+  if (screen == Screen::List) freeListDocBuf();
   screen = Screen::Image;
   requestUpdate();
 }
@@ -1020,32 +1028,64 @@ bool CompanionModeActivity::enterListDocument(const std::string& peerKey, Screen
   listPeerKey = peerKey;
   listReturnScreen = returnTo;
   listNav.reset();
+  loadListDocBuf();
   reloadListView();
   screen = Screen::List;
   return listDocLoaded;
 }
 
+// See the header's doc comment. Always starts from a clean slate -- any
+// buffer held for a previously-viewed peer (e.g. the picker moving from one
+// LIST tile straight to another) is freed first, so this never leaks one
+// buffer into another's lifetime.
+void CompanionModeActivity::loadListDocBuf() {
+  freeListDocBuf();
+  if (listPeerKey.empty()) return;
+
+  const size_t size = companionpeer::listDocumentSize(listPeerKey.c_str());
+  if (size == 0) return;
+
+  auto buf = makeUniqueNoThrow<uint8_t[]>(size);
+  if (!buf) {
+    LOG_ERR("CMA", "could not allocate %u bytes for peer %s's list document", static_cast<unsigned>(size),
+            listPeerKey.c_str());
+    return;
+  }
+
+  const size_t read = companionpeer::readListDocument(listPeerKey.c_str(), buf.get(), size);
+  if (read != size) return;
+
+  listDocBuf = std::move(buf);
+  listDocBufLen = size;
+}
+
+void CompanionModeActivity::freeListDocBuf() {
+  listDocBuf.reset();
+  listDocBufLen = 0;
+}
+
 // See the header's doc comment on `recountTotals`. Three shapes of walk,
 // cheapest first:
-//   - listPeerKey empty: nothing to walk at all.
-//   - !recountTotals: exactly one companionpeer::loadListDocument() pass,
-//     windowed against listNav's already-known counts (the Up/Down case).
+//   - listPeerKey empty or listDocBuf unset: nothing to walk at all.
+//   - !recountTotals: exactly one companiontodo::parseDocument() pass over
+//     listDocBuf, windowed against listNav's already-known counts (the
+//     Up/Down case).
 //   - recountTotals: one counting pass to learn listCount and (usually) the
 //     current list's itemCount, PLUS a second counting pass in the one case
 //     where the first pass targeted a list index that turned out to be
 //     stale (the document shrank under a listIndex a caller hadn't yet
 //     re-validated -- see ListCountingVisitor's doc comment), PLUS the
-//     windowed pass. Each pass is a full SD open + JSON parse
-//     (companionpeer::loadListDocument()'s own cost note), so this is
-//     explicitly NOT something to call from render() -- see this function's
-//     every call site, all of which are nav presses, a fresh document
-//     landing, or first entry.
+//     windowed pass. Each pass is a pure in-RAM walk of listDocBuf now (no
+//     SD, no allocation) -- loadListDocBuf() is what pays the SD cost, once,
+//     before this is ever called, so calling this on every nav press is
+//     cheap by design; it was NOT always this cheap (see this feature's
+//     commit message for the per-keypress SD+JSON cost it replaced).
 void CompanionModeActivity::reloadListView(bool recountTotals) {
   listDocLoaded = false;
   listDocTitle.clear();
   listVisibleRows.clear();
 
-  if (listPeerKey.empty()) {
+  if (listPeerKey.empty() || !listDocBuf) {
     listNav.setListCount(0);
     return;
   }
@@ -1053,7 +1093,8 @@ void CompanionModeActivity::reloadListView(bool recountTotals) {
   if (recountTotals) {
     const int originalTarget = static_cast<int>(listNav.listIndex());
     ListCountingVisitor counting(originalTarget);
-    if (!companionpeer::loadListDocument(listPeerKey.c_str(), counting) || counting.listCount() == 0) {
+    if (companiontodo::parseDocument(listDocBuf.get(), listDocBufLen, counting) != companiontodo::ParseResult::Ok ||
+        counting.listCount() == 0) {
       listNav.setListCount(0);
       return;
     }
@@ -1067,7 +1108,7 @@ void CompanionModeActivity::reloadListView(bool recountTotals) {
       // that is no longer at that position. Re-count against the clamped
       // index rather than trust a number that describes the wrong list.
       ListCountingVisitor recount(static_cast<int>(listNav.listIndex()));
-      companionpeer::loadListDocument(listPeerKey.c_str(), recount);
+      companiontodo::parseDocument(listDocBuf.get(), listDocBufLen, recount);
       itemCount = recount.targetItemCount();
     }
     listNav.setCurrentList(itemCount);  // clamps cursor()/windowStart()
@@ -1075,7 +1116,8 @@ void CompanionModeActivity::reloadListView(bool recountTotals) {
 
   ListRowVisitor rows(static_cast<int>(listNav.listIndex()), listNav.windowStart(), listNav.visibleCapacity(),
                       &listDocTitle, &listVisibleRows);
-  if (companionpeer::loadListDocument(listPeerKey.c_str(), rows)) listDocLoaded = true;
+  if (companiontodo::parseDocument(listDocBuf.get(), listDocBufLen, rows) == companiontodo::ParseResult::Ok)
+    listDocLoaded = true;
 }
 
 bool CompanionModeActivity::handleListNav() {
@@ -1099,6 +1141,7 @@ bool CompanionModeActivity::handleListNav() {
   if (buttonWasPressed(MappedInputManager::Button::Back, companionble::ButtonId::Back)) {
     RenderLock lock;
     screen = listReturnScreen;
+    freeListDocBuf();  // leaving Screen::List -- see the header's audit note
     requestUpdate();
     return true;
   }
@@ -1323,6 +1366,11 @@ void CompanionModeActivity::loop() {
       // up, same as always (the branch below still applies).
       if (!foregroundPeerKey.empty() && !foregroundPushedImageThisSession &&
           companionpeer::isImageCapable(foregroundPeerKey.c_str())) {
+        // This can take the screen away from a document being locally
+        // browsed through the offline picker (screen == List here does not
+        // imply the disconnecting peer is listPeerKey) -- see the header's
+        // audit note.
+        if (screen == Screen::List) freeListDocBuf();
         loadGalleryForPeer(foregroundPeerKey);
         if (!galleryImages.empty()) {
           browsingPeerKey = foregroundPeerKey;
@@ -1507,6 +1555,10 @@ void CompanionModeActivity::loop() {
     RenderLock lock;
     pairingAppName = newPairingName;
     pairingDeadlineMs = millis() + kPairingTimeoutMs;
+    // A pairing prompt from a NEW app can land while a different, already-
+    // enrolled peer's document is being locally browsed via the offline
+    // picker -- see the header's audit note.
+    if (screen == Screen::List) freeListDocBuf();
     screen = Screen::Pairing;
     idleSinceMs = 0;  // a prompt on screen is not idle
     requestUpdate();
@@ -1531,6 +1583,7 @@ void CompanionModeActivity::loop() {
     // one that lands while this peer is showing some other screen, is
     // silently ignored: there is nothing on screen for it to invalidate.
     RenderLock lock;
+    loadListDocBuf();  // re-read: the new document may be a different size
     reloadListView();
     requestUpdate();
   }
@@ -1568,7 +1621,10 @@ void CompanionModeActivity::loop() {
     }
     // Text replaces an image, and vice versa. There is no compositing and no
     // mode to enter: the last completed push owns the screen. That includes
-    // replacing a gallery being browsed locally through the picker.
+    // replacing a gallery -- or a different peer's document -- being browsed
+    // locally through the picker (screen == List here does not imply this
+    // push's peer is listPeerKey) -- see the header's audit note.
+    if (screen == Screen::List) freeListDocBuf();
     screen = Screen::Text;
     displayedImagePath.clear();
     galleryPickerBrowsing = false;

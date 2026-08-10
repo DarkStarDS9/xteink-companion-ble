@@ -25,15 +25,18 @@
 //   /.crosspoint/companion/peers/<key>/images.json  gallery index: slot -> seq, content-id
 //   /.crosspoint/companion/peers/<key>/images/       up to kMaxImagesPerPeer stored pushes,
 //                                                    img_<slot>.raw, slot = seq % kMaxImagesPerPeer
-//   /.crosspoint/companion/peers/<key>/lists.json    the ToDo List document (kFieldListDoc, 0x08):
-//                                                    { revision, lists: [ { listId, title, groups: [
-//                                                    { groupId, label, items: [ { itemId, text,
-//                                                    checked } ] } ] } ] } -- see
-//                                                    docs/companion-todo-list-design.md §3. Written
-//                                                    whole-document, via a temp file + rename (see
-//                                                    storeListDocument()'s comment), never mutated
-//                                                    field-by-field -- Phase A is read-only, nothing
-//                                                    here ever flips `checked` on its own.
+//   /.crosspoint/companion/peers/<key>/lists.bin     the ToDo List document (kFieldListDoc, 0x08):
+//                                                    the exact wire bytes pushed, verbatim -- same
+//                                                    discipline as buttons.bin/icon.bin above, not a
+//                                                    JSON re-encoding (see docs/companion-todo-list-
+//                                                    design.md §3 for why this moved from JSON after
+//                                                    the first cut). Written whole-document, via a
+//                                                    temp file + rename (see storeListDocument()'s
+//                                                    comment), never mutated field-by-field -- Phase A
+//                                                    is read-only, nothing here ever flips `checked`
+//                                                    on its own. Read back with
+//                                                    companiontodo::parseDocument(), the same parser
+//                                                    that validates the wire push.
 //
 // A pushed image is staged into data/incoming.raw as it streams in (see
 // CompanionBle.cpp), then, once complete, moved (renamed, not copied) into an
@@ -53,11 +56,6 @@
 // header's API. CompanionBle.h is enum/constant declarations only (it pulls in
 // nothing but <cstddef>/<cstdint>), so this costs no dependency.
 #include "CompanionBle.h"
-// For companiontodo::Visitor -- loadListDocument() below re-fires the exact
-// same callback interface parseDocument() uses for the wire push, so a reader
-// written against one walks the other unmodified. Also header-only, no new
-// dependency (see that header's own charter comment).
-#include "CompanionTodoDocument.h"
 
 namespace companionpeer {
 
@@ -233,56 +231,46 @@ bool readDeclaredShape(const char* peerKey, companionble::ContentShape* out);
 // an asset (answered via ASSET_ACK) -- see CompanionBle.cpp's kFieldListDoc
 // END handling, which maps each of these onto the RenderResult the phone
 // actually receives (Stored -> Displayed, RejectedFormat -> DecodeFailed,
-// RejectedStorage -> StorageFailed, RejectedSize -> RejectedSize). Over-cap
-// *bytes* is refused before this is ever called (CompanionBle.cpp latches
-// that at START, like the image field, against companionble::kMaxListDocLen)
-// -- but a push can be under that byte cap and still carry more than
-// companionble::kMaxListItems items (the format's per-item floor is 4
-// bytes), which only counting items during ingest can catch. RejectedSize
-// covers both: it is a size refusal either way, from the phone's point of
-// view.
+// RejectedStorage -> StorageFailed). Over-cap *bytes* is refused before this
+// is ever called (CompanionBle.cpp latches that at START, like the image
+// field, against companionble::kMaxListDocLen, and answers RejectedSize
+// itself) -- there used to be a second, item-count cap enforced here too
+// (kMaxListItems, to bound a since-removed JSON read-back), which is why
+// there is no RejectedSize value in this enum: it would exist for nothing
+// this function itself refuses. See CompanionBle.h's kMaxListDocLen comment.
 enum class ListStoreResult : uint8_t {
   Stored = 0x00,
   RejectedFormat = 0x01,
   RejectedStorage = 0x02,
-  RejectedSize = 0x03,
 };
 
 // Validates and stores a whole-document kFieldListDoc push (the wire layout
-// CompanionTodoDocument.h parses) as this peer's lists.json, replacing
+// CompanionTodoDocument.h parses) as this peer's lists.bin, replacing
 // whatever was there. `data`/`len` is the reassembled push body, already
 // capped to companionble::kMaxListDocLen by the caller.
 //
-// Never writes a partial or clobbered lists.json: the JSON is streamed to a
-// temp file as companiontodo::parseDocument() walks the binary buffer, and
-// that temp file is renamed onto lists.json only once parseDocument() returns
-// Ok. A Malformed verdict -- which, per that function's own contract, may
-// follow some callbacks already having fired -- simply discards the temp
-// file; the peer's previously-good document is untouched either way. See this
-// function's .cpp comment for why this streams to disk rather than building
-// an in-RAM JsonDocument (the "preferred" idiom images.json/peers.json use):
-// the wire format's own item-density worst case makes that unbounded.
-//
-// Also refuses (RejectedSize) a document over companionble::kMaxListItems
-// total items, counted as parseDocument() walks it, even when `len` is
-// under kMaxListDocLen -- this bounds loadListDocument()'s read-back, which
-// is NOT streaming. See kMaxListItems's comment in CompanionBle.h.
+// Stores the exact bytes pushed -- no re-encoding -- once, and only once,
+// companiontodo::parseDocument() confirms the whole buffer is structurally
+// sound (ParseResult::Ok). A Malformed verdict never touches SD at all: the
+// peer's previously-good document, if any, is untouched. The write itself
+// still goes through a temp file renamed onto lists.bin only once it fully
+// lands, so a mid-write SD failure (full card, power loss) cannot leave a
+// truncated lists.bin clobbering that previously-good document either.
 ListStoreResult storeListDocument(const char* peerKey, const uint8_t* data, size_t len);
 
-// Reads this peer's stored lists.json, if any, and walks it via the exact
-// same companiontodo::Visitor interface parseDocument() drives for the wire
-// push -- a renderer written against one walks the other unmodified. Returns
-// false, with `visitor` never called, when this peer has no document yet
-// (never pushed one) or its stored lists.json no longer parses; both are
-// treated as "no document" rather than an error a caller needs to branch on
-// specially, since neither is reachable except by tampering with the SD card
-// directly (every write here goes through storeListDocument() above, which
-// only ever leaves a structurally valid lists.json or none at all).
-//
-// This is a full SD open + JSON parse, same discipline as loadImagesIndex()
-// -- call it on the main loop task when a peer's Screen::List is opened, not
-// on the NimBLE host task and not per redraw.
-bool loadListDocument(const char* peerKey, companiontodo::Visitor& visitor);
+// Size in bytes of this peer's stored lists.bin, or 0 if this peer has none.
+// Callers (CompanionModeActivity's Screen::List) read this first to size the
+// buffer they pass to readListDocument() below.
+size_t listDocumentSize(const char* peerKey);
+
+// Reads this peer's stored lists.bin -- the verbatim wire bytes -- into
+// `buf`. Returns the number of bytes read, or 0 if this peer has no document,
+// `bufLen` is smaller than the stored file, or the read failed; matches
+// readAssetBody()'s conventions above. The caller walks the result with
+// companiontodo::parseDocument() (CompanionTodoDocument.h), the same parser
+// that validated the wire push before it was ever stored -- there is no
+// separate on-device reader to keep in sync with that one.
+size_t readListDocument(const char* peerKey, uint8_t* buf, size_t bufLen);
 
 // Marks the peer as most recently seen and evicts beyond kMaxPeers.
 void touch(const char* peerKey);

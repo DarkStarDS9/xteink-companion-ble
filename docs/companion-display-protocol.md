@@ -80,7 +80,8 @@ implements it, never after.
 > **The ToDo List document field (`0x08`, LIST content shape) — Phase A only, not run on hardware.**
 > `kFieldListDoc` completes the `LIST` shape v12 reserved but left with no content field (see "List
 > document field" below); this is not a version bump, just v12's reservation finished. Implemented:
-> the wire codec, ingest to `lists.json`, `Screen::List` rendering with paging/list-switching, and the
+> the wire codec, ingest to `lists.bin` (the verbatim wire bytes, not a JSON re-encoding -- see the
+> "Storage layout" section below), `Screen::List` rendering with paging/list-switching, and the
 > offline icon-grid/picker entry point. **Not** implemented: anything from
 > `docs/companion-todo-list-design.md` phase B or C — there is no offline check-off, no
 > `list_state.json`, and no `LIST_STATE` notify; Phase A is read-only. The e2e harness's `[list]` group
@@ -584,10 +585,9 @@ RENDER_STATUS result     0x00 DISPLAYED
                                                 over-long counts, or a `checked` byte outside
                                                 {0,1}) -- see "List document field"
                          0x02 REJECTED_SIZE     exceeded max image length, or a list document (0x08)
-                                                over kMaxListDocLen bytes or over kMaxListItems
-                                                items -- see "List document field"
+                                                over kMaxListDocLen bytes -- see "List document field"
                          0x03 STORAGE_FAILED    could not stage to SD (image), or could not write
-                                                lists.json (list document)
+                                                lists.bin (list document)
                          0x04 SEQUENCE_GAP      a CHUNK's sequence number skipped ahead of what
                                                 was expected (image), or a title/body/tag batch
                                                 was discarded because one of its fields hit that
@@ -867,7 +867,7 @@ discarded on disconnect and on a foreground handover.
 | `0x05` | UI declaration (shape + buttons + tags) | 512 bytes | SD (`ui.bin`) | *asset — never checked* |
 | `0x06` | icon | icon width x height / 8 bytes | SD (`icon.bin`) | *asset — never checked* |
 | `0x07` | tag state | 13 bytes | RAM (foreground only) | TEXT + IMAGE |
-| `0x08` | list document | 16 KB (`kMaxListDocLen`), also capped at 512 total items (`kMaxListItems`) | heap, transient — reassembled for the duration of one push, written straight through to `lists.json` on SD, then freed; never resident | LIST |
+| `0x08` | list document | 16 KB (`kMaxListDocLen`) | heap, transient — reassembled for the duration of one push, validated, written straight through to `lists.bin` on SD as the exact bytes received, then freed; never resident | LIST |
 
 Next free: `0x09`.
 
@@ -893,10 +893,9 @@ specifically a truncation is worse than for text: landing on a structural
 boundary would parse as a shorter but well-formed document and silently drop
 items with no error at all, so an over-cap push is refused outright
 (`RENDER_STATUS(REJECTED_SIZE)`) rather than truncated to the cap the way
-title/body are. The same refuse-don't-truncate answer covers the item-count cap
-(`kMaxListItems`), enforced separately at ingest to bound `lists.json`'s
-read-back into RAM (see "List document field" below) — a document can be legally
-short in bytes and still carry more items than that.
+title/body are. `kMaxListDocLen` is the only cap on this field — see "List
+document field" below for why an earlier revision also capped total item
+count, and why that second cap no longer exists.
 
 ### Atomic multi-field pushes (`0x80` final-field flag)
 
@@ -1563,63 +1562,70 @@ the buffer, is malformed.
   clamped or ignored — Phase A never writes this byte itself, so accepting a
   bad one would mean rendering state the device cannot explain.
 
-**Two caps, and they produce genuinely different answers than the same words
-mean for title/body:**
+**One cap, `kMaxListDocLen` = 16 KB, bounds the transfer's total bytes.** A
+push over this is **refused outright at `START`** — `RENDER_STATUS(REJECTED_SIZE)`
+— **not silently truncated to the cap** the way title/body are. Truncating an
+arbitrary byte off a structured document can land exactly on a
+list/group/item boundary and parse as a shorter but perfectly well-formed
+document, silently dropping items with no error the app or the user would
+ever see; refusing the whole push instead makes that failure loud.
 
-- **`kMaxListDocLen` = 16 KB** bounds the transfer's total bytes. A push over
-  this is **refused outright at `START`** — `RENDER_STATUS(REJECTED_SIZE)` —
-  **not silently truncated to the cap** the way title/body are. Truncating an
-  arbitrary byte off a structured document can land exactly on a
-  list/group/item boundary and parse as a shorter but perfectly well-formed
-  document, silently dropping items with no error the app or the user would
-  ever see; refusing the whole push instead makes that failure loud.
-- **`kMaxListItems` = 512** bounds the total item count across every
-  list/group in one document, independent of byte count — the wire format's
-  cheapest possible item costs only 4 bytes (`u16` id + `checked` + a
-  zero-length `textLen`), so a legally-sized 16 KB push can carry thousands of
-  near-empty items. This is enforced separately, at ingest
-  (`storeListDocument()`, `src/CompanionPeerStore.cpp`), because the device
-  reads a stored document back into an in-memory JSON structure to render or
-  re-serve it, and an unbounded item count would make that read-back
-  unbounded too — a push that breaks no byte-cap rule could otherwise cost
-  multiples of this device's entire RAM. Over this cap is also
-  `RENDER_STATUS(REJECTED_SIZE)`, distinguishable from the byte cap only by
-  knowing which one your own push was closer to; both are size refusals, not
-  format errors.
+There used to be a second cap here, `kMaxListItems` = 512, bounding total item
+count independent of byte count — the wire format's cheapest possible item
+costs only 4 bytes (`u16` id + `checked` + a zero-length `textLen`), so a
+legally-sized 16 KB push could carry thousands of near-empty items. It existed
+because the device used to read a stored document back into an in-memory JSON
+tree to render it, and an unbounded item count would have made that read-back
+unbounded too. That JSON read-back is gone (see "Storage layout" below):
+storage and rendering both now walk the exact wire bytes with the same
+allocation-free parser that validates the push in the first place, so nothing
+downstream cares how a 16 KB document spends its budget. `REJECTED_SIZE`
+therefore has one meaning again, not two: over `kMaxListDocLen` bytes.
 
 **`RENDER_STATUS` outcomes for this field:**
 
 ```
-DISPLAYED       parsed and written through to lists.json
+DISPLAYED       parsed and written through to lists.bin
 DECODE_FAILED   malformed — truncated, over-long counts, or a bad `checked` byte
-REJECTED_SIZE   over kMaxListDocLen bytes, or over kMaxListItems items
-STORAGE_FAILED  the SD write to lists.json failed
+REJECTED_SIZE   over kMaxListDocLen bytes
+STORAGE_FAILED  the SD write to lists.bin failed
 REJECTED_SHAPE  the pushing peer's declared content shape is not LIST (v12,
                 see "UI declaration field")
 ```
 
-Ingest writes straight to SD as the pushed binary buffer is parsed — never
-building the whole document as an in-RAM JSON tree — via a temp file renamed
-onto `lists.json` only once the parse fully succeeds, so a malformed or
-over-cap push never partially overwrites a peer's existing, valid document.
+Ingest validates the pushed binary buffer with the same parser that walks it
+for rendering (`companiontodo::parseDocument()`) before ever touching SD, then
+writes the exact bytes received — no re-encoding — via a temp file renamed
+onto `lists.bin` only once that validation passes, so a malformed or over-cap
+push never partially overwrites a peer's existing, valid document.
 
 **On-device rendering and navigation are entirely local — no wire traffic.**
 Once a document is stored, `Screen::List` shows one list at a time: its title,
 its groups (an empty-label group draws no heading), each item's checkbox glyph
-reflecting `checked`, and a cursor, paged through a bounded visible window
-rather than holding the whole document in RAM. `Screen::List` claims
-`Up`/`Down` (move cursor, page the window), `Left`/`Right` (switch lists
-within the document) and `Back` (leave the screen) unconditionally — **not**
-only what the foreground peer's own button map left unclaimed, the way the
-image gallery's `Up`/`Down` paging does. That is safe specifically because a
-`LIST` peer's shape, and therefore its need for all five buttons, is known and
-enforced before `Screen::List` is ever reached (see "UI declaration field").
-`Confirm` is a no-op in Phase A — there is nothing to toggle yet.
+reflecting `checked`, and a cursor, paged through a bounded visible window.
+The whole document (<=16 KB) is held in RAM for as long as `Screen::List` is
+up over it — read once from `lists.bin` on entry, sized exactly to the stored
+file via `makeUniqueNoThrow`, and freed the moment the screen is left (Back,
+a foreground handover, a live push that takes the screen from underneath a
+locally-browsed document) — but only the visible window is ever walked into
+rendered rows on any one pass; navigation re-walks that in-RAM buffer with
+`companiontodo::parseDocument()`, not SD, on every keypress. This replaced an
+earlier design that re-opened and re-parsed `lists.bin` from SD on every
+cursor press — a real heap-fragmentation risk on this no-PSRAM part over a
+long browse. `Screen::List` claims `Up`/`Down` (move cursor, page the window),
+`Left`/`Right` (switch lists within the document) and `Back` (leave the
+screen) unconditionally — **not** only what the foreground peer's own button
+map left unclaimed, the way the image gallery's `Up`/`Down` paging does. That
+is safe specifically because a `LIST` peer's shape, and therefore its need for
+all five buttons, is known and enforced before `Screen::List` is ever reached
+(see "UI declaration field"). `Confirm` is a no-op in Phase A — there is
+nothing to toggle yet.
 
 A newly stored document reaches the screen without a fresh connection: storing
 a push fires a device-internal callback naming the peer, and if that peer's
 document is the one currently on `Screen::List`, the activity re-reads it from
-SD on the main loop. This is entirely device-local bookkeeping, not a new wire
+SD into that in-RAM buffer on the main loop (the new document may be a
+different size). This is entirely device-local bookkeeping, not a new wire
 message.
 
 **Offline entry point.** `CONFIRM` on a `LIST` peer's tile in the on-screen
@@ -1883,8 +1889,10 @@ means:
     token.bin                16-byte pairing token
     icon.bin                 1-bpp sleep-screen icon
     ui.bin                   UI declaration (content shape + button routing/labels + tag labels)
-    lists.json                ToDo List document (field 0x08, LIST shape only) -- Phase A: read-only,
-                              whole-document replace via temp-file-then-rename; see "List document field"
+    lists.bin                 ToDo List document (field 0x08, LIST shape only) -- the exact wire bytes
+                              pushed, verbatim, same as ui.bin/icon.bin above, not a JSON re-encoding.
+                              Phase A: read-only, whole-document replace via temp-file-then-rename;
+                              see "List document field"
     data/                    per-peer scratch: staged image, event logs
 ```
 
@@ -2201,9 +2209,11 @@ READ_LATER) and added the Status characteristic.
   characteristics, session table, content reassembly, image streaming to SD,
   button-event notify, capability characteristic);
   `src/CompanionPeerStore.{h,cpp}` (peer directory, tokens, asset digests, UI
-  declaration, icons, ToDo List document storage); `src/CompanionTodoDocument.{h,cpp}`
-  (the host-buildable wire parser for field `0x08`), `src/CompanionListJsonWriter.{h,cpp}`
-  (buffered, host-buildable JSON serialization for `lists.json`), `src/CompanionTodoNav.{h,cpp}`
+  declaration, icons, ToDo List document storage as verbatim wire bytes);
+  `src/CompanionTodoDocument.{h,cpp}` (the host-buildable, allocation-free wire
+  parser for field `0x08`, used for both validating a push and walking a
+  stored document back out — see "List document field" for why there is no
+  separate JSON codec here anymore), `src/CompanionTodoNav.{h,cpp}`
   (host-buildable cursor/paging/list-switching state machine); `src/activities/companion/CompanionModeActivity.{h,cpp}` (the
   on-device screen: pagination, pairing prompt, button routing, image render,
   sleep grid, `Screen::List`). See `docs/companion-mode-implementation-notes.md` for the
@@ -2237,17 +2247,16 @@ READ_LATER) and added the Status characteristic.
   plus `REJECTED_NO_SHAPE` on a shapeless declaration with the `ACQUIRE` denial
   that follows it, and the re-declare-while-foreground escape hatch. Its
   `[list]` group covers the ToDo List document field (`0x08`): a successful
-  push and render, both size refusals (`kMaxListDocLen`, `kMaxListItems`), and
-  a malformed document — like `[shape]`, **written but not executed against a
-  device**, and deliberately not folded into `[shape]` since it needs a third
-  declared peer and a field `[shape]` knows nothing about.
+  push and render, the size refusal (`kMaxListDocLen`), and a malformed
+  document — like `[shape]`, **written but not executed against a device**,
+  and deliberately not folded into `[shape]` since it needs a third declared
+  peer and a field `[shape]` knows nothing about.
   See `docs/companion-test-console.md`. CompanionKit's framer
   and handshake codec additionally have `swift test` unit tests; the rest of
   what runs on-device is verified by the checklist below. The host-only
   parser and nav-state seams (`test/companion_todo_document/`,
-  `test/companion_todo_nav/`, `test/companion_list_json_writer/`) are the one
-  part of the ToDo List feature that has actually run, since they need no
-  hardware at all.
+  `test/companion_todo_nav/`) are the one part of the ToDo List feature that
+  has actually run, since they need no hardware at all.
 
 ## Manual verification checklist (on hardware)
 

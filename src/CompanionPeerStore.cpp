@@ -1,7 +1,7 @@
 #include "CompanionPeerStore.h"
 
 #include "CompanionBle.h"
-#include "CompanionListJsonWriter.h"
+#include "CompanionTodoDocument.h"
 #include "CompanionUiDeclaration.h"
 
 #include <ArduinoJson.h>
@@ -42,7 +42,7 @@ std::string imageSlotPath(const char* peerKey, uint32_t slot) {
   return imagesDir(peerKey) + "/" + name;
 }
 
-constexpr const char* kListsFileName = "lists.json";
+constexpr const char* kListsFileName = "lists.bin";
 
 std::string listsPath(const char* peerKey) { return peerDir(peerKey) + "/" + kListsFileName; }
 // Written first, then renamed onto listsPath() -- see storeListDocument().
@@ -132,52 +132,6 @@ bool writeWholeFile(const std::string& path, const uint8_t* data, size_t len) {
   file.close();
   return written == len;
 }
-
-// Converts a kFieldListDoc push straight to lists.json's JSON shape as
-// companiontodo::parseDocument() walks it, writing each fragment to `file`
-// as it goes rather than building a JsonDocument in RAM first.
-//
-// Why not a JsonDocument, matching images.json/peers.json's own idiom (the
-// preferred approach per docs/companion-todo-list-design.md's storage
-// section): measured against ArduinoJson v7's real allocator (v7's
-// JsonDocument::memoryUsage() always reports 0 now -- it dropped the fixed
-// pool for per-node heap allocation -- so this was measured with a custom
-// Allocator tracking live bytes instead of trusting that call). A document
-// shaped the way the design doc assumes -- a few hundred short items --
-// costs ~49 KB live, already uncomfortable stacked on the 16 KB
-// `g_activeBuf` still resident while this runs, against the ~166 KB
-// headroom the design doc's own §4/§8 cites. But `kMaxListDocLen` (16 KB)
-// does not actually bound item *count* the way that estimate assumes: the
-// wire format's minimum per-item cost is 4 bytes (a 2-byte id, 1 checked
-// byte, 1 zero-length textLen), so a legally-sized push can carry over 4000
-// near-empty items. Built and measured that exact document: ~4092 items,
-// ~450 KB live in the same JsonDocument approach -- multiples of this
-// device's entire ~380 KB RAM, from a push that is not oversize by any rule
-// this protocol enforces. A malformed-content DoS, not a hardware bug.
-// Streaming straight to disk instead keeps this function's own RAM flat
-// (one small write buffer, not proportional to item count) regardless of
-// how a pushed document chooses to spend its 16 KB, and gets the
-// temp-file-then-rename atomicity storeListDocument() needs "for free" in
-// the same move, per docs/companion-declared-shape-design.md-style
-// measure-before-deciding rather than assuming the round-number cap alone
-// bounds this. The read-back side of the same DoS -- a legally-sized push
-// with thousands of near-empty items -- is bounded separately, at ingest,
-// by companionble::kMaxListItems; see storeListDocument()'s own comment and
-// loadListDocument()'s below.
-//
-// The buffering/escaping logic itself lives in companionpeer::JsonListWriter
-// (CompanionListJsonWriter.h/.cpp), extracted out of this file so it has a
-// host gtest suite -- this file cannot be host-built at all (ArduinoJson,
-// HalStorage). This adapter is the one line of glue that lets that
-// host-testable class write to a real HalFile.
-class HalFileSink : public JsonWriteSink {
- public:
-  explicit HalFileSink(HalFile& file) : file_(file) {}
-  bool write(const uint8_t* data, size_t len) override { return file_.write(data, len) == len; }
-
- private:
-  HalFile& file_;
-};
 
 // The UI declaration's byte layout, its validation rules and its host gtest
 // suite all live in CompanionUiDeclaration.{h,cpp} — this file cannot be
@@ -441,6 +395,16 @@ size_t listImages(const char* peerKey, ImageEntry* out, size_t maxImages) {
 }
 
 ListStoreResult storeListDocument(const char* peerKey, const uint8_t* data, size_t len) {
+  // Validate before ever touching SD: a no-op Visitor (companiontodo::Visitor's
+  // default bodies do nothing) is enough to get parseDocument()'s Ok/Malformed
+  // verdict without walking any state of our own. A malformed push must not
+  // clobber a previously-good document, so nothing is written unless this
+  // returns Ok.
+  companiontodo::Visitor validator;
+  if (companiontodo::parseDocument(data, len, validator) != companiontodo::ParseResult::Ok) {
+    return ListStoreResult::RejectedFormat;
+  }
+
   if (!Storage.ensureDirectoryExists(peerDir(peerKey).c_str())) return ListStoreResult::RejectedStorage;
 
   const std::string tmpPath = listsTmpPath(peerKey);
@@ -450,43 +414,16 @@ ListStoreResult storeListDocument(const char* peerKey, const uint8_t* data, size
   // open-mode semantics.
   Storage.remove(tmpPath.c_str());
 
-  HalFile file;
-  if (!Storage.openFileForWrite("CPEER", tmpPath, file)) return ListStoreResult::RejectedStorage;
-
-  HalFileSink sink(file);
-  JsonListWriter writer(sink);
-  const companiontodo::ParseResult parseResult = companiontodo::parseDocument(data, len, writer);
-  // finish() flushes any bytes still sitting in the writer's internal
-  // buffer -- ok() below must be read AFTER this call, or a failure in that
-  // final flush would be missed and a truncated document could look Stored.
-  writer.finish();
-  file.flush();
-  const bool writeOk = writer.ok();
-  file.close();
-
-  if (parseResult != companiontodo::ParseResult::Ok || !writeOk) {
-    // Never renamed onto lists.json -- the peer's previously-good document
-    // (if any) is untouched. This temp file may itself be malformed JSON
-    // (parseDocument() can fire some callbacks before discovering a later
-    // byte is bad); that is fine, since nothing ever reads it back.
+  if (!writeWholeFile(tmpPath, data, len)) {
     Storage.remove(tmpPath.c_str());
-    return parseResult != companiontodo::ParseResult::Ok ? ListStoreResult::RejectedFormat
-                                                          : ListStoreResult::RejectedStorage;
-  }
-
-  if (writer.overCap()) {
-    // Structurally valid and fully written to the temp file, but over
-    // companionble::kMaxListItems items -- refused rather than stored, same
-    // as an over-cap-bytes push, because loadListDocument() reads this back
-    // into a live ArduinoJson JsonDocument that is NOT streaming; an
-    // uncapped item count there is the unbounded-RAM DoS kMaxListItems
-    // exists to close. See that constant's comment in CompanionBle.h.
-    Storage.remove(tmpPath.c_str());
-    return ListStoreResult::RejectedSize;
+    return ListStoreResult::RejectedStorage;
   }
 
   // Same "clear the destination first" discipline as commitImage() --
   // renaming over an existing path is not guaranteed on every filesystem.
+  // This is the only moment lists.bin ever changes: a mid-write failure above
+  // already bailed out before reaching here, so the peer's previously-good
+  // document survives any failure up to this point untouched.
   const std::string destPath = listsPath(peerKey);
   Storage.remove(destPath.c_str());
   if (!Storage.rename(tmpPath.c_str(), destPath.c_str())) {
@@ -497,40 +434,25 @@ ListStoreResult storeListDocument(const char* peerKey, const uint8_t* data, size
   return ListStoreResult::Stored;
 }
 
-// Safe to materialize the whole file into a live JsonDocument here (unlike
-// storeListDocument()'s streaming write) ONLY because storeListDocument() is
-// the sole writer of lists.json and refuses (ListStoreResult::RejectedSize)
-// any document over companionble::kMaxListItems items before it is ever
-// renamed into place -- see that constant's comment in CompanionBle.h and
-// the RejectedSize branch above. If that ingest-time cap is ever removed or
-// bypassed, this read-back becomes the same unbounded-RAM DoS the streaming
-// writer was built to avoid on the write side (up to ~450 KB live for a
-// legal 16 KB push, measured -- multiples of this device's RAM).
-bool loadListDocument(const char* peerKey, companiontodo::Visitor& visitor) {
-  JsonDocument doc;
-  if (!PersistableStoreBase::readDocFromFile(listsPath(peerKey).c_str(), doc)) return false;
+size_t listDocumentSize(const char* peerKey) {
+  HalFile file;
+  if (!Storage.openFileForRead("CPEER", listsPath(peerKey), file)) return 0;
+  const size_t size = file.size();
+  file.close();
+  return size;
+}
 
-  const uint32_t revision = doc["revision"] | 0u;
-  visitor.onDocument(revision);
-  for (JsonObject list : doc["lists"].as<JsonArray>()) {
-    const uint16_t listId = static_cast<uint16_t>(list["listId"] | 0u);
-    const char* title = list["title"] | "";
-    visitor.onListStart(listId, title, static_cast<uint8_t>(strnlen(title, 255)));
-    for (JsonObject group : list["groups"].as<JsonArray>()) {
-      const uint16_t groupId = static_cast<uint16_t>(group["groupId"] | 0u);
-      const char* label = group["label"] | "";
-      visitor.onGroupStart(groupId, label, static_cast<uint8_t>(strnlen(label, 255)));
-      for (JsonObject item : group["items"].as<JsonArray>()) {
-        const uint16_t itemId = static_cast<uint16_t>(item["itemId"] | 0u);
-        const bool checked = item["checked"] | false;
-        const char* text = item["text"] | "";
-        visitor.onItem(itemId, checked, text, static_cast<uint8_t>(strnlen(text, 255)));
-      }
-      visitor.onGroupEnd(groupId);
-    }
-    visitor.onListEnd(listId);
+size_t readListDocument(const char* peerKey, uint8_t* buf, size_t bufLen) {
+  HalFile file;
+  if (!Storage.openFileForRead("CPEER", listsPath(peerKey), file)) return 0;
+  const size_t size = file.size();
+  if (size == 0 || size > bufLen) {
+    file.close();
+    return 0;
   }
-  return true;
+  const int read = file.read(buf, size);
+  file.close();
+  return read > 0 ? static_cast<size_t>(read) : 0;
 }
 
 std::string displayName(const char* peerKey) {

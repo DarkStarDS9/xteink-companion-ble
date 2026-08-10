@@ -93,37 +93,26 @@ inline constexpr size_t kMaxContentIdLen = 32;
 // text fields (kMaxFieldLen) and unlike the image field, this bounds an
 // in-RAM reassembly buffer -- but deliberately NOT a resident one: per
 // docs/companion-todo-list-design.md section 4/8, a list document is
-// heap-allocated via makeUniqueNoThrow for the duration of one push, written
-// straight through to lists.json on SD, and freed immediately after, rather
-// than living in a fixed global buffer the way titleBuf_/bodyBuf_ do. 16 KB is
-// chosen against the actual measured headroom rather than picked round: at
-// design time, steady-state DRAM usage was 154,857 / 321,296 bytes (48.2%),
-// leaving ~166 KB (docs/companion-todo-list-design.md section 4/8, from
-// `pio run -e default`'s size report) -- even the full 16 KB, transient and
-// never resident, is a rounding error against that.
-inline constexpr size_t kMaxListDocLen = 16 * 1024;
-
-// Max total items accepted across every list/group in one kFieldListDoc
-// push. kMaxListDocLen bounds *bytes*, not item *count*: the wire format's
-// minimum per-item cost is 4 bytes (a 2-byte id, 1 checked byte, 1
-// zero-length textLen), so a legally-sized 16 KB push can carry over 4000
-// near-empty items -- and CompanionPeerStore's loadListDocument() reads the
-// stored document back into an ArduinoJson JsonDocument, which the previous
-// agent measured at ~450 KB live for that exact ~4092-item document (versus
-// ~49 KB for a design-doc-realistic ~400-item one). That is multiples of
-// this device's entire ~380 KB RAM, reachable by a push that breaks no rule
-// the write path already enforces -- the streaming writer bounds the write
-// path's own RAM, but the read path re-materializes the whole thing, so the
-// document must be bounded at ingest to bound both.
+// heap-allocated via makeUniqueNoThrow for the duration of one push, validated,
+// written straight through to lists.bin on SD as the exact bytes received, and
+// freed immediately after, rather than living in a fixed global buffer the way
+// titleBuf_/bodyBuf_ do. 16 KB is chosen against the actual measured headroom
+// rather than picked round: at design time, steady-state DRAM usage was
+// 154,857 / 321,296 bytes (48.2%), leaving ~166 KB (docs/companion-todo-list-
+// design.md section 4/8, from `pio run -e default`'s size report) -- even the
+// full 16 KB, transient and never resident, is a rounding error against that.
 //
-// 512 is far beyond any real shopping/todo list (the design doc's stated
-// primary use case, docs/companion-todo-list-design.md §1) while keeping the
-// read-back JsonDocument in the same ballpark as the ~49 KB measured for
-// ~400 items, not the ~450 KB the degenerate case costs. Enforced during
-// ingest in storeListDocument() (CompanionPeerStore.cpp), not in
-// companiontodo::parseDocument() itself -- that parser deliberately enforces
-// no cap of its own; see CompanionTodoDocument.h's header comment.
-inline constexpr size_t kMaxListItems = 512;
+// This is the ONLY size cap on a list document. An earlier revision also
+// capped total item count (kMaxListItems, since removed) to bound a JSON
+// read-back that materialized the whole stored document into an ArduinoJson
+// JsonDocument -- up to ~450 KB live for a legal 16 KB push packed with
+// near-empty items, measured, multiples of this device's RAM. That reader is
+// gone: storage and read-back both now move the verbatim wire bytes through
+// companiontodo::parseDocument() (CompanionTodoDocument.h), which allocates
+// nothing regardless of how a document spends its 16 KB, so kMaxListDocLen
+// alone bounds every path. See docs/companion-todo-list-design.md §3 for the
+// full story of why the JSON detour existed and why it was removed.
+inline constexpr size_t kMaxListDocLen = 16 * 1024;
 
 // Concurrent sessions on one link. Four apps on one phone driving one screen is
 // already generous; the cap exists because the session table is fixed-size, and
@@ -529,7 +518,7 @@ using ImageStagedCallback = void (*)(const char* peerKey, const char* path, cons
 void setImageStagedCallback(ImageStagedCallback cb);
 
 // A kFieldListDoc push was validated and written straight through to
-// `peerKey`'s lists.json (companionpeer::storeListDocument() returned
+// `peerKey`'s lists.bin (companionpeer::storeListDocument() returned
 // Stored), on this task, per that field's END handling in CompanionBle.cpp.
 // Unlike ImageStagedCallback there is nothing left to decode -- the document
 // is already on SD -- so this callback carries no payload beyond which peer

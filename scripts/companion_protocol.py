@@ -75,18 +75,12 @@ FINAL_FLAG = 0x80
 
 # docs/companion-todo-list-design.md §4: the whole list document is
 # reassembled in RAM, capped well inside the ~166 KB of headroom measured
-# there.
+# there. This is the only size cap on a list document -- an earlier revision
+# also capped total item count (MAX_LIST_ITEMS) to bound a device-side JSON
+# read-back that no longer exists; storage and read-back both now move the
+# verbatim wire bytes, which nothing further needs to bound. See
+# docs/companion-todo-list-design.md §3.
 MAX_LIST_DOC_LEN = 16 * 1024
-
-# Total items (across every list/group) accepted in one FIELD_LIST_DOC push,
-# independent of MAX_LIST_DOC_LEN: the wire format's per-item floor is 4
-# bytes (2-byte id, 1 checked byte, 1 zero-length textLen), so a push well
-# under the byte cap can still carry thousands of near-empty items. The
-# device reads a stored document back into a live in-RAM JSON tree (not
-# streamed, unlike the write path), so item count has to be bounded
-# separately at ingest to keep that read-back bounded too. Mirrors
-# companionble::kMaxListItems in src/CompanionBle.h -- keep these in sync.
-MAX_LIST_ITEMS = 512
 
 # Fields whose CHUNKs carry the 2-byte little-endian sequence number: image
 # since v9, title/body since v10. Every other field's CHUNK payload still

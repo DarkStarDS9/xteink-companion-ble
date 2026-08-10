@@ -2,12 +2,13 @@
 
 **STATUS (2026-08-10): §10 phase A is implemented in firmware, protocol doc and host harness;
 nothing has run on hardware.** Landed: the `kFieldListDoc` (`0x08`) wire codec and its
-host-buildable parser (`src/CompanionTodoDocument.{h,cpp}`), per-peer storage
-(`src/CompanionPeerStore.{h,cpp}`'s `lists.json`, streamed write, ingest-time item cap),
-`Screen::List` rendering and local navigation (`src/CompanionTodoNav.{h,cpp}`,
-`src/activities/companion/CompanionModeActivity.cpp`), and the offline icon-grid/picker entry
-point. Host-tested (`test/companion_todo_document/`, `test/companion_todo_nav/`,
-`test/companion_list_json_writer/`) and covered by an e2e `[list]` harness group
+host-buildable, allocation-free parser (`src/CompanionTodoDocument.{h,cpp}`), per-peer storage
+(`src/CompanionPeerStore.{h,cpp}`'s `lists.bin`, the verbatim wire bytes — see §3 for the JSON
+detour this superseded and why), `Screen::List` rendering and local navigation
+(`src/CompanionTodoNav.{h,cpp}`, `src/activities/companion/CompanionModeActivity.cpp`, which now
+holds the document in RAM for the screen's lifetime rather than re-reading SD per keypress — see
+§8), and the offline icon-grid/picker entry point. Host-tested (`test/companion_todo_document/`,
+`test/companion_todo_nav/`) and covered by an e2e `[list]` harness group
 (`scripts/companion_e2e_test.py`) that is written but **not run against a device** — see
 `docs/companion-display-protocol.md`'s status warning, same honesty this doc's own prior status
 line asked for. **Not** landed: phases B (offline checking, `list_state.json`, `LIST_STATE`
@@ -68,10 +69,11 @@ never merges or decides anything, it only accumulates a diff and hands it back v
   preference: sync all lists at once, not per-list, given how small this data is).
 - **List** = `{ listId, title, groups[] }` — **hierarchical**, not a flat item array with a group
   label reference. Revised from the first draft's flat-plus-reference shape: that shape existed to
-  dodge a recursive parser, which isn't a real cost here (see §3 — storage moves to `ArduinoJson`,
-  the same library `peers.json`/`images.json` already use, and nested JSON costs nothing extra
-  there). Nesting also settles §9's original open question about group order for free: order is
-  array position, not a separate field or "first item wins" convention.
+  dodge a recursive parser, which isn't a real cost here — `companiontodo::parseDocument()`
+  (§3/§4) walks nesting with a single forward pass and no allocation, so a hierarchical wire format
+  costs nothing extra over the flat one it replaced. Nesting also settles §9's original open
+  question about group order for free: order is array position, not a separate field or "first item
+  wins" convention.
 - **Group** = `{ groupId, label, items[] }`. A list's "ungrouped" items are just its first group with
   an empty label — no separate bucket type, one less case to render.
 - **Item** = `{ itemId, text, checked }`.
@@ -81,30 +83,56 @@ never merges or decides anything, it only accumulates a diff and hands it back v
 
 ## 3. Storage layout
 
-Extends `CompanionPeerStore`'s existing per-peer directory (`src/CompanionPeerStore.h:19-27`), but
-following **`peers.json`/`images.json`'s** idiom (`ArduinoJson` + `PersistableStoreBase`,
-`src/CompanionPeerStore.cpp:5-81`), not `buttons.bin`/`icon.bin`'s verbatim-asset one. Those two are
-stored as exact pushed bytes because the asset-digest mechanism needs them back byte-identical and
-never parses them; the todo document has no such constraint — `Screen::List` has to parse it to
-render regardless, so storing the already-parsed structure costs nothing extra and keeps the SD card
-human-readable, which is worth it here since size isn't a real constraint (a shopping list is a few
-KB, nothing like a raw framebuffer push):
+**This section was rewritten after the JSON choice below was implemented, measured, and reversed.
+The original reasoning is kept (struck through in spirit, not in markdown) rather than quietly
+overwritten, because the reversal — and the measurement behind it — is the whole point of this
+revision.**
+
+**Original choice (superseded):** follow **`peers.json`/`images.json`'s** idiom (`ArduinoJson` +
+`PersistableStoreBase`), not `buttons.bin`/`icon.bin`'s verbatim-asset one — the todo document has no
+byte-identity constraint the way an asset digest does, `Screen::List` has to parse it to render
+regardless, so storing the already-parsed structure would cost nothing extra and keep the SD card
+human-readable. The premise was **reusing machinery already in the firmware** (`ArduinoJson`), not
+writing a new codec.
+
+**What actually happened at implementation time:** measured against `ArduinoJson` v7's real allocator
+(a custom `Allocator` tracking live bytes, since v7's `JsonDocument::memoryUsage()` always reports 0
+now), a JsonDocument shaped the way this design assumed — a few hundred short items — cost ~49 KB
+live, already uncomfortable next to the reassembly buffer resident alongside it. Worse, `kMaxListDocLen`
+(16 KB) bounds transfer *bytes*, not item *count*: the wire format's per-item floor is 4 bytes (a
+2-byte id, 1 checked byte, 1 zero-length `textLen`), so a legally-sized push can carry over 4000
+near-empty items — built and measured that exact ~4092-item document at ~450 KB live in the same
+JsonDocument approach, multiples of this device's entire ~380 KB RAM, from a push that broke no rule
+this protocol enforced. A malformed-content DoS, not a hardware bug. The write side was rewritten as a
+fully hand-rolled, host-tested JSON serializer (streaming to SD as the wire buffer was parsed, never
+building a JsonDocument) to dodge exactly that cost — **which voided the original premise**: nothing
+was being reused from `peers.json`/`images.json` anymore, `ArduinoJson` was still on the *read* path
+only, and an artificial `kMaxListItems` = 512 item cap had to be invented purely to keep that
+remaining reader's read-back bounded. Bespoke writer, RAM-hungry reader, and a cap that existed only
+to make that reader safe — all in service of a "reuse JSON machinery" goal that no longer held.
+
+**Current choice: store the verbatim wire bytes, exactly like `buttons.bin`/`icon.bin`.** The document
+is validated with `companiontodo::parseDocument()` — the same allocation-free parser
+(`src/CompanionTodoDocument.{h,cpp}`) that already had to exist to walk the wire push in the first
+place — and, only once that returns `Ok`, written through unmodified. Reading it back for
+`Screen::List` uses the identical parser. This is what a byte-identity asset gets for free and a
+"the device parses it anyway" document does not automatically forfeit: since nothing downstream can
+safely assume an item-count bound smaller than what `kMaxListDocLen` already implies, and the
+allocation-free parser doesn't care how a document spends its 16 KB either way, there is no reader left
+to protect — `kMaxListItems` is gone, and `lists.bin`'s bytes are the wire bytes, full stop.
 
 ```
 peers/<peerKey>/
-  lists.json        { revision, lists: [ { listId, title, groups: [ { groupId, label, items: [
-                     { itemId, text, checked } ] } ] } ] } — the device's parsed copy of the phone's
-                     last full push
+  lists.bin          the exact wire bytes of the phone's last full kFieldListDoc push, unmodified
   list_state.json    { revision it was taken against, checked: { itemId: bool } } — items the device
-                     has toggled locally since lists.json's own revision was pushed
+                     has toggled locally since lists.bin's own revision was pushed (Phase B; not
+                     built in Phase A — see §9)
 ```
 
-The wire push itself (§4) stays binary framing like every other field — `Screen::List` decodes it
-once on arrival and writes the JSON straight through, the same shape as how `images.json`'s index is
-synthesized by firmware from binary pushes rather than pushed as JSON itself. `list_state.json` is
-the only genuinely new *kind* of file this feature needs: everywhere else, SD storage is a cache of
-something the phone already knows; this one is source-of-truth data that hasn't reached the phone
-yet.
+`list_state.json` is still the only genuinely new *kind* of file this feature needs, and remains
+JSON: unlike `lists.bin`, it has no wire format to be verbatim *of* — it is device-local, source-of-
+truth data (checked-locally-since-last-push) that has no equivalent on the wire until Phase B pushes
+it back to the phone.
 
 ## 4. Wire format
 
@@ -124,8 +152,8 @@ yet.
     push. A list document is 4x that size and pushed rarely (a full document replace, not a per-item
     op) — following the same fixed-global-buffer pattern would make 16 KB permanently resident for a
     feature most sessions never touch. Instead: heap-allocate via `makeUniqueNoThrow` (per this repo's
-    heap-discipline convention) for the duration of one push, write straight through to `lists.json`,
-    free immediately after. Alloc-per-push is normally something to avoid here for fragmentation
+    heap-discipline convention) for the duration of one push, validate and write straight through to
+    `lists.bin` (§3), free immediately after. Alloc-per-push is normally something to avoid here for fragmentation
     reasons, but a todo-list push is infrequent enough (not a hot per-CHUNK or per-frame path) that
     the tradeoff favors not carrying 16 KB permanently over avoiding one alloc/free per full-document
     sync.
@@ -220,13 +248,16 @@ version). New first-class Swift types, not opaque-bytes round-tripping:
 
 | Item | Where it lives | Cost |
 |---|---|---|
-| Document (`lists.json`) | SD | 0 RAM |
+| Document (`lists.bin`) | SD | 0 RAM at rest |
 | Local diff (`list_state.json`) | SD | 0 RAM |
-| In-flight document reassembly | heap, `makeUniqueNoThrow`, freed right after the write to SD | ≤ `kMaxListDocLen` = 16 KB, transient — **not** a fixed global buffer (see §4's note on why this deliberately does not copy the title/body pattern) |
+| In-flight document reassembly (a push arriving) | heap, `makeUniqueNoThrow`, freed right after validating and writing to SD | ≤ `kMaxListDocLen` = 16 KB, transient — **not** a fixed global buffer (see §4's note on why this deliberately does not copy the title/body pattern) |
+| Document buffer while `Screen::List` is up | heap, `makeUniqueNoThrow`, held by `CompanionModeActivity`, sized to the stored document, freed the moment the screen is left | ≤ `kMaxListDocLen` = 16 KB, held for the screen's lifetime rather than re-read from SD per keypress — see §3's "current choice" and `docs/companion-display-protocol.md`'s "List document field" |
 | List/cursor nav state | RAM, foreground peer only | comparable to the ~200 B gallery nav state (§11 of the multi-app design) |
 
 Net new *permanently resident* RAM is well under 1 KB, matching the multi-app design's own budget
-outcome — the 16 KB reassembly buffer is real but transient, alive only for the duration of one push,
+outcome. Two of the rows above are real but transient 16 KB allocations, never both live at once
+(a push's reassembly buffer is long freed before `Screen::List` is ever entered over its result): one
+alive only for the duration of one push, the other alive only while `Screen::List` is on screen —
 against ~166 KB of measured headroom (see §4).
 
 ## 9. Open questions — resolved

@@ -18,9 +18,12 @@
 // caller-supplied Visitor. The buffer itself is a transient heap allocation
 // owned by the one call site that reassembles a push
 // (docs/companion-todo-list-design.md section 4: makeUniqueNoThrow'd for the
-// duration of one kFieldListDoc push, written straight through to
-// lists.json, freed immediately after) -- this parser never allocates one of
-// its own, and never needs to: it only ever reads the caller's buffer.
+// duration of one kFieldListDoc push, validated then written straight through
+// to lists.bin as the exact bytes received, freed immediately after) -- this
+// parser never allocates one of its own, and never needs to: it only ever
+// reads the caller's buffer. This same function also walks lists.bin back out
+// for Screen::List (CompanionModeActivity.cpp), so there is exactly one
+// codec for this format, not one per direction.
 namespace companiontodo {
 
 // The wire layout, as pushed on kFieldListDoc -- the single source of truth
