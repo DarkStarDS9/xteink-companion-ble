@@ -70,28 +70,55 @@ implements it, never after.
 > actually use), via `companion-bench`: image push throughput, text pushes with
 > `awaitRender`, and the connection-profile ladder.
 >
-> **v12 has NOT run on hardware yet.** The declared-content-shape change
-> described below is implemented in firmware and in the Python client, and the
-> e2e harness has a `[shape]` group asserting every one of its refusals — but as
-> of 2026-08-09 that group has not been run against a device. Everything the
-> paragraphs above claim is a v11 result; treat v12's enforcement paths as
-> written-and-reviewed, not proven.
+> **As of 2026-08-10, v12 has run on real hardware and passed.** A `[env:test]`
+> build was flashed to a real X3 reader (`pio run -e test -t upload`,
+> `/dev/cu.usbmodem212401`) and `scripts/companion_e2e_test.py` was run against
+> it over BLE from a plain macOS terminal. Final run: **112 passed, 0 failed,
+> 0 skipped**, exit 0, with the device's own `[ERR]` log scanned throughout and
+> clean. The `[shape]` group — declared-content-shape enforcement, the change
+> this section used to say was unproven — passed in that run, covering the
+> shape-refusal paths (`RejectedShape`, `RejectedNoShape`) described below.
 >
-> **The ToDo List document field (`0x08`, LIST content shape) — Phase A only, not run on hardware.**
-> `kFieldListDoc` completes the `LIST` shape v12 reserved but left with no content field (see "List
-> document field" below); this is not a version bump, just v12's reservation finished. Implemented:
-> the wire codec, ingest to `lists.bin` (the verbatim wire bytes, not a JSON re-encoding -- see the
-> "Storage layout" section below), `Screen::List` rendering with paging/list-switching, and the
-> offline icon-grid/picker entry point. **Not** implemented: anything from
-> `docs/companion-todo-list-design.md` phase B or C — there is no offline check-off, no
-> `list_state.json`, and no `LIST_STATE` notify; Phase A is read-only. The e2e harness's `[list]` group
-> (`scripts/companion_e2e_test.py`) is written but, like `[shape]` above, has not been run against a
-> device — treat it as written-and-reviewed, not proven, same caveat as the rest of this block.
+> One harness bug was found and fixed by this run (commit `097b2841`): the
+> over-cap fixture for the list field originally built ~3400 single-character
+> items, which cannot be encoded because item count is a u8 per group; it was
+> rebuilt from 70 items of 250-byte text.
+>
+> An earlier run in the same session showed 2 failures, neither in `[shape]`'s
+> refusal assertions or `[list]`: `"the previous screen is retained after a
+> gapped image"` (`[image seqgap]`) and `"a refused text batch left the screen
+> as it was"` (a screen-state sampling check inside `[shape]`). Both are
+> screen-state *sampling* checks in an area with a prior commit titled
+> "fix(harness): stop racing the shape group's own screen-state checks", and
+> both passed cleanly on the immediately following identical run. Treat them as
+> **flaky, not proven absent** — this document does not claim they are fixed,
+> and does not claim the suite is reliably 112/112 run over run.
+>
+> **The ToDo List document field (`0x08`, LIST content shape) — Phase A, now
+> hardware-verified.** `kFieldListDoc` completes the `LIST` shape v12 reserved
+> but left with no content field (see "List document field" below); this is
+> not a version bump, just v12's reservation finished. Implemented: the wire
+> codec, ingest to `lists.bin` (the verbatim wire bytes, not a JSON re-encoding
+> -- see the "Storage layout" section below), `Screen::List` rendering with
+> paging/list-switching, and the offline icon-grid/picker entry point. **Not**
+> implemented: anything from `docs/companion-todo-list-design.md` phase B or C
+> — there is no offline check-off, no `list_state.json`, and no `LIST_STATE`
+> notify; Phase A is read-only. The e2e harness's `[list]` group
+> (`scripts/companion_e2e_test.py`) ran against the same real X3 on 2026-08-10
+> and passed **17/17**, covering: a list doc pushed to a TEXT peer answered
+> `RejectedShape`; the LIST peer's declaration stored and holding the screen; a
+> well-formed multi-list document accepted and rendered; the device reporting
+> the `list` screen; a title pushed to a LIST peer refused `RejectedShape`; tag
+> state to a LIST peer refused `RejectedShape`; a truncated document refused
+> and specifically `DecodeFailed`; a `checked=2` document refused; an over-cap
+> (>16 KB) document refused and specifically `RejectedSize`; and no unexpected
+> `[ERR]` log lines.
 >
 > **Still not proven**, and worth treating with the old caution:
 >
-> - **v12 on hardware at all** — see immediately above.
-> - **The ToDo List document field — see immediately above.**
+> - **Reliability of the two flaky screen-state checks above.** One run showed
+>   them failing, the next run was clean; neither is proven absent, and this
+>   document does not claim the suite is reliably green run over run.
 > - **The consumer apps on v11, let alone v12.** Neither SpokenFeeds nor Snap2Ink
 >   has been rebuilt against either. Everything above was driven by test
 >   harnesses on a Mac, not by an iPhone. Under v12's clean break, both are

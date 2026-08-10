@@ -1,13 +1,18 @@
 # Declared Content Shape — Design
 
-**STATUS: §9 slice A is implemented in firmware, protocol doc and host harness; nothing has run on
-hardware.** The authoritative wire contract is `docs/companion-display-protocol.md`, now at v12 and
-describing the model below rather than the opposite of it. Landed: the mandatory shape byte, the
-ACQUIRE-time cache, the START-latch/END-answer refusal, `RejectedShape` and `RejectedNoShape`,
-version 12 and capability bit 4, host unit tests over the parse and the permitted-field table, and
-the harness's `[shape]` group. **Not** landed and not claimed: no part of this has been exercised
-against a real device — the harness cases are written but unexecuted — and slices B, C and D (the
-RAM savings, and the CompanionKit/consumer-app releases) are untouched.
+**STATUS (2026-08-10): §9 slice A is implemented in firmware, protocol doc and host harness, and is
+now hardware-verified.** The authoritative wire contract is `docs/companion-display-protocol.md`,
+now at v12 and describing the model below rather than the opposite of it. Landed: the mandatory
+shape byte, the ACQUIRE-time cache, the START-latch/END-answer refusal, `RejectedShape` and
+`RejectedNoShape`, version 12 and capability bit 4, host unit tests over the parse and the
+permitted-field table, and the harness's `[shape]` group. The `[shape]` group ran against a real X3
+reader on 2026-08-10 (`scripts/companion_e2e_test.py`, full suite 112 passed / 0 failed / 0 skipped)
+and passed; one screen-state sampling check inside `[shape]` failed on an earlier run of the same
+session and passed cleanly on the next identical run — see
+`docs/companion-display-protocol.md`'s status warning for the exact wording and treat it as flaky,
+not proven absent, not as evidence against the shape-enforcement logic itself. **Not** landed and
+not claimed: slices B, C and D (the RAM savings, and the CompanionKit/consumer-app releases) are
+untouched.
 
 One deliberate amendment since this was written: **tag state (`0x07`) is permitted under both `TEXT`
 and `IMAGE`**, because it is an overlay rather than content — see §5.

@@ -1,7 +1,7 @@
 # ToDo List Mode — Design Sketch
 
-**STATUS (2026-08-10): §10 phase A is implemented in firmware, protocol doc and host harness;
-nothing has run on hardware.** Landed: the `kFieldListDoc` (`0x08`) wire codec and its
+**STATUS (2026-08-10): §10 phase A is implemented in firmware, protocol doc and host harness, and is
+now hardware-verified.** Landed: the `kFieldListDoc` (`0x08`) wire codec and its
 host-buildable, allocation-free parser (`src/CompanionTodoDocument.{h,cpp}`), per-peer storage
 (`src/CompanionPeerStore.{h,cpp}`'s `lists.bin`, the verbatim wire bytes — see §3 for the JSON
 detour this superseded and why), `Screen::List` rendering and local navigation
@@ -9,9 +9,10 @@ detour this superseded and why), `Screen::List` rendering and local navigation
 holds the document in RAM for the screen's lifetime rather than re-reading SD per keypress — see
 §8), and the offline icon-grid/picker entry point. Host-tested (`test/companion_todo_document/`,
 `test/companion_todo_nav/`) and covered by an e2e `[list]` harness group
-(`scripts/companion_e2e_test.py`) that is written but **not run against a device** — see
-`docs/companion-display-protocol.md`'s status warning, same honesty this doc's own prior status
-line asked for. **Not** landed: phases B (offline checking, `list_state.json`, `LIST_STATE`
+(`scripts/companion_e2e_test.py`) that ran against a real X3 reader on 2026-08-10 and passed
+**17/17** — see `docs/companion-display-protocol.md`'s status warning for the exact assertions
+covered and the two unrelated flaky screen-state checks (not in this group) seen in an earlier run
+of the same session. **Not** landed: phases B (offline checking, `list_state.json`, `LIST_STATE`
 sync-back) and C (CompanionKit surface) below — Phase A is read-only, full stop.
 
 **This shipped as part of protocol v12, not a new version.** v12 already reserved
@@ -98,7 +99,11 @@ writing a new codec.
 **What actually happened at implementation time:** measured against `ArduinoJson` v7's real allocator
 (a custom `Allocator` tracking live bytes, since v7's `JsonDocument::memoryUsage()` always reports 0
 now), a JsonDocument shaped the way this design assumed — a few hundred short items — cost ~49 KB
-live, already uncomfortable next to the reassembly buffer resident alongside it. Worse, `kMaxListDocLen`
+live, already uncomfortable next to the reassembly buffer resident alongside it. That discomfort has
+since been measured directly rather than argued: the 2026-08-10 hardware run of the current
+(verbatim-bytes) build reported `Free: 52112 bytes, Total: 234676, MaxAlloc: 51188` on-device — the
+abandoned ~49 KB JsonDocument approach would have been perilously close to that `MaxAlloc` ceiling on
+this exact part, before even accounting for the pathological item counts below. Worse, `kMaxListDocLen`
 (16 KB) bounds transfer *bytes*, not item *count*: the wire format's per-item floor is 4 bytes (a
 2-byte id, 1 checked byte, 1 zero-length `textLen`), so a legally-sized push can carry over 4000
 near-empty items — built and measured that exact ~4092-item document at ~450 KB live in the same
