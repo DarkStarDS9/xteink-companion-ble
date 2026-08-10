@@ -15,6 +15,7 @@
 #include "CompanionBle.h"
 #include "CompanionPeerStore.h"
 #include "CompanionTestConsole.h"
+#include "CompanionTodoDocument.h"
 #include "CompanionUiDeclaration.h"
 #include "Epub/converters/ImageDecoderFactory.h"
 #include "MappedInputManager.h"
@@ -126,6 +127,15 @@ uint8_t g_pendingImageContentIdLen = 0;
 uint8_t g_pendingImagePushId = 0;
 volatile bool g_pendingImageReady = false;
 
+// A kFieldListDoc push landed and was stored to SD (companionble::
+// ListDocStoredCallback) -- which peer, so loop() can decide whether it's
+// worth a reload (only when that peer's document is the one currently on
+// Screen::List; see the drain site). No document content rides this hop --
+// it's already on SD, and re-reading it is a main-loop-task job per
+// docs/companion-todo-list-design.md §8.
+char g_pendingListDocPeerKey[companionpeer::kPeerKeyLen] = {0};
+volatile bool g_pendingListDocReady = false;
+
 // Runs on the NimBLE host task — hand the field to the batch model and let
 // CompanionModeActivity::loop() (main loop task) do the rest via poll().
 void onContentField(uint8_t field, const uint8_t* data, size_t len, bool final, companionble::FieldOutcome outcome,
@@ -171,6 +181,116 @@ void onImageStaged(const char* peerKey, const char* path, const uint8_t* content
   portEXIT_CRITICAL(&g_mux);
 }
 
+void onListDocStored(const char* peerKey) {
+  portENTER_CRITICAL(&g_mux);
+  snprintf(g_pendingListDocPeerKey, sizeof(g_pendingListDocPeerKey), "%s", peerKey ? peerKey : "");
+  g_pendingListDocReady = true;
+  portEXIT_CRITICAL(&g_mux);
+}
+
+// ---------------------------------------------------------------------------
+// ToDo List document walkers (Screen::List) -- both are thin, stateless-per-
+// call companiontodo::Visitor implementations that re-walk the whole stored
+// document every time they're used (see CompanionModeActivity::
+// reloadListView()'s doc comment for why that's the right cost model here).
+// Kept out of the class itself since a companiontodo::Visitor override set
+// is glue, not state worth exposing -- CompanionTodoNav.h is where the
+// actual cursor/paging logic lives and is unit tested.
+// ---------------------------------------------------------------------------
+
+// Pass 1: how many lists does this document have, and (only meaningful when
+// targetListIndex is in range) how many items does that one list hold. Two
+// numbers, no text -- cheap enough to throw away and redo if reloadListView()
+// discovers targetListIndex needs to be clamped after this returns.
+class ListCountingVisitor : public companiontodo::Visitor {
+ public:
+  explicit ListCountingVisitor(int targetListIndex) : targetListIndex_(targetListIndex) {}
+
+  void onListStart(uint16_t, const char*, uint8_t) override {
+    inTarget_ = (static_cast<int>(listIndex_) == targetListIndex_);
+    itemsInThisList_ = 0;
+  }
+  void onItem(uint16_t, bool, const char*, uint8_t) override {
+    if (inTarget_) itemsInThisList_++;
+  }
+  void onListEnd(uint16_t) override {
+    if (inTarget_) targetItemCount_ = itemsInThisList_;
+    listIndex_++;
+    inTarget_ = false;
+  }
+
+  uint16_t listCount() const { return listIndex_; }
+  uint16_t targetItemCount() const { return targetItemCount_; }
+
+ private:
+  int targetListIndex_;
+  uint16_t listIndex_ = 0;
+  bool inTarget_ = false;
+  uint16_t itemsInThisList_ = 0;
+  uint16_t targetItemCount_ = 0;
+};
+
+// Pass 2: the target list's title and every row (group header + item) that
+// falls in [windowStart, windowStart + capacity) of its flat item sequence.
+// A group's header is emitted once, right before the first in-window item
+// that belongs to it -- so a window that starts mid-group still shows that
+// group's label, and an empty label (the "ungrouped" bucket, design doc §2)
+// never emits a header row at all.
+class ListRowVisitor : public companiontodo::Visitor {
+ public:
+  ListRowVisitor(int targetListIndex, uint16_t windowStart, uint16_t capacity, std::string* titleOut,
+                 std::vector<CompanionListRow>* rowsOut)
+      : targetListIndex_(targetListIndex),
+        windowStart_(windowStart),
+        windowEnd_(static_cast<uint32_t>(windowStart) + capacity),
+        titleOut_(titleOut),
+        rowsOut_(rowsOut) {}
+
+  void onListStart(uint16_t, const char* title, uint8_t titleLen) override {
+    inTarget_ = (static_cast<int>(listIndex_) == targetListIndex_);
+    if (inTarget_) titleOut_->assign(title, titleLen);
+  }
+  void onGroupStart(uint16_t, const char* label, uint8_t labelLen) override {
+    if (!inTarget_) return;
+    groupLabel_.assign(label, labelLen);
+    groupHeaderEmitted_ = false;
+  }
+  void onItem(uint16_t, bool checked, const char* text, uint8_t textLen) override {
+    if (!inTarget_) return;
+    if (itemIndex_ >= windowStart_ && itemIndex_ < windowEnd_) {
+      if (!groupLabel_.empty() && !groupHeaderEmitted_) {
+        CompanionListRow header;
+        header.isHeader = true;
+        header.text = groupLabel_;
+        rowsOut_->push_back(std::move(header));
+        groupHeaderEmitted_ = true;
+      }
+      CompanionListRow row;
+      row.checked = checked;
+      row.itemFlatIndex = static_cast<int>(itemIndex_);
+      row.text.assign(text, textLen);
+      rowsOut_->push_back(std::move(row));
+    }
+    itemIndex_++;
+  }
+  void onListEnd(uint16_t) override {
+    listIndex_++;
+    inTarget_ = false;
+  }
+
+ private:
+  int targetListIndex_;
+  uint32_t windowStart_;
+  uint32_t windowEnd_;
+  std::string* titleOut_;
+  std::vector<CompanionListRow>* rowsOut_;
+  uint16_t listIndex_ = 0;
+  bool inTarget_ = false;
+  uint32_t itemIndex_ = 0;
+  std::string groupLabel_;
+  bool groupHeaderEmitted_ = false;
+};
+
 }  // namespace
 
 #ifdef COMPANION_TEST_CONSOLE
@@ -190,6 +310,11 @@ void CompanionModeActivity::onEnter() {
   pages.clear();
   galleryImages.clear();
   galleryIndex = 0;
+  listVisibleRows.clear();
+  listNav.reset();
+  listDocTitle.clear();
+  listPeerKey.clear();
+  listDocLoaded = false;
   clearUiDeclaration();
   cachedFontId = kCompanionFontId;
   computeViewport();
@@ -199,6 +324,7 @@ void CompanionModeActivity::onEnter() {
   companionble::setPairingRequestCallback(onPairingRequest);
   companionble::setForegroundChangeCallback(onForegroundChange);
   companionble::setImageStagedCallback(onImageStaged);
+  companionble::setListDocStoredCallback(onListDocStored);
 #ifdef COMPANION_TEST_CONSOLE
   // The console reports the screen without knowing what a screen is.
   g_screenNameActivity = this;
@@ -243,6 +369,7 @@ void CompanionModeActivity::onExit() {
   companionble::setPairingRequestCallback(nullptr);
   companionble::setForegroundChangeCallback(nullptr);
   companionble::setImageStagedCallback(nullptr);
+  companionble::setListDocStoredCallback(nullptr);
 #ifdef COMPANION_TEST_CONSOLE
   companiontest::setScreenNameProvider(nullptr);
   companiontest::setTagStateProvider(nullptr);
@@ -255,6 +382,7 @@ void CompanionModeActivity::onExit() {
   g_pendingForegroundReady = false;
   g_pendingPairingReady = false;
   g_pendingImageReady = false;
+  g_pendingListDocReady = false;
   g_batchModel.reset();
   portEXIT_CRITICAL(&g_mux);
 }
@@ -468,6 +596,23 @@ void CompanionModeActivity::computeViewport() {
   cachedTitleFontId = kCompanionTitleFontId;
 
   updateTitleLayout();
+
+  // ToDo List layout: one line for the current list's own title
+  // (cachedTitleFontId, bold) plus a gap, then as many rows as fit at
+  // kCompanionFontId. Recomputed here alongside linesPerPage above, for the
+  // same triggers (screen rotation, touch/no-touch margin change). This is
+  // an approximate row *capacity*, not an exact one -- a group header takes
+  // a row too, and listNav only ever counts *items* (see CompanionTodoNav.h),
+  // so a window that includes headers can render a row or two more than
+  // this many; renderList() just stops drawing once it runs out of vertical
+  // space rather than treating this as a hard cap.
+  constexpr int kListTitleBottomSpacing = 6;
+  listRowHeight = renderer.getLineHeight(cachedFontId);
+  const int listViewportHeight = renderer.getScreenHeight() - cachedOrientedMarginTop - cachedOrientedMarginBottom -
+                                 renderer.getLineHeight(cachedTitleFontId) - kListTitleBottomSpacing;
+  const int listRows = listRowHeight > 0 ? listViewportHeight / listRowHeight : 1;
+  listVisibleCapacity = static_cast<uint8_t>(std::max(1, listRows));
+  listNav.setVisibleCapacity(listVisibleCapacity);
 }
 
 // Re-wraps `title` into `titleLines` (see kMaxTitleLines) and, since the title
@@ -679,9 +824,11 @@ void CompanionModeActivity::applyForegroundChange() {
 
   if (foregroundPeerKey.empty()) {
     // Nobody holds the screen. Content stays up — it is the idle timeout, not
-    // the handover, that clears it.
+    // the handover, that clears it. Screen::List joins Image here for the
+    // same reason: a LIST peer's document is exactly as much "content" as a
+    // pushed photo, and a dropped link mid-shopping-trip must not blank it.
     idleSinceMs = millis();
-    if (!haveContent && screen != Screen::Image) chooseIdleScreen();
+    if (!haveContent && screen != Screen::Image && screen != Screen::List) chooseIdleScreen();
   } else {
     // A different app took the screen: clear whatever the previous one left,
     // since the device retains no content for a background session. That
@@ -700,8 +847,31 @@ void CompanionModeActivity::applyForegroundChange() {
     browsingPeerKey.clear();
     galleryPickerBrowsing = false;
     foregroundPushedImageThisSession = false;
+    listVisibleRows.clear();
+    listNav.reset();
+    listDocTitle.clear();
+    listPeerKey.clear();
+    listDocLoaded = false;
     updateTitleLayout();
-    screen = Screen::Text;
+
+    // A LIST peer lands on Screen::List directly rather than the
+    // unconditional Screen::Text below -- see docs/companion-declared-shape-
+    // design.md §2-§3: its document may already be on SD from a previous
+    // session, and unlike Text/Image, List holds a cursor/window that a
+    // reactive "whatever pushed last" model can't safely arbitrate. This SD
+    // read is fine here (once per foreground change, on the main loop task —
+    // see readDeclaredShape()'s own doc comment); it must never happen on
+    // the NimBLE host task or per push. A peer with no declaration, or one
+    // that fails to parse, falls back to Text -- the pre-existing, safe
+    // default -- exactly as every other reader of this SD state already
+    // treats "unreadable" as "none".
+    companionble::ContentShape shape = companionble::ContentShape::Text;
+    if (companionpeer::readDeclaredShape(foregroundPeerKey.c_str(), &shape) &&
+        shape == companionble::ContentShape::List) {
+      enterListDocument(foregroundPeerKey, Screen::Text);
+    } else {
+      screen = Screen::Text;
+    }
   }
   requestUpdate();
 }
@@ -830,6 +1000,145 @@ bool CompanionModeActivity::handleGalleryNav() {
   if (isGalleryClaimable(routingFor(companionble::ButtonId::Down)) &&
       buttonWasPressed(MappedInputManager::Button::Down, companionble::ButtonId::Down)) {
     showGalleryImage(galleryIndex + 1 >= galleryImages.size() ? 0 : galleryIndex + 1);
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// ToDo List (Screen::List) -- docs/companion-todo-list-design.md §5.
+// ---------------------------------------------------------------------------
+
+// See the header's doc comment. Caller must already hold a RenderLock (or be
+// somewhere render() cannot run concurrently, e.g. onEnter()) -- this only
+// mutates state and sets `screen`, so it composes inside a caller's existing
+// lock rather than nesting its own (RenderLock.h: the underlying semaphore
+// is not recursive). applyForegroundChange() already holds one for its whole
+// body; the picker entry point added in this feature's second commit takes
+// its own around this call, mirroring selectGalleryPickerPeer().
+bool CompanionModeActivity::enterListDocument(const std::string& peerKey, Screen returnTo) {
+  listPeerKey = peerKey;
+  listReturnScreen = returnTo;
+  listNav.reset();
+  reloadListView();
+  screen = Screen::List;
+  return listDocLoaded;
+}
+
+// See the header's doc comment on `recountTotals`. Three shapes of walk,
+// cheapest first:
+//   - listPeerKey empty: nothing to walk at all.
+//   - !recountTotals: exactly one companionpeer::loadListDocument() pass,
+//     windowed against listNav's already-known counts (the Up/Down case).
+//   - recountTotals: one counting pass to learn listCount and (usually) the
+//     current list's itemCount, PLUS a second counting pass in the one case
+//     where the first pass targeted a list index that turned out to be
+//     stale (the document shrank under a listIndex a caller hadn't yet
+//     re-validated -- see ListCountingVisitor's doc comment), PLUS the
+//     windowed pass. Each pass is a full SD open + JSON parse
+//     (companionpeer::loadListDocument()'s own cost note), so this is
+//     explicitly NOT something to call from render() -- see this function's
+//     every call site, all of which are nav presses, a fresh document
+//     landing, or first entry.
+void CompanionModeActivity::reloadListView(bool recountTotals) {
+  listDocLoaded = false;
+  listDocTitle.clear();
+  listVisibleRows.clear();
+
+  if (listPeerKey.empty()) {
+    listNav.setListCount(0);
+    return;
+  }
+
+  if (recountTotals) {
+    const int originalTarget = static_cast<int>(listNav.listIndex());
+    ListCountingVisitor counting(originalTarget);
+    if (!companionpeer::loadListDocument(listPeerKey.c_str(), counting) || counting.listCount() == 0) {
+      listNav.setListCount(0);
+      return;
+    }
+    listNav.setListCount(counting.listCount());  // may clamp listIndex()
+
+    uint16_t itemCount = counting.targetItemCount();
+    if (static_cast<int>(listNav.listIndex()) != originalTarget) {
+      // The document has fewer lists than listIndex() assumed (e.g. the app
+      // re-pushed a shorter document while this list was on screen) --
+      // setListCount() just clamped it, so the count above targeted a list
+      // that is no longer at that position. Re-count against the clamped
+      // index rather than trust a number that describes the wrong list.
+      ListCountingVisitor recount(static_cast<int>(listNav.listIndex()));
+      companionpeer::loadListDocument(listPeerKey.c_str(), recount);
+      itemCount = recount.targetItemCount();
+    }
+    listNav.setCurrentList(itemCount);  // clamps cursor()/windowStart()
+  }
+
+  ListRowVisitor rows(static_cast<int>(listNav.listIndex()), listNav.windowStart(), listNav.visibleCapacity(),
+                      &listDocTitle, &listVisibleRows);
+  if (companionpeer::loadListDocument(listPeerKey.c_str(), rows)) listDocLoaded = true;
+}
+
+bool CompanionModeActivity::handleListNav() {
+  if (screen != Screen::List) return false;
+
+  // Unlike handleGalleryNav() above (which only takes a button the
+  // foreground peer's own map left unclaimed -- see that function's comment
+  // and docs/companion-multi-app-design.md:96-106), this claims
+  // Up/Down/Left/Right/Confirm unconditionally, without consulting
+  // routingFor() at all. That is deliberately NOT the same rule, and it is
+  // safe here specifically because a LIST peer's shape is declared and
+  // enforced before this screen is ever reached
+  // (docs/companion-declared-shape-design.md §2-§3): the device already
+  // knows, at ACQUIRE time, that this peer's button map -- built for
+  // whichever shape it *isn't* -- must not be consulted for navigation on
+  // its own list. The gallery's "only take what's unclaimed" trick exists
+  // precisely because Image has no such declared exclusivity; List doesn't
+  // need that trick because the exclusivity is already structural. The
+  // offline picker entry point (this feature's second commit) has no live
+  // peer or button map at all, so the question doesn't even arise there.
+  if (buttonWasPressed(MappedInputManager::Button::Back, companionble::ButtonId::Back)) {
+    RenderLock lock;
+    screen = listReturnScreen;
+    requestUpdate();
+    return true;
+  }
+  if (buttonWasPressed(MappedInputManager::Button::Confirm, companionble::ButtonId::Confirm)) {
+    // Phase A is read-only -- no toggling (root CLAUDE.md's scope for this
+    // task). Consuming the press here rather than falling through anywhere
+    // else keeps Phase B's eventual check/uncheck an additive change to this
+    // one branch, not a second button-wiring site.
+    return true;
+  }
+  if (buttonWasPressed(MappedInputManager::Button::Up, companionble::ButtonId::Up)) {
+    if (listNav.moveUp()) {
+      RenderLock lock;
+      reloadListView(/*recountTotals=*/false);
+      requestUpdate();
+    }
+    return true;
+  }
+  if (buttonWasPressed(MappedInputManager::Button::Down, companionble::ButtonId::Down)) {
+    if (listNav.moveDown()) {
+      RenderLock lock;
+      reloadListView(/*recountTotals=*/false);
+      requestUpdate();
+    }
+    return true;
+  }
+  if (buttonWasPressed(MappedInputManager::Button::Left, companionble::ButtonId::Left)) {
+    if (listNav.switchListLeft()) {
+      RenderLock lock;
+      reloadListView();
+      requestUpdate();
+    }
+    return true;
+  }
+  if (buttonWasPressed(MappedInputManager::Button::Right, companionble::ButtonId::Right)) {
+    if (listNav.switchListRight()) {
+      RenderLock lock;
+      reloadListView();
+      requestUpdate();
+    }
     return true;
   }
   return false;
@@ -1035,6 +1344,7 @@ void CompanionModeActivity::loop() {
   bool gotForeground = false;
   bool gotPairing = false;
   bool gotImage = false;
+  bool gotListDoc = false;
   std::string newTitle;
   std::string newBody;
   uint8_t newTagId = 0;
@@ -1051,6 +1361,7 @@ void CompanionModeActivity::loop() {
   uint8_t newImageContentId[sizeof(g_pendingImageContentId)] = {0};
   uint8_t newImageContentIdLen = 0;
   uint8_t newImagePushId = 0;
+  char newListDocPeerKey[sizeof(g_pendingListDocPeerKey)] = {0};
 
   portENTER_CRITICAL(&g_mux);
   const CompanionBatchModel::PollResult batchResult = g_batchModel.poll(millis());
@@ -1122,6 +1433,11 @@ void CompanionModeActivity::loop() {
     g_pendingImageReady = false;
     gotImage = true;
   }
+  if (g_pendingListDocReady) {
+    memcpy(newListDocPeerKey, g_pendingListDocPeerKey, sizeof(newListDocPeerKey));
+    g_pendingListDocReady = false;
+    gotListDoc = true;
+  }
   portEXIT_CRITICAL(&g_mux);
 
   if (poisoned) {
@@ -1176,6 +1492,19 @@ void CompanionModeActivity::loop() {
 
   if (gotImage) {
     handlePendingImage(newImagePath, newImagePeerKey, newImageContentId, newImageContentIdLen, newImagePushId);
+  }
+
+  if (gotListDoc && screen == Screen::List && listPeerKey == newListDocPeerKey) {
+    // The peer whose document is currently on screen just pushed a new one
+    // (docs/companion-todo-list-design.md §6: always a whole-document
+    // replace) -- re-walk it so the push actually appears, same "learn about
+    // it, don't carry the payload across" discipline as every other
+    // host-task -> main-loop handoff here. A push from any OTHER peer, or
+    // one that lands while this peer is showing some other screen, is
+    // silently ignored: there is nothing on screen for it to invalidate.
+    RenderLock lock;
+    reloadListView();
+    requestUpdate();
   }
 
   if (commit && (gotTitle || gotBody)) {
@@ -1285,6 +1614,15 @@ void CompanionModeActivity::loop() {
   // with no foreground peer's button map to defer to, so this is tried
   // regardless of whether foregroundPeerKey is empty.
   if (handlePickerInput()) return;
+
+  // Screen::List claims Up/Down/Left/Right/Confirm/Back unconditionally --
+  // see handleListNav()'s own comment for why that's safe specifically for
+  // this screen. Tried here, before the foreground button-map dispatch
+  // below, for the same "no live session required" reasoning as
+  // handleGalleryNav()/handlePickerInput() above: the offline icon-grid
+  // picker entry point (this feature's second commit) reaches Screen::List
+  // with no foreground peer at all.
+  if (handleListNav()) return;
 
   // Deliberately NOT gated on a live foreground session, for the same reason
   // handleGalleryNav() above isn't: a dropped link does not take the article off
@@ -1421,6 +1759,8 @@ const char* CompanionModeActivity::screenName() const {
       return haveContent ? "text" : "waiting_app";
     case Screen::Image:
       return "image";
+    case Screen::List:
+      return "list";
     case Screen::Message:
       return "message";
   }
@@ -1516,6 +1856,9 @@ void CompanionModeActivity::render(RenderLock&&) {
       break;
     case Screen::Image:
       renderImage();
+      break;
+    case Screen::List:
+      renderList();
       break;
     case Screen::Text:
       if (haveContent) {
@@ -1982,6 +2325,93 @@ void CompanionModeActivity::renderTags(int rightEdgeX, int centerY) const {
     renderer.drawText(UI_10_FONT_ID, x + kTagChipPadX, y + kTagChipPadY, tag.label, !filled);
     x -= kTagChipGap;
   }
+}
+
+// Screen::List, Phase A: the current list's title, its groups (an empty
+// label is the "ungrouped" bucket, design doc §2 -- no heading drawn for
+// it), and its items with a checkbox glyph reflecting `checked` plus a
+// cursor marker on the item under listNav.cursor(). No toggling -- Phase A
+// is read-only (root CLAUDE.md's scope for this task); Confirm is
+// deliberately a no-op (see handleListNav()).
+void CompanionModeActivity::renderList() {
+  const int titleLineHeight = renderer.getLineHeight(cachedTitleFontId);
+  const int titleY = cachedOrientedMarginTop;
+
+  if (!listDocLoaded || listNav.listCount() == 0) {
+    // A LIST peer with nothing pushed yet, or a document that failed to
+    // parse -- same "waiting for content" idea as Screen::Text's
+    // haveContent==false branch, just phrased for a list.
+    renderer.drawCenteredText(cachedTitleFontId, renderer.getScreenHeight() / 2, tr(STR_COMPANION_LIST_EMPTY), true,
+                              EpdFontFamily::BOLD);
+    renderer.displayBuffer();
+    return;
+  }
+
+  // Title, with an "index/count" indicator when Left/Right actually does
+  // something -- same idiom as renderPage()'s page-count indicator.
+  renderer.drawText(cachedTitleFontId, cachedOrientedMarginLeft, titleY, listDocTitle.c_str(), true,
+                    EpdFontFamily::BOLD);
+  if (listNav.listCount() > 1) {
+    char counter[16];
+    snprintf(counter, sizeof(counter), "%u/%u", static_cast<unsigned>(listNav.listIndex()) + 1,
+             static_cast<unsigned>(listNav.listCount()));
+    const int counterWidth = renderer.getTextWidth(SMALL_FONT_ID, counter);
+    renderer.drawText(SMALL_FONT_ID, cachedOrientedMarginLeft + viewportWidth - counterWidth, titleY, counter, true);
+  }
+
+  constexpr int kListTitleBottomSpacing = 6;
+  constexpr int kCheckboxSize = 14;
+  constexpr int kCheckboxGap = 8;
+  const int itemIndent = kCheckboxSize + kCheckboxGap;
+  const int bottomLimit = renderer.getScreenHeight() - cachedOrientedMarginBottom;
+  const int rowHeight = listRowHeight > 0 ? listRowHeight : renderer.getLineHeight(cachedFontId);
+
+  int y = titleY + titleLineHeight + kListTitleBottomSpacing;
+
+  if (listVisibleRows.empty()) {
+    // listNav.empty() true: the current list has zero items (a legal, if
+    // unusual, pushed list -- design doc §2 places no floor on item count).
+    renderer.drawText(cachedFontId, cachedOrientedMarginLeft, y, tr(STR_COMPANION_LIST_NO_ITEMS));
+  }
+
+  for (const auto& row : listVisibleRows) {
+    if (y + rowHeight > bottomLimit) break;  // ran out of vertical room -- see computeViewport()'s cap note
+
+    if (row.isHeader) {
+      renderer.drawText(cachedFontId, cachedOrientedMarginLeft, y, row.text.c_str(), true, EpdFontFamily::BOLD);
+      y += rowHeight;
+      continue;
+    }
+
+    const bool isCursor = row.itemFlatIndex == static_cast<int>(listNav.cursor());
+    if (isCursor) {
+      // Thick outline around the whole row -- same cursor idiom as
+      // renderGalleryPicker()'s tile-selection marker.
+      renderer.drawRect(cachedOrientedMarginLeft - 3, y - 2, viewportWidth + 6, rowHeight, 2, true);
+    }
+
+    const int boxY = y + (rowHeight - kCheckboxSize) / 2;
+    renderer.drawRect(cachedOrientedMarginLeft, boxY, kCheckboxSize, kCheckboxSize, true);
+    if (row.checked) {
+      renderer.fillRect(cachedOrientedMarginLeft + 3, boxY + 3, kCheckboxSize - 6, kCheckboxSize - 6, true);
+    }
+    renderer.drawText(cachedFontId, cachedOrientedMarginLeft + itemIndent, y, row.text.c_str(), true);
+    y += rowHeight;
+  }
+
+  if (!mappedInput.hasTouch()) {
+    // No app button map is consulted on this screen (see handleListNav()'s
+    // comment), so these hints are fixed strings, not labelFor() -- there is
+    // no declared label to show. Left/Right hidden entirely when there is
+    // only one list to switch between, same "hide, don't grey out"
+    // convention renderPage() uses for page-turn buttons at either end.
+    const char* leftLabel = listNav.listCount() > 1 ? tr(STR_COMPANION_LIST_PREV) : "";
+    const char* rightLabel = listNav.listCount() > 1 ? tr(STR_COMPANION_LIST_NEXT) : "";
+    const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", leftLabel, rightLabel);
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  }
+
+  renderer.displayBuffer();
 }
 
 void CompanionModeActivity::renderPage() {

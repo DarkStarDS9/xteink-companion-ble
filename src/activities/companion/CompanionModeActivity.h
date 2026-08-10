@@ -6,7 +6,25 @@
 #include "CompanionBle.h"
 #include "CompanionPeerStore.h"
 #include "CompanionTestConsole.h"
+#include "CompanionTodoNav.h"
 #include "activities/Activity.h"
+
+// One row of the current ToDo List's visible window -- either a group header
+// (drawn as a label, never selectable) or an item (checkbox + text,
+// selectable). File-scope rather than nested in CompanionModeActivity so the
+// .cpp's row-window-walking companiontodo::Visitor (private to that file)
+// can build a vector of these without needing class access. See
+// CompanionModeActivity::listVisibleRows's doc comment for the full picture.
+struct CompanionListRow {
+  bool isHeader = false;
+  bool checked = false;
+  // -1 for a header row; this item's 0-based position among its list's
+  // items (ignoring group boundaries) otherwise -- what
+  // CompanionModeActivity::listNav's cursor() indexes, so rendering compares
+  // the two to place the cursor marker.
+  int itemFlatIndex = -1;
+  std::string text;
+};
 
 // Companion Mode: X3 as a BLE GATT peripheral, rendering whatever the
 // foreground phone app pushes — title/body text or a full-screen image — and
@@ -31,6 +49,7 @@ class CompanionModeActivity final : public Activity {
     Pairing,        // "Pair with <app>?" prompt, awaiting CONFIRM/BACK
     Text,           // title/body from the foreground app
     Image,          // a pushed photo, full screen
+    List,           // a ToDo List document (kFieldListDoc) -- see docs/companion-todo-list-design.md
     Message,        // a transient status line, auto-reverting after a few seconds
   };
 
@@ -154,6 +173,29 @@ class CompanionModeActivity final : public Activity {
   // normal hold-last-content behaviour — see loop()'s disconnect handling.
   bool foregroundPushedImageThisSession = false;
 
+  // ---------------------------------------------------------------------
+  // ToDo List (Screen::List) -- docs/companion-todo-list-design.md §5, §8.
+  // ---------------------------------------------------------------------
+
+  // Rebuilt by reloadListView() from a single companionpeer::
+  // loadListDocument() walk every time the view changes (nav press, new
+  // document, foreground/peer change) -- never per render(), per that
+  // function's own cost note. Bounded by listNav.visibleCapacity() (a
+  // handful of rows, sized to the viewport) -- never the whole document. See
+  // CompanionTodoNav.h for the pure cursor/paging/list-switching state
+  // machine this is rendered against; that class is host-unit-tested
+  // (test/companion_todo_nav/), this vector and the walk that fills it are
+  // not (no host seam -- see this feature's commit message).
+  std::vector<CompanionListRow> listVisibleRows;
+  companiontodo::Nav listNav;
+  std::string listDocTitle;     // the current list's title
+  std::string listPeerKey;      // whose document is loaded -- see enterListDocument()
+  bool listDocLoaded = false;   // false: peer has no (parseable) document at all
+  // Where Back returns to -- IconGrid for the picker entry point (no live
+  // session), Text for a live LIST peer that pushed a document while
+  // foreground (applyForegroundChange() landed here directly).
+  Screen listReturnScreen = Screen::IconGrid;
+
   std::string transientMessage;
   unsigned long transientMessageUntilMs = 0;
   Screen transientMessageReturnScreen = Screen::IconGrid;
@@ -178,6 +220,8 @@ class CompanionModeActivity final : public Activity {
   int cachedOrientedMarginBottom = 0;
   int cachedOrientedMarginLeft = 0;
   int cachedTitleBlockHeight = 0;  // vertical space reserved above the body for the bold title line
+  int listRowHeight = 0;           // pixel height of one ToDo List row, computed alongside the above
+  uint8_t listVisibleCapacity = 1; // how many item rows fit below the list title -- feeds listNav
 
   // Set whenever no app holds the screen; 0 while one does. loop() deep-sleeps
   // once this has been non-zero for longer than kWaitingIdleSleepMs, so an
@@ -237,6 +281,36 @@ class CompanionModeActivity final : public Activity {
   void enterGalleryPicker();
   void selectGalleryPickerPeer();
   bool handlePickerInput();
+  // Enters Screen::List over `peerKey`'s stored document -- the one entry
+  // point both a live LIST peer's applyForegroundChange() and the offline
+  // icon-grid picker (enterListPicker()/selectListPickerPeer(), see the
+  // second commit of this feature) go through. `returnTo` is where Back
+  // takes the user (see listReturnScreen's doc comment). Shows a transient
+  // "nothing yet" message and returns false, without switching screens, if
+  // the peer has no (parseable) document -- fine to call speculatively.
+  bool enterListDocument(const std::string& peerKey, Screen returnTo);
+  // Re-walks the current peer's stored document (companionpeer::
+  // loadListDocument(), a full SD open + JSON parse -- see that function's
+  // doc comment) to refresh listNav's counts and listVisibleRows for
+  // whatever list/window listNav is currently pointed at. Called once per
+  // view change -- never from render() itself. `recountTotals` controls how
+  // many passes that costs: Up/Down inside one list can never change that
+  // list's own item count or the document's list count, so
+  // handleListNav()'s Up/Down branches pass false and this does one
+  // windowed pass; switching lists, a fresh document landing, and first
+  // entry all pass true (the default) because a list's item count -- or the
+  // whole document -- may have changed since listNav last knew it, costing
+  // up to two extra passes to re-derive that safely (see the .cpp comment).
+  //
+  // See this feature's commit message for why the extracted seam stops at
+  // CompanionTodoNav's pure cursor arithmetic rather than reaching this
+  // function too: the row-window walk depends on the on-device renderer's
+  // string/text handling and isn't cheaply host-testable.
+  void reloadListView(bool recountTotals = true);
+  // Up/Down/Left/Right/Confirm/Back on Screen::List. Unlike
+  // handleGalleryNav(), claims every one of those buttons unconditionally --
+  // see this function's .cpp comment for why that's safe here specifically.
+  bool handleListNav();
   void computeViewport();
   void updateTitleLayout();
   std::vector<std::string> wrapTitleToLines(const std::string& text) const;
@@ -255,6 +329,7 @@ class CompanionModeActivity final : public Activity {
   void renderStartFailed();
   void renderPage();
   void renderImage();
+  void renderList();
   // Sends RENDER_STATUS only if a push (image or content) is still awaiting
   // its answer, and consumes that expectation. Every notify reached from
   // renderImage() or the Screen::Text branch of render() must go through here;

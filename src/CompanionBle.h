@@ -528,4 +528,17 @@ using ImageStagedCallback = void (*)(const char* peerKey, const char* path, cons
                                      size_t contentIdLen, uint8_t pushId);
 void setImageStagedCallback(ImageStagedCallback cb);
 
+// A kFieldListDoc push was validated and written straight through to
+// `peerKey`'s lists.json (companionpeer::storeListDocument() returned
+// Stored), on this task, per that field's END handling in CompanionBle.cpp.
+// Unlike ImageStagedCallback there is nothing left to decode -- the document
+// is already on SD -- so this callback carries no payload beyond which peer
+// changed. The activity's job is only to notice, on the main loop task, that
+// it should re-walk that peer's document if it is the one currently showing
+// on Screen::List (see CompanionModeActivity.cpp's g_pendingListDocReady
+// flag, same task-boundary discipline as every other callback here: this
+// runs on the NimBLE host task and must stay cheap -- no SD reads, no JSON).
+using ListDocStoredCallback = void (*)(const char* peerKey);
+void setListDocStoredCallback(ListDocStoredCallback cb);
+
 }  // namespace companionble

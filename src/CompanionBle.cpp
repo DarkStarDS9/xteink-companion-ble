@@ -161,6 +161,7 @@ StatusCallback g_statusCb = nullptr;
 PairingRequestCallback g_pairingCb = nullptr;
 ForegroundChangeCallback g_foregroundCb = nullptr;
 ImageStagedCallback g_imageStagedCb = nullptr;
+ListDocStoredCallback g_listDocStoredCb = nullptr;
 
 // ---------------------------------------------------------------------------
 // Connection interval / peripheral latency
@@ -1537,6 +1538,11 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
             switch (companionpeer::storeListDocument(session->peerKey, g_activeBuf.get(), g_activeWritten)) {
               case companionpeer::ListStoreResult::Stored:
                 notifyRenderStatus(RenderResult::Displayed, pushId);
+                // Tell the activity a document changed under it -- cheap
+                // (a callback, no SD/JSON on this task); the activity itself
+                // decides on the main loop task whether this peer's document
+                // is the one currently on Screen::List and worth re-walking.
+                if (g_listDocStoredCb) g_listDocStoredCb(session->peerKey);
                 break;
               case companionpeer::ListStoreResult::RejectedFormat:
                 notifyRenderStatus(RenderResult::DecodeFailed, pushId);
@@ -2076,5 +2082,6 @@ void setStatusCallback(StatusCallback cb) { g_statusCb = cb; }
 void setPairingRequestCallback(PairingRequestCallback cb) { g_pairingCb = cb; }
 void setForegroundChangeCallback(ForegroundChangeCallback cb) { g_foregroundCb = cb; }
 void setImageStagedCallback(ImageStagedCallback cb) { g_imageStagedCb = cb; }
+void setListDocStoredCallback(ListDocStoredCallback cb) { g_listDocStoredCb = cb; }
 
 }  // namespace companionble
