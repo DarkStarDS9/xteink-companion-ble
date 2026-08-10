@@ -1,6 +1,7 @@
 #include "CompanionPeerStore.h"
 
 #include "CompanionBle.h"
+#include "CompanionListJsonWriter.h"
 #include "CompanionUiDeclaration.h"
 
 #include <ArduinoJson.h>
@@ -159,110 +160,23 @@ bool writeWholeFile(const std::string& path, const uint8_t* data, size_t len) {
 // temp-file-then-rename atomicity storeListDocument() needs "for free" in
 // the same move, per docs/companion-declared-shape-design.md-style
 // measure-before-deciding rather than assuming the round-number cap alone
-// bounds this.
-class JsonListWriter : public companiontodo::Visitor {
+// bounds this. The read-back side of the same DoS -- a legally-sized push
+// with thousands of near-empty items -- is bounded separately, at ingest,
+// by companionble::kMaxListItems; see storeListDocument()'s own comment and
+// loadListDocument()'s below.
+//
+// The buffering/escaping logic itself lives in companionpeer::JsonListWriter
+// (CompanionListJsonWriter.h/.cpp), extracted out of this file so it has a
+// host gtest suite -- this file cannot be host-built at all (ArduinoJson,
+// HalStorage). This adapter is the one line of glue that lets that
+// host-testable class write to a real HalFile.
+class HalFileSink : public JsonWriteSink {
  public:
-  explicit JsonListWriter(HalFile& file) : file_(file) {}
-
-  // False if any underlying write failed. Checked by the caller instead of
-  // trusting parseDocument()'s own Ok/Malformed verdict alone -- a full SD
-  // card can fail a write in the middle of an otherwise well-formed
-  // document, and that must not look like Stored either.
-  bool ok() const { return ok_; }
-
-  void onDocument(uint32_t revision) override {
-    writeRaw("{\"revision\":");
-    writeUint(revision);
-    writeRaw(",\"lists\":[");
-  }
-  void onListStart(uint16_t listId, const char* title, uint8_t titleLen) override {
-    if (listIndex_++ > 0) writeRaw(",");
-    writeRaw("{\"listId\":");
-    writeUint(listId);
-    writeRaw(",\"title\":");
-    writeJsonString(title, titleLen);
-    writeRaw(",\"groups\":[");
-    groupIndex_ = 0;
-  }
-  void onGroupStart(uint16_t groupId, const char* label, uint8_t labelLen) override {
-    if (groupIndex_++ > 0) writeRaw(",");
-    writeRaw("{\"groupId\":");
-    writeUint(groupId);
-    writeRaw(",\"label\":");
-    writeJsonString(label, labelLen);
-    writeRaw(",\"items\":[");
-    itemIndex_ = 0;
-  }
-  void onItem(uint16_t itemId, bool checked, const char* text, uint8_t textLen) override {
-    if (itemIndex_++ > 0) writeRaw(",");
-    writeRaw("{\"itemId\":");
-    writeUint(itemId);
-    writeRaw(",\"text\":");
-    writeJsonString(text, textLen);
-    writeRaw(checked ? ",\"checked\":true}" : ",\"checked\":false}");
-  }
-  void onGroupEnd(uint16_t /*groupId*/) override { writeRaw("]}"); }
-  void onListEnd(uint16_t /*listId*/) override { writeRaw("]}"); }
-
-  // Closes the document. Always safe to call, even on a document that never
-  // got past onDocument() (or was never called at all) -- the caller
-  // discards this file entirely unless parseDocument() returned Ok, so an
-  // unbalanced close on a document that failed early is harmless.
-  void finish() { writeRaw("]}"); }
+  explicit HalFileSink(HalFile& file) : file_(file) {}
+  bool write(const uint8_t* data, size_t len) override { return file_.write(data, len) == len; }
 
  private:
-  void writeRaw(const char* s) {
-    const size_t len = strlen(s);
-    if (file_.write(reinterpret_cast<const uint8_t*>(s), len) != len) ok_ = false;
-  }
-  void writeUint(uint32_t v) {
-    char buf[11];
-    snprintf(buf, sizeof(buf), "%u", static_cast<unsigned>(v));
-    writeRaw(buf);
-  }
-  // Wire text is arbitrary bytes the phone chose (parseDocument() validates
-  // structure, never UTF-8 well-formedness), so only what JSON itself
-  // requires is escaped: quote, backslash, and control characters. Anything
-  // else -- including multi-byte UTF-8 sequences -- passes through verbatim.
-  void writeJsonString(const char* s, uint8_t len) {
-    writeRaw("\"");
-    for (uint8_t i = 0; i < len; ++i) {
-      const uint8_t c = static_cast<uint8_t>(s[i]);
-      switch (c) {
-        case '"':
-          writeRaw("\\\"");
-          break;
-        case '\\':
-          writeRaw("\\\\");
-          break;
-        case '\n':
-          writeRaw("\\n");
-          break;
-        case '\r':
-          writeRaw("\\r");
-          break;
-        case '\t':
-          writeRaw("\\t");
-          break;
-        default:
-          if (c < 0x20) {
-            char buf[7];
-            snprintf(buf, sizeof(buf), "\\u%04x", c);
-            writeRaw(buf);
-          } else {
-            const uint8_t one[1] = {c};
-            if (file_.write(one, 1) != 1) ok_ = false;
-          }
-      }
-    }
-    writeRaw("\"");
-  }
-
   HalFile& file_;
-  bool ok_ = true;
-  size_t listIndex_ = 0;
-  size_t groupIndex_ = 0;
-  size_t itemIndex_ = 0;
 };
 
 // The UI declaration's byte layout, its validation rules and its host gtest
@@ -539,8 +453,12 @@ ListStoreResult storeListDocument(const char* peerKey, const uint8_t* data, size
   HalFile file;
   if (!Storage.openFileForWrite("CPEER", tmpPath, file)) return ListStoreResult::RejectedStorage;
 
-  JsonListWriter writer(file);
+  HalFileSink sink(file);
+  JsonListWriter writer(sink);
   const companiontodo::ParseResult parseResult = companiontodo::parseDocument(data, len, writer);
+  // finish() flushes any bytes still sitting in the writer's internal
+  // buffer -- ok() below must be read AFTER this call, or a failure in that
+  // final flush would be missed and a truncated document could look Stored.
   writer.finish();
   file.flush();
   const bool writeOk = writer.ok();
@@ -556,6 +474,17 @@ ListStoreResult storeListDocument(const char* peerKey, const uint8_t* data, size
                                                           : ListStoreResult::RejectedStorage;
   }
 
+  if (writer.overCap()) {
+    // Structurally valid and fully written to the temp file, but over
+    // companionble::kMaxListItems items -- refused rather than stored, same
+    // as an over-cap-bytes push, because loadListDocument() reads this back
+    // into a live ArduinoJson JsonDocument that is NOT streaming; an
+    // uncapped item count there is the unbounded-RAM DoS kMaxListItems
+    // exists to close. See that constant's comment in CompanionBle.h.
+    Storage.remove(tmpPath.c_str());
+    return ListStoreResult::RejectedSize;
+  }
+
   // Same "clear the destination first" discipline as commitImage() --
   // renaming over an existing path is not guaranteed on every filesystem.
   const std::string destPath = listsPath(peerKey);
@@ -568,6 +497,15 @@ ListStoreResult storeListDocument(const char* peerKey, const uint8_t* data, size
   return ListStoreResult::Stored;
 }
 
+// Safe to materialize the whole file into a live JsonDocument here (unlike
+// storeListDocument()'s streaming write) ONLY because storeListDocument() is
+// the sole writer of lists.json and refuses (ListStoreResult::RejectedSize)
+// any document over companionble::kMaxListItems items before it is ever
+// renamed into place -- see that constant's comment in CompanionBle.h and
+// the RejectedSize branch above. If that ingest-time cap is ever removed or
+// bypassed, this read-back becomes the same unbounded-RAM DoS the streaming
+// writer was built to avoid on the write side (up to ~450 KB live for a
+// legal 16 KB push, measured -- multiples of this device's RAM).
 bool loadListDocument(const char* peerKey, companiontodo::Visitor& visitor) {
   JsonDocument doc;
   if (!PersistableStoreBase::readDocFromFile(listsPath(peerKey).c_str(), doc)) return false;

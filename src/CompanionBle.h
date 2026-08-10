@@ -103,6 +103,28 @@ inline constexpr size_t kMaxContentIdLen = 32;
 // never resident, is a rounding error against that.
 inline constexpr size_t kMaxListDocLen = 16 * 1024;
 
+// Max total items accepted across every list/group in one kFieldListDoc
+// push. kMaxListDocLen bounds *bytes*, not item *count*: the wire format's
+// minimum per-item cost is 4 bytes (a 2-byte id, 1 checked byte, 1
+// zero-length textLen), so a legally-sized 16 KB push can carry over 4000
+// near-empty items -- and CompanionPeerStore's loadListDocument() reads the
+// stored document back into an ArduinoJson JsonDocument, which the previous
+// agent measured at ~450 KB live for that exact ~4092-item document (versus
+// ~49 KB for a design-doc-realistic ~400-item one). That is multiples of
+// this device's entire ~380 KB RAM, reachable by a push that breaks no rule
+// the write path already enforces -- the streaming writer bounds the write
+// path's own RAM, but the read path re-materializes the whole thing, so the
+// document must be bounded at ingest to bound both.
+//
+// 512 is far beyond any real shopping/todo list (the design doc's stated
+// primary use case, docs/companion-todo-list-design.md §1) while keeping the
+// read-back JsonDocument in the same ballpark as the ~49 KB measured for
+// ~400 items, not the ~450 KB the degenerate case costs. Enforced during
+// ingest in storeListDocument() (CompanionPeerStore.cpp), not in
+// companiontodo::parseDocument() itself -- that parser deliberately enforces
+// no cap of its own; see CompanionTodoDocument.h's header comment.
+inline constexpr size_t kMaxListItems = 512;
+
 // Concurrent sessions on one link. Four apps on one phone driving one screen is
 // already generous; the cap exists because the session table is fixed-size, and
 // only the foreground session has a reassembly buffer, so this number does not

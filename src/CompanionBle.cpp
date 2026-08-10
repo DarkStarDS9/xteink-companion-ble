@@ -1544,6 +1544,13 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
               case companionpeer::ListStoreResult::RejectedStorage:
                 notifyRenderStatus(RenderResult::StorageFailed, pushId);
                 break;
+              // Under kMaxListDocLen bytes but over kMaxListItems items --
+              // a size refusal just like the byte-cap g_activeOverflow
+              // branch above, not a format/decode problem. See
+              // ListStoreResult's comment in CompanionPeerStore.h.
+              case companionpeer::ListStoreResult::RejectedSize:
+                notifyRenderStatus(RenderResult::RejectedSize, pushId);
+                break;
             }
             break;
           }

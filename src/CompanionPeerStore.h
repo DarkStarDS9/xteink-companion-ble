@@ -233,13 +233,19 @@ bool readDeclaredShape(const char* peerKey, companionble::ContentShape* out);
 // an asset (answered via ASSET_ACK) -- see CompanionBle.cpp's kFieldListDoc
 // END handling, which maps each of these onto the RenderResult the phone
 // actually receives (Stored -> Displayed, RejectedFormat -> DecodeFailed,
-// RejectedStorage -> StorageFailed). Over-cap is refused before this is ever
-// called (CompanionBle.cpp latches that at START, like the image field), so
-// there is no RejectedSize case here.
+// RejectedStorage -> StorageFailed, RejectedSize -> RejectedSize). Over-cap
+// *bytes* is refused before this is ever called (CompanionBle.cpp latches
+// that at START, like the image field, against companionble::kMaxListDocLen)
+// -- but a push can be under that byte cap and still carry more than
+// companionble::kMaxListItems items (the format's per-item floor is 4
+// bytes), which only counting items during ingest can catch. RejectedSize
+// covers both: it is a size refusal either way, from the phone's point of
+// view.
 enum class ListStoreResult : uint8_t {
   Stored = 0x00,
   RejectedFormat = 0x01,
   RejectedStorage = 0x02,
+  RejectedSize = 0x03,
 };
 
 // Validates and stores a whole-document kFieldListDoc push (the wire layout
@@ -256,6 +262,11 @@ enum class ListStoreResult : uint8_t {
 // function's .cpp comment for why this streams to disk rather than building
 // an in-RAM JsonDocument (the "preferred" idiom images.json/peers.json use):
 // the wire format's own item-density worst case makes that unbounded.
+//
+// Also refuses (RejectedSize) a document over companionble::kMaxListItems
+// total items, counted as parseDocument() walks it, even when `len` is
+// under kMaxListDocLen -- this bounds loadListDocument()'s read-back, which
+// is NOT streaming. See kMaxListItems's comment in CompanionBle.h.
 ListStoreResult storeListDocument(const char* peerKey, const uint8_t* data, size_t len);
 
 // Reads this peer's stored lists.json, if any, and walks it via the exact

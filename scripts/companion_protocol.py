@@ -78,6 +78,16 @@ FINAL_FLAG = 0x80
 # there.
 MAX_LIST_DOC_LEN = 16 * 1024
 
+# Total items (across every list/group) accepted in one FIELD_LIST_DOC push,
+# independent of MAX_LIST_DOC_LEN: the wire format's per-item floor is 4
+# bytes (2-byte id, 1 checked byte, 1 zero-length textLen), so a push well
+# under the byte cap can still carry thousands of near-empty items. The
+# device reads a stored document back into a live in-RAM JSON tree (not
+# streamed, unlike the write path), so item count has to be bounded
+# separately at ingest to keep that read-back bounded too. Mirrors
+# companionble::kMaxListItems in src/CompanionBle.h -- keep these in sync.
+MAX_LIST_ITEMS = 512
+
 # Fields whose CHUNKs carry the 2-byte little-endian sequence number: image
 # since v9, title/body since v10. Every other field's CHUNK payload still
 # starts at byte 2. Sending the sequence number to a field that doesn't expect
