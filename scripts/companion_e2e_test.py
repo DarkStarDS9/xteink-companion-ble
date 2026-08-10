@@ -119,6 +119,7 @@ from companion_protocol import (
     ASSET_STORED,
     BTN_BACK,
     BTN_CONFIRM,
+    BTN_DOWN,
     BTN_LEFT,
     BTN_RIGHT,
     CAPABILITY_CHAR_UUID,
@@ -212,33 +213,51 @@ LIST_DECL = encode_ui_declaration([], shape=SHAPE_LIST)
 # of the nesting the wire format describes (docs/companion-todo-list-design.md
 # §4): two lists, an ungrouped bucket (empty label) alongside a labelled
 # group, and both checked states.
-SAMPLE_LIST_DOC = encode_list_doc(
-    [
-        {
-            "id": 1,
-            "title": "Groceries",
-            "groups": [
-                {"id": 1, "label": "", "items": [
-                    {"id": 1, "text": "Milk", "checked": 0},
-                    {"id": 2, "text": "Eggs", "checked": 1},
-                ]},
-                {"id": 2, "label": "Produce", "items": [
-                    {"id": 3, "text": "Apples", "checked": 0},
-                ]},
-            ],
-        },
-        {
-            "id": 2,
-            "title": "Hardware",
-            "groups": [
-                {"id": 1, "label": "", "items": [
-                    {"id": 1, "text": "Batteries AA", "checked": 0},
-                ]},
-            ],
-        },
-    ],
-    revision=1,
-)
+#
+# Kept apart from the encode_list_doc() calls below so the same structure can be
+# re-encoded at a different revision without a second copy drifting away from
+# this one -- the Phase B group needs a *different document* that is otherwise
+# byte-identical in structure, to prove the diff is cleared by the act of
+# storing a document rather than by the document's contents changing.
+SAMPLE_LIST_STRUCTURE = [
+    {
+        "id": 1,
+        "title": "Groceries",
+        "groups": [
+            {"id": 1, "label": "", "items": [
+                {"id": 1, "text": "Milk", "checked": 0},
+                {"id": 2, "text": "Eggs", "checked": 1},
+            ]},
+            {"id": 2, "label": "Produce", "items": [
+                {"id": 3, "text": "Apples", "checked": 0},
+            ]},
+        ],
+    },
+    {
+        "id": 2,
+        "title": "Hardware",
+        "groups": [
+            {"id": 1, "label": "", "items": [
+                # id 10, not 1: itemIds are global to the peer's document, not
+                # scoped per list (docs/companion-todo-list-design.md:230), and
+                # the device's check-off diff is keyed by itemId alone. Reusing
+                # 1 here would collide with "Milk" above, which would make the
+                # cross-list assertion in [list] silently meaningless -- the
+                # second toggle would overwrite the first entry instead of
+                # adding one, and the test would still "pass" a count it never
+                # actually proved.
+                {"id": 10, "text": "Batteries AA", "checked": 0},
+            ]},
+        ],
+    },
+]
+
+SAMPLE_LIST_DOC = encode_list_doc(SAMPLE_LIST_STRUCTURE, revision=1)
+
+# Same structure, higher revision: what the device is told when the phone
+# re-syncs a document it has already seen. Used to prove that an accepted push
+# clears the stored check-off diff unconditionally.
+SAMPLE_LIST_DOC_REV2 = encode_list_doc(SAMPLE_LIST_STRUCTURE, revision=2)
 
 
 # --------------------------------------------------------------------------- #
@@ -399,6 +418,58 @@ class Console:
                 if "id" in fields:
                     out[int(fields["id"])] = fields.get("state")
         return out
+
+    def list_state(self) -> tuple[int, list[tuple[int, int]]]:
+        """The foreground peer's stored check-off diff: (revision, [(itemId, checked), ...]).
+
+        The check-off equivalent of tags() above, and it exists for the same
+        reason: the diff is written to SD and is otherwise invisible from this
+        side, so without it a toggle can only be confirmed by looking at the
+        panel -- i.e. by picking up the phone, which CLAUDE.md rules out.
+
+        Reads SD, not the activity's in-RAM Diff, so the answer is meaningful
+        even when the device is not on Screen::List at all (which is exactly
+        what the "survives Back" assertion below leans on). A peer with no
+        stored diff answers revision=0 count=0, indistinguishable from one
+        whose edits have all been synced away -- neither has anything pending.
+        """
+        revision = 0
+        entries: list[tuple[int, int]] = []
+        # No `expect=`: the header line arrives first and the entries follow it,
+        # so latching on "list " would cut the deadline short before the rows
+        # this function actually exists to read have been collected.
+        for reply in self.send("CLIST"):
+            fields = {}
+            head, _, rest = reply.partition(" ")
+            for token in rest.split(" "):
+                if "=" in token:
+                    key, value = token.split("=", 1)
+                    fields[key] = value
+            if head == "list" and "revision" in fields:
+                revision = int(fields["revision"])
+            elif head == "listitem" and "id" in fields:
+                entries.append((int(fields["id"]), int(fields.get("checked", 0))))
+        return revision, entries
+
+    def await_list_state(
+        self, count: int, timeout: float = 8.0
+    ) -> tuple[int, list[tuple[int, int]]]:
+        """Polls list_state() until it reports `count` entries, then returns whatever it last saw.
+
+        Same race await_screen() exists for: a Confirm press is consumed on the
+        device's main loop, and the SD write plus the redraw it triggers happen
+        under a RenderLock an in-flight e-ink refresh can hold for the best part
+        of a second. Sampling once right after press() tests the panel's timing,
+        not the toggle.
+        """
+        deadline = time.time() + timeout
+        state = self.list_state()
+        while time.time() < deadline:
+            if len(state[1]) == count:
+                return state
+            time.sleep(0.3)
+            state = self.list_state()
+        return state
 
     def press(self, button: int, hold_ms: int = 0) -> None:
         self.send(f"CBTN {button} {hold_ms}", expect="btn")
@@ -2026,6 +2097,219 @@ async def run_tests(args, console: Console, results: Results) -> None:
                         "an over-cap list document is specifically RejectedSize",
                         verdict == RENDER_REJECTED_SIZE,
                         f"result {RENDER_RESULTS.get(verdict, verdict)} (guessed code -- see comment)",
+                    )
+
+                    # --- Phase B slice 3: on-device check-off ---------------- #
+                    #
+                    # Placed last in the group, after the malformed-document
+                    # cases, for two reasons: it needs `truncated_doc` (defined
+                    # above) to prove a *refused* push leaves the diff alone,
+                    # and every check before this one asserts against a device
+                    # whose stored diff is empty -- toggling first would change
+                    # what those are testing.
+                    #
+                    # What is under test is not "does Confirm draw a tick". It
+                    # is the storage model of docs/companion-todo-list-design.md
+                    # §7: list_state.bin records *deviations from the document*,
+                    # never absolutes. Every assertion below is a statement
+                    # about that model, which is why they are all counts and
+                    # entries rather than screenshots.
+                    #
+                    # The document is re-pushed first so this starts from a
+                    # known-clean diff whatever the cases above left behind, and
+                    # so the cursor is back at flat index 0 of list 0 ("Milk").
+                    toggle_reset_id = 0x78
+                    verdict = await session_c.push_list_doc(SAMPLE_LIST_DOC, push_id=toggle_reset_id)
+                    results.check(
+                        "list-toggle: the fixture document re-pushed cleanly",
+                        verdict == RENDER_DISPLAYED,
+                        f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                    )
+                    revision, entries = console.await_list_state(0)
+                    results.check(
+                        "list-toggle: a freshly pushed document starts with an empty diff",
+                        entries == [],
+                        f"revision {revision}, entries {entries}",
+                    )
+
+                    # Milk is checked=0 in the document, so ticking it deviates.
+                    console.press(BTN_CONFIRM)
+                    revision, entries = console.await_list_state(1)
+                    results.check(
+                        "list-toggle: checking a document-unchecked item stores one deviation",
+                        entries == [(1, 1)],
+                        f"revision {revision}, entries {entries}",
+                    )
+
+                    # THE REMOVAL ASSERTION. Toggling back is not "store 0" --
+                    # the entry has to disappear, because the file records what
+                    # differs from the document and nothing differs any more.
+                    # Storing a redundant absolute instead would still render
+                    # correctly, which is precisely why only this check can tell
+                    # the two implementations apart: it is the difference
+                    # between a diff that stays bounded over a shopping trip and
+                    # one that grows to a full shadow copy of the document.
+                    console.press(BTN_CONFIRM)
+                    revision, entries = console.await_list_state(0)
+                    results.check(
+                        "list-toggle: toggling back deletes the entry rather than storing checked=0",
+                        entries == [],
+                        f"revision {revision}, entries {entries}",
+                    )
+
+                    # Eggs is checked=1 in the document. Un-checking it is just
+                    # as much an edit as checking Milk was, and a naive
+                    # "store the ones the user ticked" model gets this wrong --
+                    # it has nowhere to put an un-tick.
+                    console.press(BTN_DOWN)
+                    console.press(BTN_CONFIRM)
+                    revision, entries = console.await_list_state(1)
+                    results.check(
+                        "list-toggle: un-checking a document-checked item stores checked=0",
+                        entries == [(2, 0)],
+                        f"revision {revision}, entries {entries}",
+                    )
+
+                    # Right switches lists (handleListNav claims Left/Right
+                    # unconditionally). Item 10 lives in list 2, and the entry
+                    # for item 2 in list 1 must still be there afterwards: the
+                    # diff is one flat map over the whole document keyed by the
+                    # globally-unique itemId, not a per-list file. This is the
+                    # assertion the fixture's id collision (see
+                    # SAMPLE_LIST_STRUCTURE) would have quietly defeated.
+                    console.press(BTN_RIGHT)
+                    console.press(BTN_CONFIRM)
+                    revision, entries = console.await_list_state(2)
+                    results.check(
+                        "list-toggle: edits in two different lists share one flat diff",
+                        sorted(entries) == [(2, 0), (10, 1)],
+                        f"revision {revision}, entries {entries}",
+                    )
+
+                    # Back leaves Screen::List, which frees the in-RAM document
+                    # buffer and the Diff built from it. CLIST reads SD, so it
+                    # can still answer here -- and that is the point: if the
+                    # toggles only ever lived in RAM, this is where they vanish.
+                    console.press(BTN_BACK)
+                    revision, entries = console.await_list_state(2)
+                    results.check(
+                        "list-toggle: the diff survives leaving the list screen",
+                        sorted(entries) == [(2, 0), (10, 1)],
+                        f"revision {revision}, entries {entries}",
+                    )
+
+                    # Re-entering the list is not reachable by buttons from
+                    # where Back lands. enterListDocument() is called with
+                    # returnTo=Screen::Text when the peer took the foreground
+                    # (CompanionModeActivity.cpp:875), so Back puts a live TEXT-
+                    # ish screen up with the peer still foreground, and nothing
+                    # on that screen routes to the icon grid or the picker while
+                    # an app holds it. Re-pushing the document would get us back
+                    # in, but a push clears the diff, so it cannot be the way
+                    # in here.
+                    #
+                    # A foreground round-trip can: applyForegroundChange() sends
+                    # a LIST peer straight back to Screen::List, and it is not a
+                    # push, so it touches nothing on SD. It has to be a RELEASE
+                    # then an ACQUIRE rather than a bare re-ACQUIRE, because
+                    # setForeground() early-returns when the session is already
+                    # foreground (CompanionBle.cpp:395) -- the FOREGROUND
+                    # notification would never arrive and acquire() would time
+                    # out on a device that is behaving correctly.
+                    await session_c.release()
+                    await asyncio.sleep(0.5)
+                    outcome = await session_c.acquire()
+                    if results.check(
+                        "list-toggle: the LIST peer retook the screen",
+                        outcome[0] == "foreground",
+                        str(outcome),
+                    ):
+                        settled = console.await_screen("list")
+                        results.check(
+                            "list-toggle: re-acquiring reopens the stored document",
+                            settled == "list",
+                            f"screen is {settled!r}",
+                        )
+                        revision, entries = console.await_list_state(2)
+                        results.check(
+                            "list-toggle: the reopened document still carries both edits",
+                            sorted(entries) == [(2, 0), (10, 1)],
+                            f"revision {revision}, entries {entries}",
+                        )
+
+                    # An accepted push clears the diff unconditionally -- not
+                    # "when the revision changed", not "for items the new
+                    # document no longer has". The phone is the authority on
+                    # what is checked; anything the device had pending was, by
+                    # the time this document was built, either already folded in
+                    # or deliberately dropped. Same structure at a new revision,
+                    # so the clear cannot be attributed to the content differing.
+                    rev2_id = 0x79
+                    verdict = await session_c.push_list_doc(SAMPLE_LIST_DOC_REV2, push_id=rev2_id)
+                    results.check(
+                        "list-toggle: a document at a new revision is accepted",
+                        verdict == RENDER_DISPLAYED,
+                        f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                    )
+                    revision, entries = console.await_list_state(0)
+                    results.check(
+                        "list-toggle: an accepted push clears the whole diff",
+                        entries == [],
+                        f"revision {revision}, entries {entries}",
+                    )
+
+                    # ...whereas a refused one must not, because the clear is a
+                    # consequence of *storing* a document, not of receiving
+                    # bytes. Getting this wrong loses a user's ticks to a
+                    # dropped connection or a corrupt transfer -- the two cases
+                    # where they are least able to redo them.
+                    #
+                    # Which item the cursor is on after a re-push is the
+                    # firmware's business, so the entry is captured rather than
+                    # predicted; what is asserted is that it is unchanged.
+                    console.press(BTN_CONFIRM)
+                    revision, before_refusal = console.await_list_state(1)
+                    results.check(
+                        "list-toggle: one edit staged before the refused push",
+                        len(before_refusal) == 1,
+                        f"revision {revision}, entries {before_refusal}",
+                    )
+                    refused_id = 0x7A
+                    verdict = await session_c.push_list_doc(truncated_doc, push_id=refused_id)
+                    results.check(
+                        "list-toggle: the truncated document is still refused",
+                        verdict != RENDER_DISPLAYED,
+                        f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                    )
+                    revision, after_refusal = console.await_list_state(len(before_refusal))
+                    results.check(
+                        "list-toggle: a refused push leaves the diff untouched",
+                        after_refusal == before_refusal,
+                        f"revision {revision}, {before_refusal} -> {after_refusal}",
+                    )
+
+                    # Leave the device on a document with an empty diff. Nothing
+                    # after this group depends on it today ([list] is the last
+                    # group before --soak), but a group that hands the next one
+                    # a half-edited list is a landmine for whatever gets added
+                    # after it.
+                    restore_id = 0x7B
+                    verdict = await session_c.push_list_doc(SAMPLE_LIST_DOC_REV2, push_id=restore_id)
+                    results.check(
+                        "list-toggle: the group leaves a clean document on screen",
+                        verdict == RENDER_DISPLAYED,
+                        f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                    )
+
+                    # Same exemptions as the group's closing check below: this
+                    # block deliberately pushes a truncated document, and the
+                    # device is expected to say so out loud. Anything else it
+                    # logs while toggling -- an SD write failure, an allocation
+                    # that did not happen -- is a real finding, and no other
+                    # check here would see it.
+                    check_no_errors(
+                        console, results, "list-toggle",
+                        allowed=("shape", "0x08", "list doc", "decode", "size"),
                     )
 
                 # NEEDS RECONCILIATION: exact wording is firmware's to pick, so

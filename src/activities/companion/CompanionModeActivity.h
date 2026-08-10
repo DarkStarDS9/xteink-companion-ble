@@ -7,6 +7,7 @@
 #include "CompanionBle.h"
 #include "CompanionPeerStore.h"
 #include "CompanionTestConsole.h"
+#include "CompanionTodoDiff.h"
 #include "CompanionTodoDocument.h"
 #include "CompanionTodoNav.h"
 #include "activities/Activity.h"
@@ -19,7 +20,19 @@
 // CompanionModeActivity::listVisibleRows's doc comment for the full picture.
 struct CompanionListRow {
   bool isHeader = false;
+  // What the checkbox draws: the document's value with any local check-off
+  // deviation already applied (companiontodo::Diff::effectiveChecked()), so
+  // rendering never has to know the diff exists.
   bool checked = false;
+  // What the *document* says, undeviated. Kept alongside `checked` because
+  // companiontodo::Diff::applyToggle() is defined against the document value,
+  // not the on-screen one -- feeding it the effective value would invert the
+  // deviation logic (an entry would be created exactly when it should be
+  // removed) while still looking right for a single press.
+  bool documentChecked = false;
+  // The phone's opaque id for this item, echoed back in the check-off diff.
+  // Meaningless for a header row.
+  uint16_t itemId = 0;
   // -1 for a header row; this item's 0-based position among its list's
   // items (ignoring group boundaries) otherwise -- what
   // CompanionModeActivity::listNav's cursor() indexes, so rendering compares
@@ -190,9 +203,9 @@ class CompanionModeActivity final : public Activity {
   // not (no host seam -- see this feature's commit message).
   std::vector<CompanionListRow> listVisibleRows;
   companiontodo::Nav listNav;
-  std::string listDocTitle;     // the current list's title
-  std::string listPeerKey;      // whose document is loaded -- see enterListDocument()
-  bool listDocLoaded = false;   // false: peer has no (parseable) document at all
+  std::string listDocTitle;    // the current list's title
+  std::string listPeerKey;     // whose document is loaded -- see enterListDocument()
+  bool listDocLoaded = false;  // false: peer has no (parseable) document at all
   // The peer's lists.bin (companionpeer::readListDocument()), held in RAM for
   // the whole time Screen::List is up over it, sized exactly to the stored
   // document (<= companionble::kMaxListDocLen, 16 KB) via makeUniqueNoThrow.
@@ -207,6 +220,18 @@ class CompanionModeActivity final : public Activity {
   // outlive the screen it was read for.
   std::unique_ptr<uint8_t[]> listDocBuf;
   size_t listDocBufLen = 0;
+  // The peer's check-off deviations (list_state.bin), materialised for exactly
+  // as long as listDocBuf is -- allocated and freed by the same two functions,
+  // so its 1096 bytes (CompanionTodoDiff.h's MEMORY note) cost nothing while
+  // no list is on screen. That pairing is the whole reason it is a
+  // unique_ptr and not a plain member: 1096 permanently-resident bytes
+  // alongside NimBLE is not a trade this part can make.
+  //
+  // NULL IS A SUPPORTED STATE, not just an error one: makeUniqueNoThrow can
+  // fail on a part this tight, and when it does the list stays browsable
+  // read-only (Phase A behaviour) rather than the screen refusing to open.
+  // Every read of this pointer must therefore be guarded.
+  std::unique_ptr<companiontodo::Diff> listDiff;
   // Where Back returns to -- IconGrid for the picker entry point (no live
   // session), Text for a live LIST peer that pushed a document while
   // foreground (applyForegroundChange() landed here directly).
@@ -235,9 +260,9 @@ class CompanionModeActivity final : public Activity {
   int cachedOrientedMarginRight = 0;
   int cachedOrientedMarginBottom = 0;
   int cachedOrientedMarginLeft = 0;
-  int cachedTitleBlockHeight = 0;  // vertical space reserved above the body for the bold title line
-  int listRowHeight = 0;           // pixel height of one ToDo List row, computed alongside the above
-  uint8_t listVisibleCapacity = 1; // how many item rows fit below the list title -- feeds listNav
+  int cachedTitleBlockHeight = 0;   // vertical space reserved above the body for the bold title line
+  int listRowHeight = 0;            // pixel height of one ToDo List row, computed alongside the above
+  uint8_t listVisibleCapacity = 1;  // how many item rows fit below the list title -- feeds listNav
 
   // Set whenever no app holds the screen; 0 while one does. loop() deep-sleeps
   // once this has been non-zero for longer than kWaitingIdleSleepMs, so an
@@ -315,7 +340,13 @@ class CompanionModeActivity final : public Activity {
   // caller makes right after) if the peer has no document or the read
   // failed -- fine to call speculatively, same as enterListDocument().
   void loadListDocBuf();
-  // Frees listDocBuf. Called from every path that can leave Screen::List --
+  // Materialises listDiff for listPeerKey, against the document already in
+  // listDocBuf. Called only from loadListDocBuf(), and only once the document
+  // is in hand -- the two must be loaded together or the revision check below
+  // has nothing to check against. Leaves listDiff null (read-only browsing)
+  // if the 1096 bytes cannot be had.
+  void loadListDiff();
+  // Frees listDocBuf and listDiff. Called from every path that can leave Screen::List --
   // Back, a foreground handover to a different peer, a live push that takes
   // the screen out from under a locally-browsed (picker) document, and
   // Activity::onExit() -- see this feature's commit message for the full

@@ -231,6 +231,20 @@ class ListCountingVisitor : public companiontodo::Visitor {
   uint16_t targetItemCount_ = 0;
 };
 
+// The document's revision and nothing else. A four-byte read of listDocBuf
+// would answer the same question, but only by copying the wire layout out of
+// CompanionTodoDocument.h into a second place -- and that header is explicit
+// that it is the single source of truth for this format. One extra in-RAM
+// walk buys that; it is paid once per SD load, not per keypress.
+class ListRevisionVisitor : public companiontodo::Visitor {
+ public:
+  void onDocument(uint32_t revision) override { revision_ = revision; }
+  uint32_t revision() const { return revision_; }
+
+ private:
+  uint32_t revision_ = 0;
+};
+
 // Pass 2: the target list's title and every row (group header + item) that
 // falls in [windowStart, windowStart + capacity) of its flat item sequence.
 // A group's header is emitted once, right before the first in-window item
@@ -239,13 +253,17 @@ class ListCountingVisitor : public companiontodo::Visitor {
 // never emits a header row at all.
 class ListRowVisitor : public companiontodo::Visitor {
  public:
+  // `diff` may be null -- no check-off state was loadable, so the document's
+  // own `checked` is what the user sees (Phase A behaviour). It is borrowed
+  // for the duration of one walk and never stored beyond it.
   ListRowVisitor(int targetListIndex, uint16_t windowStart, uint16_t capacity, std::string* titleOut,
-                 std::vector<CompanionListRow>* rowsOut)
+                 std::vector<CompanionListRow>* rowsOut, const companiontodo::Diff* diff)
       : targetListIndex_(targetListIndex),
         windowStart_(windowStart),
         windowEnd_(static_cast<uint32_t>(windowStart) + capacity),
         titleOut_(titleOut),
-        rowsOut_(rowsOut) {}
+        rowsOut_(rowsOut),
+        diff_(diff) {}
 
   void onListStart(uint16_t, const char* title, uint8_t titleLen) override {
     inTarget_ = (static_cast<int>(listIndex_) == targetListIndex_);
@@ -256,7 +274,7 @@ class ListRowVisitor : public companiontodo::Visitor {
     groupLabel_.assign(label, labelLen);
     groupHeaderEmitted_ = false;
   }
-  void onItem(uint16_t, bool checked, const char* text, uint8_t textLen) override {
+  void onItem(uint16_t itemId, bool checked, const char* text, uint8_t textLen) override {
     if (!inTarget_) return;
     if (itemIndex_ >= windowStart_ && itemIndex_ < windowEnd_) {
       if (!groupLabel_.empty() && !groupHeaderEmitted_) {
@@ -267,7 +285,9 @@ class ListRowVisitor : public companiontodo::Visitor {
         groupHeaderEmitted_ = true;
       }
       CompanionListRow row;
-      row.checked = checked;
+      row.documentChecked = checked;
+      row.checked = diff_ ? diff_->effectiveChecked(itemId, checked) : checked;
+      row.itemId = itemId;
       row.itemFlatIndex = static_cast<int>(itemIndex_);
       row.text.assign(text, textLen);
       rowsOut_->push_back(std::move(row));
@@ -285,6 +305,7 @@ class ListRowVisitor : public companiontodo::Visitor {
   uint32_t windowEnd_;
   std::string* titleOut_;
   std::vector<CompanionListRow>* rowsOut_;
+  const companiontodo::Diff* diff_;
   uint16_t listIndex_ = 0;
   bool inTarget_ = false;
   uint32_t itemIndex_ = 0;
@@ -1057,11 +1078,60 @@ void CompanionModeActivity::loadListDocBuf() {
 
   listDocBuf = std::move(buf);
   listDocBufLen = size;
+  loadListDiff();
+}
+
+// See the header's doc comment. Every caller of loadListDocBuf() gets the
+// diff refreshed for free, which is what makes the "a push landed under a live
+// list screen" path correct: storeListDocument() has just deleted
+// list_state.bin, and re-reading here is what stops the now-dead in-RAM diff
+// from being re-applied to a document it was never taken against.
+void CompanionModeActivity::loadListDiff() {
+  listDiff.reset();
+
+  // 1096 bytes (CompanionTodoDiff.h's MEMORY note), heap rather than a member
+  // because it is only wanted while Screen::List is up; stack is out of the
+  // question at this size on this part's task stacks.
+  auto diff = makeUniqueNoThrow<companiontodo::Diff>();
+  if (!diff) {
+    LOG_ERR("CMA", "could not allocate %u bytes for peer %s's list check-off state; browsing read-only",
+            static_cast<unsigned>(sizeof(companiontodo::Diff)), listPeerKey.c_str());
+    return;
+  }
+  diff->clear();
+
+  ListRevisionVisitor rev;
+  const bool haveRevision =
+      companiontodo::parseDocument(listDocBuf.get(), listDocBufLen, rev) == companiontodo::ParseResult::Ok;
+
+  if (companionpeer::readListState(listPeerKey.c_str(), *diff) &&
+      (!haveRevision || diff->revision() != rev.revision())) {
+    // NOT a merge decision, and deliberately not one: this refuses to apply a
+    // diff to a document it demonstrably was not taken against. The normal
+    // path cannot produce a mismatch -- storeListDocument() clears the state
+    // file whenever a document lands -- so reaching here means the two SD
+    // writes disagree: a crash between them, a hand-edited card, or a
+    // document that no longer parses so its revision cannot be confirmed at
+    // all. Applying deviations keyed by itemId to an unknown document would
+    // silently tick the wrong boxes, which is worse than losing edits the
+    // phone can re-push.
+    LOG_INF("CMA", "peer %s's list state is for revision %u, document is %u -- discarding", listPeerKey.c_str(),
+            static_cast<unsigned>(diff->revision()), static_cast<unsigned>(rev.revision()));
+    companionpeer::clearListState(listPeerKey.c_str());
+    diff->clear();
+  }
+
+  diff->setRevision(rev.revision());
+  listDiff = std::move(diff);
 }
 
 void CompanionModeActivity::freeListDocBuf() {
   listDocBuf.reset();
   listDocBufLen = 0;
+  // Freed with the document, never separately: a diff without the document it
+  // deviates from cannot be rendered or toggled against, and every caller of
+  // this function is leaving Screen::List.
+  listDiff.reset();
 }
 
 // See the header's doc comment on `recountTotals`. Three shapes of walk,
@@ -1115,7 +1185,7 @@ void CompanionModeActivity::reloadListView(bool recountTotals) {
   }
 
   ListRowVisitor rows(static_cast<int>(listNav.listIndex()), listNav.windowStart(), listNav.visibleCapacity(),
-                      &listDocTitle, &listVisibleRows);
+                      &listDocTitle, &listVisibleRows, listDiff.get());
   if (companiontodo::parseDocument(listDocBuf.get(), listDocBufLen, rows) == companiontodo::ParseResult::Ok)
     listDocLoaded = true;
 }
@@ -1146,10 +1216,55 @@ bool CompanionModeActivity::handleListNav() {
     return true;
   }
   if (buttonWasPressed(MappedInputManager::Button::Confirm, companionble::ButtonId::Confirm)) {
-    // Phase A is read-only -- no toggling (root CLAUDE.md's scope for this
-    // task). Consuming the press here rather than falling through anywhere
-    // else keeps Phase B's eventual check/uncheck an additive change to this
-    // one branch, not a second button-wiring site.
+    // listVisibleRows is already the window listNav.cursor() indexes into, and
+    // already carries every item's id -- so the row under the cursor is a scan
+    // of a handful of rows, not a second walk of the document.
+    const CompanionListRow* target = nullptr;
+    for (const auto& row : listVisibleRows) {
+      if (!row.isHeader && row.itemFlatIndex == static_cast<int>(listNav.cursor())) {
+        target = &row;
+        break;
+      }
+    }
+    // No diff (allocation failed -- see listDiff's doc comment) or nothing
+    // selectable under the cursor (an empty list): the press is still consumed,
+    // so Confirm never leaks out to some other handler from this screen.
+    if (!listDiff || target == nullptr) return true;
+
+    // The resulting on-screen value is not captured: the redraw below rebuilds
+    // every row through effectiveChecked() anyway, and a second copy of the
+    // same truth is a second thing that can disagree with the diff.
+    if (!listDiff->applyToggle(target->itemId, target->documentChecked, nullptr)) {
+      // The table is full and applyToggle() mutated nothing. Saying so out loud
+      // is the point: an edit the user made and the device dropped in silence
+      // is the one failure mode this feature cannot have. Note this is reached
+      // before any RenderLock is taken -- showTransientMessage() takes its own,
+      // and the semaphore is not recursive (RenderLock.h).
+      showTransientMessage(tr(STR_COMPANION_LIST_TOO_MANY_EDITS), Screen::List);
+      return true;
+    }
+    // SD OUTSIDE THE RENDER LOCK, deliberately. The lock serialises this task
+    // against the render task, and everything the render task reads for this
+    // screen is listVisibleRows/listNav -- neither of which is touched until
+    // the locked block below. listDiff is read only by ListRowVisitor, i.e.
+    // only from inside reloadListView(), so mutating it and persisting it here
+    // races nothing; holding the lock across an SD write would instead stall
+    // the panel for the write's duration for no protection at all.
+    if (!companionpeer::writeListState(listPeerKey.c_str(), *listDiff)) {
+      // Undo rather than show a check the card did not keep. applyToggle() is
+      // its own inverse, and the second call cannot fail: it either removes
+      // the entry the first one added, or re-inserts into a slot just vacated.
+      LOG_ERR("CMA", "could not persist peer %s's list state; reverting the toggle", listPeerKey.c_str());
+      listDiff->applyToggle(target->itemId, target->documentChecked, nullptr);
+      return true;
+    }
+
+    RenderLock lock;
+    // Full re-walk rather than poking the one row: the row vector is rebuilt
+    // from the document on every other view change too, and one in-RAM parse
+    // is cheaper than a second code path that has to stay consistent with it.
+    reloadListView(/*recountTotals=*/false);
+    requestUpdate();
     return true;
   }
   if (buttonWasPressed(MappedInputManager::Button::Up, companionble::ButtonId::Up)) {
@@ -2411,12 +2526,16 @@ void CompanionModeActivity::renderTags(int rightEdgeX, int centerY) const {
   }
 }
 
-// Screen::List, Phase A: the current list's title, its groups (an empty
-// label is the "ungrouped" bucket, design doc §2 -- no heading drawn for
-// it), and its items with a checkbox glyph reflecting `checked` plus a
-// cursor marker on the item under listNav.cursor(). No toggling -- Phase A
-// is read-only (root CLAUDE.md's scope for this task); Confirm is
-// deliberately a no-op (see handleListNav()).
+// Screen::List: the current list's title, its groups (an empty label is the
+// "ungrouped" bucket, design doc §2 -- no heading drawn for it), and its items
+// with a checkbox glyph reflecting `checked` plus a cursor marker on the item
+// under listNav.cursor().
+//
+// This function knows nothing about the check-off diff, and that is on
+// purpose: reloadListView() has already folded any local deviation into
+// row.checked (ListRowVisitor), so adding on-device toggling did not touch a
+// line of the drawing code below. Anything that makes rendering consult the
+// diff directly is a step back from that.
 void CompanionModeActivity::renderList() {
   const int titleLineHeight = renderer.getLineHeight(cachedTitleFontId);
   const int titleY = cachedOrientedMarginTop;
