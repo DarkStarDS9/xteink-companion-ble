@@ -41,6 +41,15 @@ std::string imageSlotPath(const char* peerKey, uint32_t slot) {
   return imagesDir(peerKey) + "/" + name;
 }
 
+constexpr const char* kListsFileName = "lists.json";
+
+std::string listsPath(const char* peerKey) { return peerDir(peerKey) + "/" + kListsFileName; }
+// Written first, then renamed onto listsPath() -- see storeListDocument().
+// Never left behind on a clean push; a stale one only survives a crash
+// mid-write, and the next push overwrites it before ever reading it, so it
+// costs nothing to leave cleanup to that path plus removePeerDir().
+std::string listsTmpPath(const char* peerKey) { return peerDir(peerKey) + "/" + kListsFileName + ".tmp"; }
+
 // The images index is read/mutated/written on demand, same discipline as
 // peers.json — see the header's "NOTHING HERE IS RESIDENT" note.
 bool loadImagesIndex(const char* peerKey, JsonDocument& doc) {
@@ -123,6 +132,139 @@ bool writeWholeFile(const std::string& path, const uint8_t* data, size_t len) {
   return written == len;
 }
 
+// Converts a kFieldListDoc push straight to lists.json's JSON shape as
+// companiontodo::parseDocument() walks it, writing each fragment to `file`
+// as it goes rather than building a JsonDocument in RAM first.
+//
+// Why not a JsonDocument, matching images.json/peers.json's own idiom (the
+// preferred approach per docs/companion-todo-list-design.md's storage
+// section): measured against ArduinoJson v7's real allocator (v7's
+// JsonDocument::memoryUsage() always reports 0 now -- it dropped the fixed
+// pool for per-node heap allocation -- so this was measured with a custom
+// Allocator tracking live bytes instead of trusting that call). A document
+// shaped the way the design doc assumes -- a few hundred short items --
+// costs ~49 KB live, already uncomfortable stacked on the 16 KB
+// `g_activeBuf` still resident while this runs, against the ~166 KB
+// headroom the design doc's own §4/§8 cites. But `kMaxListDocLen` (16 KB)
+// does not actually bound item *count* the way that estimate assumes: the
+// wire format's minimum per-item cost is 4 bytes (a 2-byte id, 1 checked
+// byte, 1 zero-length textLen), so a legally-sized push can carry over 4000
+// near-empty items. Built and measured that exact document: ~4092 items,
+// ~450 KB live in the same JsonDocument approach -- multiples of this
+// device's entire ~380 KB RAM, from a push that is not oversize by any rule
+// this protocol enforces. A malformed-content DoS, not a hardware bug.
+// Streaming straight to disk instead keeps this function's own RAM flat
+// (one small write buffer, not proportional to item count) regardless of
+// how a pushed document chooses to spend its 16 KB, and gets the
+// temp-file-then-rename atomicity storeListDocument() needs "for free" in
+// the same move, per docs/companion-declared-shape-design.md-style
+// measure-before-deciding rather than assuming the round-number cap alone
+// bounds this.
+class JsonListWriter : public companiontodo::Visitor {
+ public:
+  explicit JsonListWriter(HalFile& file) : file_(file) {}
+
+  // False if any underlying write failed. Checked by the caller instead of
+  // trusting parseDocument()'s own Ok/Malformed verdict alone -- a full SD
+  // card can fail a write in the middle of an otherwise well-formed
+  // document, and that must not look like Stored either.
+  bool ok() const { return ok_; }
+
+  void onDocument(uint32_t revision) override {
+    writeRaw("{\"revision\":");
+    writeUint(revision);
+    writeRaw(",\"lists\":[");
+  }
+  void onListStart(uint16_t listId, const char* title, uint8_t titleLen) override {
+    if (listIndex_++ > 0) writeRaw(",");
+    writeRaw("{\"listId\":");
+    writeUint(listId);
+    writeRaw(",\"title\":");
+    writeJsonString(title, titleLen);
+    writeRaw(",\"groups\":[");
+    groupIndex_ = 0;
+  }
+  void onGroupStart(uint16_t groupId, const char* label, uint8_t labelLen) override {
+    if (groupIndex_++ > 0) writeRaw(",");
+    writeRaw("{\"groupId\":");
+    writeUint(groupId);
+    writeRaw(",\"label\":");
+    writeJsonString(label, labelLen);
+    writeRaw(",\"items\":[");
+    itemIndex_ = 0;
+  }
+  void onItem(uint16_t itemId, bool checked, const char* text, uint8_t textLen) override {
+    if (itemIndex_++ > 0) writeRaw(",");
+    writeRaw("{\"itemId\":");
+    writeUint(itemId);
+    writeRaw(",\"text\":");
+    writeJsonString(text, textLen);
+    writeRaw(checked ? ",\"checked\":true}" : ",\"checked\":false}");
+  }
+  void onGroupEnd(uint16_t /*groupId*/) override { writeRaw("]}"); }
+  void onListEnd(uint16_t /*listId*/) override { writeRaw("]}"); }
+
+  // Closes the document. Always safe to call, even on a document that never
+  // got past onDocument() (or was never called at all) -- the caller
+  // discards this file entirely unless parseDocument() returned Ok, so an
+  // unbalanced close on a document that failed early is harmless.
+  void finish() { writeRaw("]}"); }
+
+ private:
+  void writeRaw(const char* s) {
+    const size_t len = strlen(s);
+    if (file_.write(reinterpret_cast<const uint8_t*>(s), len) != len) ok_ = false;
+  }
+  void writeUint(uint32_t v) {
+    char buf[11];
+    snprintf(buf, sizeof(buf), "%u", static_cast<unsigned>(v));
+    writeRaw(buf);
+  }
+  // Wire text is arbitrary bytes the phone chose (parseDocument() validates
+  // structure, never UTF-8 well-formedness), so only what JSON itself
+  // requires is escaped: quote, backslash, and control characters. Anything
+  // else -- including multi-byte UTF-8 sequences -- passes through verbatim.
+  void writeJsonString(const char* s, uint8_t len) {
+    writeRaw("\"");
+    for (uint8_t i = 0; i < len; ++i) {
+      const uint8_t c = static_cast<uint8_t>(s[i]);
+      switch (c) {
+        case '"':
+          writeRaw("\\\"");
+          break;
+        case '\\':
+          writeRaw("\\\\");
+          break;
+        case '\n':
+          writeRaw("\\n");
+          break;
+        case '\r':
+          writeRaw("\\r");
+          break;
+        case '\t':
+          writeRaw("\\t");
+          break;
+        default:
+          if (c < 0x20) {
+            char buf[7];
+            snprintf(buf, sizeof(buf), "\\u%04x", c);
+            writeRaw(buf);
+          } else {
+            const uint8_t one[1] = {c};
+            if (file_.write(one, 1) != 1) ok_ = false;
+          }
+      }
+    }
+    writeRaw("\"");
+  }
+
+  HalFile& file_;
+  bool ok_ = true;
+  size_t listIndex_ = 0;
+  size_t groupIndex_ = 0;
+  size_t itemIndex_ = 0;
+};
+
 // The UI declaration's byte layout, its validation rules and its host gtest
 // suite all live in CompanionUiDeclaration.{h,cpp} — this file cannot be
 // host-built (ArduinoJson, PersistableStore, HalStorage), and the codec is
@@ -138,6 +280,8 @@ void removePeerDir(const char* peerKey) {
   Storage.remove((dir + "/" + kImagesIndexName).c_str());
   for (uint32_t slot = 0; slot < kMaxImagesPerPeer; ++slot) Storage.remove(imageSlotPath(peerKey, slot).c_str());
   Storage.removeDir((dir + "/images").c_str());
+  Storage.remove((dir + "/" + kListsFileName).c_str());
+  Storage.remove((dir + "/" + kListsFileName + ".tmp").c_str());
   Storage.removeDir((dir + "/data").c_str());
   Storage.rmdir(dir.c_str());
 }
@@ -380,6 +524,75 @@ size_t listImages(const char* peerKey, ImageEntry* out, size_t maxImages) {
     ++written;
   }
   return written;
+}
+
+ListStoreResult storeListDocument(const char* peerKey, const uint8_t* data, size_t len) {
+  if (!Storage.ensureDirectoryExists(peerDir(peerKey).c_str())) return ListStoreResult::RejectedStorage;
+
+  const std::string tmpPath = listsTmpPath(peerKey);
+  // Clear any temp file left behind by a push that never reached a clean
+  // END (crash, disconnect mid-transfer) -- openFileForWrite() below would
+  // otherwise append to or otherwise collide with it depending on HalFile's
+  // open-mode semantics.
+  Storage.remove(tmpPath.c_str());
+
+  HalFile file;
+  if (!Storage.openFileForWrite("CPEER", tmpPath, file)) return ListStoreResult::RejectedStorage;
+
+  JsonListWriter writer(file);
+  const companiontodo::ParseResult parseResult = companiontodo::parseDocument(data, len, writer);
+  writer.finish();
+  file.flush();
+  const bool writeOk = writer.ok();
+  file.close();
+
+  if (parseResult != companiontodo::ParseResult::Ok || !writeOk) {
+    // Never renamed onto lists.json -- the peer's previously-good document
+    // (if any) is untouched. This temp file may itself be malformed JSON
+    // (parseDocument() can fire some callbacks before discovering a later
+    // byte is bad); that is fine, since nothing ever reads it back.
+    Storage.remove(tmpPath.c_str());
+    return parseResult != companiontodo::ParseResult::Ok ? ListStoreResult::RejectedFormat
+                                                          : ListStoreResult::RejectedStorage;
+  }
+
+  // Same "clear the destination first" discipline as commitImage() --
+  // renaming over an existing path is not guaranteed on every filesystem.
+  const std::string destPath = listsPath(peerKey);
+  Storage.remove(destPath.c_str());
+  if (!Storage.rename(tmpPath.c_str(), destPath.c_str())) {
+    LOG_ERR("CPEER", "could not move %s to %s", tmpPath.c_str(), destPath.c_str());
+    Storage.remove(tmpPath.c_str());
+    return ListStoreResult::RejectedStorage;
+  }
+  return ListStoreResult::Stored;
+}
+
+bool loadListDocument(const char* peerKey, companiontodo::Visitor& visitor) {
+  JsonDocument doc;
+  if (!PersistableStoreBase::readDocFromFile(listsPath(peerKey).c_str(), doc)) return false;
+
+  const uint32_t revision = doc["revision"] | 0u;
+  visitor.onDocument(revision);
+  for (JsonObject list : doc["lists"].as<JsonArray>()) {
+    const uint16_t listId = static_cast<uint16_t>(list["listId"] | 0u);
+    const char* title = list["title"] | "";
+    visitor.onListStart(listId, title, static_cast<uint8_t>(strnlen(title, 255)));
+    for (JsonObject group : list["groups"].as<JsonArray>()) {
+      const uint16_t groupId = static_cast<uint16_t>(group["groupId"] | 0u);
+      const char* label = group["label"] | "";
+      visitor.onGroupStart(groupId, label, static_cast<uint8_t>(strnlen(label, 255)));
+      for (JsonObject item : group["items"].as<JsonArray>()) {
+        const uint16_t itemId = static_cast<uint16_t>(item["itemId"] | 0u);
+        const bool checked = item["checked"] | false;
+        const char* text = item["text"] | "";
+        visitor.onItem(itemId, checked, text, static_cast<uint8_t>(strnlen(text, 255)));
+      }
+      visitor.onGroupEnd(groupId);
+    }
+    visitor.onListEnd(listId);
+  }
+  return true;
 }
 
 std::string displayName(const char* peerKey) {

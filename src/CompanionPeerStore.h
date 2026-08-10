@@ -25,6 +25,15 @@
 //   /.crosspoint/companion/peers/<key>/images.json  gallery index: slot -> seq, content-id
 //   /.crosspoint/companion/peers/<key>/images/       up to kMaxImagesPerPeer stored pushes,
 //                                                    img_<slot>.raw, slot = seq % kMaxImagesPerPeer
+//   /.crosspoint/companion/peers/<key>/lists.json    the ToDo List document (kFieldListDoc, 0x08):
+//                                                    { revision, lists: [ { listId, title, groups: [
+//                                                    { groupId, label, items: [ { itemId, text,
+//                                                    checked } ] } ] } ] } -- see
+//                                                    docs/companion-todo-list-design.md §3. Written
+//                                                    whole-document, via a temp file + rename (see
+//                                                    storeListDocument()'s comment), never mutated
+//                                                    field-by-field -- Phase A is read-only, nothing
+//                                                    here ever flips `checked` on its own.
 //
 // A pushed image is staged into data/incoming.raw as it streams in (see
 // CompanionBle.cpp), then, once complete, moved (renamed, not copied) into an
@@ -44,6 +53,11 @@
 // header's API. CompanionBle.h is enum/constant declarations only (it pulls in
 // nothing but <cstddef>/<cstdint>), so this costs no dependency.
 #include "CompanionBle.h"
+// For companiontodo::Visitor -- loadListDocument() below re-fires the exact
+// same callback interface parseDocument() uses for the wire push, so a reader
+// written against one walks the other unmodified. Also header-only, no new
+// dependency (see that header's own charter comment).
+#include "CompanionTodoDocument.h"
 
 namespace companionpeer {
 
@@ -213,6 +227,51 @@ bool isImageCapable(const char* peerKey);
 // there, because consulting it per push would put an SD open on the NimBLE
 // host task for every field of every push (§5).
 bool readDeclaredShape(const char* peerKey, companionble::ContentShape* out);
+
+// Outcome of storing a kFieldListDoc push. Distinct from AssetStoreResult
+// above because a list document is content (answered via RENDER_STATUS), not
+// an asset (answered via ASSET_ACK) -- see CompanionBle.cpp's kFieldListDoc
+// END handling, which maps each of these onto the RenderResult the phone
+// actually receives (Stored -> Displayed, RejectedFormat -> DecodeFailed,
+// RejectedStorage -> StorageFailed). Over-cap is refused before this is ever
+// called (CompanionBle.cpp latches that at START, like the image field), so
+// there is no RejectedSize case here.
+enum class ListStoreResult : uint8_t {
+  Stored = 0x00,
+  RejectedFormat = 0x01,
+  RejectedStorage = 0x02,
+};
+
+// Validates and stores a whole-document kFieldListDoc push (the wire layout
+// CompanionTodoDocument.h parses) as this peer's lists.json, replacing
+// whatever was there. `data`/`len` is the reassembled push body, already
+// capped to companionble::kMaxListDocLen by the caller.
+//
+// Never writes a partial or clobbered lists.json: the JSON is streamed to a
+// temp file as companiontodo::parseDocument() walks the binary buffer, and
+// that temp file is renamed onto lists.json only once parseDocument() returns
+// Ok. A Malformed verdict -- which, per that function's own contract, may
+// follow some callbacks already having fired -- simply discards the temp
+// file; the peer's previously-good document is untouched either way. See this
+// function's .cpp comment for why this streams to disk rather than building
+// an in-RAM JsonDocument (the "preferred" idiom images.json/peers.json use):
+// the wire format's own item-density worst case makes that unbounded.
+ListStoreResult storeListDocument(const char* peerKey, const uint8_t* data, size_t len);
+
+// Reads this peer's stored lists.json, if any, and walks it via the exact
+// same companiontodo::Visitor interface parseDocument() drives for the wire
+// push -- a renderer written against one walks the other unmodified. Returns
+// false, with `visitor` never called, when this peer has no document yet
+// (never pushed one) or its stored lists.json no longer parses; both are
+// treated as "no document" rather than an error a caller needs to branch on
+// specially, since neither is reachable except by tampering with the SD card
+// directly (every write here goes through storeListDocument() above, which
+// only ever leaves a structurally valid lists.json or none at all).
+//
+// This is a full SD open + JSON parse, same discipline as loadImagesIndex()
+// -- call it on the main loop task when a peer's Screen::List is opened, not
+// on the NimBLE host task and not per redraw.
+bool loadListDocument(const char* peerKey, companiontodo::Visitor& visitor);
 
 // Marks the peer as most recently seen and evicts beyond kMaxPeers.
 void touch(const char* peerKey);

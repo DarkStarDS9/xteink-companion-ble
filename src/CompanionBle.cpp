@@ -439,12 +439,24 @@ uint32_t g_activeTotalLen = 0;
 uint32_t g_activeWritten = 0;
 bool g_activeFinal = false;
 std::unique_ptr<uint8_t[]> g_activeBuf;
-bool g_activeImageOverflow = false;
+// Set at START when a field whose reassembly is bounded by a RAM cap (the
+// image field's SD-backed cap, and, since v12's part 3, the list-document
+// field's heap cap) arrives with more bytes declared than that cap allows.
+// Shared between the two rather than a second parallel flag -- both need the
+// exact same lifecycle: refuse the bytes outright rather than silently
+// truncating them (title/body's own cap enforcement below does truncate,
+// which is fine for them but would be a silent-data-loss bug for a document
+// whose truncation could land on a structural boundary and parse as a
+// shorter-but-valid document missing items), latch here because START
+// carries no pushId, and answer RejectedSize once END's pushId exists. Only
+// one field is ever mid-reassembly at a time (g_activeField), so one flag
+// unambiguously describes whichever one that is.
+bool g_activeOverflow = false;
 // v12: set at START when the field being pushed is not one the foreground
 // peer's declared content shape permits (see fieldMatchesShape() below). The
 // transfer is then consumed and thrown away -- no buffer is allocated, CHUNKs
 // no-op -- and END answers RejectedShape. Latched rather than answered on the
-// spot for the same reason g_activeImageOverflow is: START carries no pushId,
+// spot for the same reason g_activeOverflow is: START carries no pushId,
 // it arrives only on END.
 bool g_activeShapeRejected = false;
 // Set once handing image work to the writer task fails (queue full/missing,
@@ -809,7 +821,7 @@ void resetReassembly() {
   g_activeTotalLen = 0;
   g_activeWritten = 0;
   g_activeFinal = false;
-  g_activeImageOverflow = false;
+  g_activeOverflow = false;
   g_activeShapeRejected = false;
   g_activeImageFailed = false;
   g_activeSeq = 0;
@@ -836,6 +848,8 @@ uint32_t fieldCap(uint8_t field) {
     case kFieldTagState:
       // 1 count byte + kMaxTags x { tagId, state }.
       return 1 + 2 * kMaxTags;
+    case kFieldListDoc:
+      return kMaxListDocLen;
     default:
       return kMaxFieldLen;
   }
@@ -843,7 +857,7 @@ uint32_t fieldCap(uint8_t field) {
 
 bool isKnownField(uint8_t field) {
   return field == kFieldTitle || field == kFieldBody || field == kFieldContentId || field == kFieldImage ||
-         field == kFieldUiDeclaration || field == kFieldIcon || field == kFieldTagState;
+         field == kFieldUiDeclaration || field == kFieldIcon || field == kFieldTagState || field == kFieldListDoc;
 }
 
 // v12's permitted-field table is companionui::fieldMatchesShape(), one file
@@ -1238,15 +1252,29 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
         if (field == kFieldImage) {
           // Oversize images are rejected at END rather than here so the app gets
           // one clear RENDER_STATUS either way; the bytes are simply not stored.
-          g_activeImageOverflow = totalLen > cap;
+          g_activeOverflow = totalLen > cap;
           g_activeTotalLen = totalLen;
           g_imageTransferStartMs = millis();
           resetChunkTiming();
-          if (!g_activeImageOverflow) beginImageStaging(*session);
+          if (!g_activeOverflow) beginImageStaging(*session);
           return;
         }
 
         if (field == kFieldTitle || field == kFieldBody) g_textTransferStartMs = millis();
+
+        if (field == kFieldListDoc && totalLen > cap) {
+          // v12 part 3: refuse over-cap bytes outright rather than the
+          // silent truncation below -- unlike title/body, a list document
+          // truncated at an arbitrary byte can land exactly on a structural
+          // boundary and parse as a shorter-but-well-formed document, which
+          // would silently store a shopping list missing items with no error
+          // the app or the user ever sees. No buffer allocated; CHUNKs for
+          // this transfer are consumed and thrown away by the `!g_activeBuf`
+          // guard below, and END answers RejectedSize once pushId exists.
+          g_activeOverflow = true;
+          g_activeTotalLen = totalLen;
+          break;
+        }
 
         g_activeTotalLen = totalLen > cap ? cap : totalLen;
         g_activeBuf = makeUniqueNoThrow<uint8_t[]>(g_activeTotalLen == 0 ? 1 : g_activeTotalLen);
@@ -1269,7 +1297,7 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           // of when the write arrived, not what this task did with it.
           const uint32_t chunkEntryMs = millis();
           recordChunkGap(chunkEntryMs);
-          if (g_activeImageOverflow || g_activeShapeRejected || g_activeImageFailed || g_activeSeqGap) return;
+          if (g_activeOverflow || g_activeShapeRejected || g_activeImageFailed || g_activeSeqGap) return;
           // v9: image CHUNKs carry a 2-byte little-endian sequence number
           // right after sessionId -- byte 0 opcode, byte 1 sessionId, bytes
           // 2-3 seq, bytes 4..N payload. Every other field's CHUNK is
@@ -1445,7 +1473,7 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
             }
             logChunkTiming();
             logLastConnParams();
-            if (g_activeImageOverflow) {
+            if (g_activeOverflow) {
               notifyRenderStatus(RenderResult::RejectedSize, pushId);
             } else if (g_activeSeqGap) {
               // Distinct from StorageFailed: the SD path never ran into
@@ -1484,6 +1512,41 @@ class ContentCharCallbacks : public NimBLECharacteristicCallbacks {
           case kFieldIcon:
             if (g_activeBuf) finishAsset(field, *session, sessionId);
             break;
+
+          case kFieldListDoc: {
+            // v12 part 3: a list document is content, answered via
+            // RENDER_STATUS like title/body/image -- NOT an asset (ASSET_ACK
+            // is for kFieldUiDeclaration/kFieldIcon only). Ingested straight
+            // to SD here, on this task, rather than via ContentFieldCallback
+            // (which crosses to the main loop and must stay cheap -- see its
+            // doc comment in CompanionBle.h): one SD write per whole-document
+            // push is the same infrequent-write class as finishAsset()'s own
+            // storeAsset() call just above, not the per-CHUNK hot path the
+            // image writer task exists to avoid.
+            if (g_activeOverflow) {
+              notifyRenderStatus(RenderResult::RejectedSize, pushId);
+              break;
+            }
+            if (!g_activeBuf) {
+              // OOM at START already fully reset via resetReassembly() there
+              // (g_activeField -> 0), so this case would not even be reached
+              // -- guarded anyway rather than dereferencing a null buffer.
+              notifyRenderStatus(RenderResult::StorageFailed, pushId);
+              break;
+            }
+            switch (companionpeer::storeListDocument(session->peerKey, g_activeBuf.get(), g_activeWritten)) {
+              case companionpeer::ListStoreResult::Stored:
+                notifyRenderStatus(RenderResult::Displayed, pushId);
+                break;
+              case companionpeer::ListStoreResult::RejectedFormat:
+                notifyRenderStatus(RenderResult::DecodeFailed, pushId);
+                break;
+              case companionpeer::ListStoreResult::RejectedStorage:
+                notifyRenderStatus(RenderResult::StorageFailed, pushId);
+                break;
+            }
+            break;
+          }
 
           case kFieldContentId:
             session->contentIdLen = static_cast<uint8_t>(g_activeWritten);
