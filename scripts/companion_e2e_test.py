@@ -1949,13 +1949,16 @@ async def run_tests(args, console: Console, results: Results) -> None:
 
                     # --- an over-cap document is refused --------------------- #
                     #
-                    # One list, one group, enough single-character items to
-                    # clear MAX_LIST_DOC_LEN (16 KiB) comfortably -- each item
-                    # is 4 bytes of header plus 1 byte of text, so ~3300 items
-                    # covers it with margin.
+                    # One list, one group, few but *long* items to clear
+                    # MAX_LIST_DOC_LEN (16 KiB). Deliberately not thousands of
+                    # tiny items: item count is a u8 per group (see
+                    # CompanionTodoDocument.h's layout), so that shape cannot
+                    # even be encoded -- it overflows the count byte long
+                    # before the document reaches 16 KiB. Each item here is
+                    # 5 header bytes plus 250 of text, so 70 items is ~17.8 KB.
                     oversize_items = [
-                        {"id": i & 0xFFFF, "text": "x", "checked": 0}
-                        for i in range(1, 3400)
+                        {"id": i, "text": "x" * 250, "checked": 0}
+                        for i in range(1, 71)
                     ]
                     oversize_doc = encode_list_doc(
                         [{"id": 1, "title": "Too Big", "groups": [
