@@ -72,6 +72,7 @@ so a host can pick replies out of the log stream without parsing timestamps.
 | `CMD:CCAP` | `CT:cap len=23 <hex>` | Capability block without a BLE read |
 | `CMD:CUI` | `CT:ui …`, then one `CT:button …` and one `CT:tag …` per entry | The foreground app's declared buttons and tags |
 | `CMD:CTAGS` | `CT:tags count=N`, then one `CT:tag id=… state=… label=…` | Live tag state — see below |
+| `CMD:CLIST` | `CT:list peer=… revision=… count=N`, then one `CT:listitem id=… checked=…` per entry | The foreground peer's stored ToDo List check-off diff — see below |
 | `CMD:CBTN <id> [holdMs]` | `CT:btn id=… hold=…` | Inject a button press |
 | `CMD:CRESET` | `CT:reset ok` | Delete all peer state — back to never-paired |
 
@@ -79,7 +80,7 @@ Button ids match the protocol's own: `0` BACK, `1` CONFIRM, `2` LEFT, `3` RIGHT,
 `4` UP, `5` DOWN, `6` POWER.
 
 `screen` is one of `start_failed`, `waiting`, `waiting_app`, `icon_grid`,
-`pairing`, `text`, `image`.
+`gallery_picker`, `pairing`, `text`, `image`, `list`, `message`.
 
 ### `CBTN` and hold duration
 
@@ -98,6 +99,22 @@ whether its tag write landed. This is the one piece of protocol state a BLE
 client genuinely cannot confirm for itself, and reading it back over serial is
 how a test asserts it did. It is also how the harness checks that tags survive a
 content push (they must) and clear on a foreground handover (they must).
+
+### `CLIST`
+
+Reports the foreground peer's `list_state.bin` — the check-off diff the device
+holds against the ToDo List document that peer pushed. Read-only, and justified
+exactly as `CTAGS` is: it exposes no capability, only state already on SD.
+
+Entries are the DEVIATIONS from the pushed document, not absolute checkbox
+states (see `src/CompanionTodoDiff.h`), so `count=0` means "nothing pending",
+whether the user never touched a checkbox or toggled one back to where the
+document had it. `revision` is the document revision the edits were made
+against; the device never interprets it. A peer with no stored diff at all
+reports `revision=0 count=0`, the same as one with nothing pending.
+
+The diff is cleared unconditionally whenever a new list document lands, so
+`CMD:CLIST` immediately after a `kFieldListDoc` push always reports `count=0`.
 
 ### `CRESET`
 

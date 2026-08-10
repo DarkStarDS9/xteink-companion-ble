@@ -7,6 +7,7 @@
 #include <ArduinoJson.h>
 #include <HalStorage.h>
 #include <Logging.h>
+#include <Memory.h>
 #include <PersistableStore.h>
 #include <esp_random.h>
 #include <mbedtls/sha256.h>
@@ -50,6 +51,48 @@ std::string listsPath(const char* peerKey) { return peerDir(peerKey) + "/" + kLi
 // mid-write, and the next push overwrites it before ever reading it, so it
 // costs nothing to leave cleanup to that path plus removePeerDir().
 std::string listsTmpPath(const char* peerKey) { return peerDir(peerKey) + "/" + kListsFileName + ".tmp"; }
+
+constexpr const char* kListStateFileName = "list_state.bin";
+
+std::string listStatePath(const char* peerKey) { return peerDir(peerKey) + "/" + kListStateFileName; }
+// Same throwaway-temp reasoning as listsTmpPath() above.
+std::string listStateTmpPath(const char* peerKey) { return peerDir(peerKey) + "/" + kListStateFileName + ".tmp"; }
+
+// list_state.bin's header, duplicated here only as offsets -- the layout itself
+// is documented once, in CompanionTodoDiff.h. This file reads the header
+// directly rather than decoding a whole Diff because the two hot callers
+// (readListStateEntries(), listStateCount()) exist precisely to avoid
+// materialising one.
+constexpr uint8_t kListStateFormatVersion = 1;
+constexpr size_t kListStateHeaderLen = 7;
+constexpr size_t kListStateEntryLen = 3;
+constexpr size_t kMaxListStateLen = kListStateHeaderLen + kListStateEntryLen * companiontodo::kMaxDiffEntries;
+
+// Reads and validates list_state.bin's header, leaving `file` positioned just
+// past it. False (file closed) when absent, too short, or the wrong version.
+bool openListStateHeader(const char* peerKey, HalFile& file, uint32_t* revisionOut, uint16_t* countOut) {
+  if (!Storage.openFileForRead("CPEER", listStatePath(peerKey), file)) return false;
+  uint8_t header[kListStateHeaderLen] = {0};
+  const int read = file.read(header, sizeof(header));
+  if (read != static_cast<int>(sizeof(header)) || header[0] != kListStateFormatVersion) {
+    file.close();
+    return false;
+  }
+  // An over-cap count means a corrupt or foreign file; refusing it here keeps
+  // every caller below from having to reason about a length nothing here could
+  // have written.
+  const uint16_t count = static_cast<uint16_t>(header[5] | (header[6] << 8));
+  if (count > companiontodo::kMaxDiffEntries) {
+    file.close();
+    return false;
+  }
+  if (revisionOut) {
+    *revisionOut = static_cast<uint32_t>(header[1]) | (static_cast<uint32_t>(header[2]) << 8) |
+                   (static_cast<uint32_t>(header[3]) << 16) | (static_cast<uint32_t>(header[4]) << 24);
+  }
+  if (countOut) *countOut = count;
+  return true;
+}
 
 // The images index is read/mutated/written on demand, same discipline as
 // peers.json — see the header's "NOTHING HERE IS RESIDENT" note.
@@ -150,6 +193,8 @@ void removePeerDir(const char* peerKey) {
   Storage.removeDir((dir + "/images").c_str());
   Storage.remove((dir + "/" + kListsFileName).c_str());
   Storage.remove((dir + "/" + kListsFileName + ".tmp").c_str());
+  Storage.remove((dir + "/" + kListStateFileName).c_str());
+  Storage.remove((dir + "/" + kListStateFileName + ".tmp").c_str());
   Storage.removeDir((dir + "/data").c_str());
   Storage.rmdir(dir.c_str());
 }
@@ -431,6 +476,21 @@ ListStoreResult storeListDocument(const char* peerKey, const uint8_t* data, size
     Storage.remove(tmpPath.c_str());
     return ListStoreResult::RejectedStorage;
   }
+
+  // A new document lands: the old diff goes, unconditionally, without
+  // comparing revisions. Comparing would be the DEVICE deciding whether the
+  // user's pending edits still apply to the document that just arrived, and
+  // the whole model here is that it never decides that -- the phone does, by
+  // pulling the diff before it pushes (CLAUDE.md, "dumb firmware, smart
+  // phone"). A device that kept a diff it judged still-valid would silently
+  // re-apply edits against items the phone may have deleted, renamed or
+  // already synced, and would be doing it on the side of the split with the
+  // least information.
+  //
+  // This is deliberately AFTER the rename, not before: a push that fails
+  // validation or fails to write must leave both the old document and the old
+  // diff untouched, and every failure path above returns before reaching here.
+  clearListState(peerKey);
   return ListStoreResult::Stored;
 }
 
@@ -453,6 +513,118 @@ size_t readListDocument(const char* peerKey, uint8_t* buf, size_t bufLen) {
   const int read = file.read(buf, size);
   file.close();
   return read > 0 ? static_cast<size_t>(read) : 0;
+}
+
+size_t listStateSize(const char* peerKey) {
+  HalFile file;
+  if (!Storage.openFileForRead("CPEER", listStatePath(peerKey), file)) return 0;
+  const size_t size = file.size();
+  file.close();
+  return size;
+}
+
+uint16_t listStateCount(const char* peerKey) {
+  HalFile file;
+  uint16_t count = 0;
+  if (!openListStateHeader(peerKey, file, nullptr, &count)) return 0;
+  file.close();
+  return count;
+}
+
+bool readListState(const char* peerKey, companiontodo::Diff& out) {
+  out.clear();  // no file, or an unreadable one, is "no local edits"
+
+  HalFile file;
+  if (!Storage.openFileForRead("CPEER", listStatePath(peerKey), file)) return false;
+  const size_t size = file.size();
+  if (size < kListStateHeaderLen || size > kMaxListStateLen) {
+    file.close();
+    return false;
+  }
+
+  // Transient: at most kMaxListStateLen (1543) bytes, freed before this returns.
+  // Not a stack buffer -- that is six times the <256 B frame budget in
+  // .skills/SKILL.md -- and not resident, per this file's header note.
+  auto buffer = makeUniqueNoThrow<uint8_t[]>(size);
+  if (!buffer) {
+    LOG_ERR("CPEER", "OOM: %u bytes for list state", static_cast<unsigned>(size));
+    file.close();
+    return false;
+  }
+  const int read = file.read(buffer.get(), size);
+  file.close();
+  if (read != static_cast<int>(size)) return false;
+
+  return companiontodo::Diff::decode(buffer.get(), size, out);
+}
+
+bool writeListState(const char* peerKey, const companiontodo::Diff& in) {
+  if (!Storage.ensureDirectoryExists(peerDir(peerKey).c_str())) return false;
+
+  const size_t length = kListStateHeaderLen + kListStateEntryLen * in.count();
+  auto buffer = makeUniqueNoThrow<uint8_t[]>(length);
+  if (!buffer) {
+    LOG_ERR("CPEER", "OOM: %u bytes for list state", static_cast<unsigned>(length));
+    return false;
+  }
+  if (in.encode(buffer.get(), length) != length) return false;
+
+  // Identical temp-file discipline to storeListDocument() above, down to
+  // clearing both the stale temp file and the destination first: renaming over
+  // an existing path is not guaranteed on every filesystem, and a temp left by
+  // an interrupted write would otherwise collide with openFileForWrite().
+  const std::string tmpPath = listStateTmpPath(peerKey);
+  Storage.remove(tmpPath.c_str());
+  if (!writeWholeFile(tmpPath, buffer.get(), length)) {
+    Storage.remove(tmpPath.c_str());
+    return false;
+  }
+
+  const std::string destPath = listStatePath(peerKey);
+  Storage.remove(destPath.c_str());
+  if (!Storage.rename(tmpPath.c_str(), destPath.c_str())) {
+    LOG_ERR("CPEER", "could not move %s to %s", tmpPath.c_str(), destPath.c_str());
+    Storage.remove(tmpPath.c_str());
+    return false;
+  }
+  return true;
+}
+
+size_t readListStateEntries(const char* peerKey, uint16_t offset, uint16_t maxEntries, uint8_t* out,
+                            uint32_t* revisionOut, uint16_t* totalOut) {
+  if (revisionOut) *revisionOut = 0;
+  if (totalOut) *totalOut = 0;
+
+  HalFile file;
+  uint32_t revision = 0;
+  uint16_t total = 0;
+  if (!openListStateHeader(peerKey, file, &revision, &total)) return 0;
+  if (revisionOut) *revisionOut = revision;
+  if (totalOut) *totalOut = total;
+
+  // Past the end is a legitimate pull, not an error: it is exactly what the
+  // last request of a walk looks like, and what an empty diff answers to any
+  // request at all.
+  if (!out || maxEntries == 0 || offset >= total) {
+    file.close();
+    return 0;
+  }
+  const uint16_t wanted =
+      static_cast<uint16_t>(total - offset) < maxEntries ? static_cast<uint16_t>(total - offset) : maxEntries;
+
+  const size_t at = kListStateHeaderLen + kListStateEntryLen * offset;
+  const size_t wantedBytes = kListStateEntryLen * wanted;
+  if (!file.seek(at) || file.read(out, wantedBytes) != static_cast<int>(wantedBytes)) {
+    file.close();
+    return 0;
+  }
+  file.close();
+  return wanted;
+}
+
+void clearListState(const char* peerKey) {
+  Storage.remove(listStatePath(peerKey).c_str());
+  Storage.remove(listStateTmpPath(peerKey).c_str());
 }
 
 std::string displayName(const char* peerKey) {

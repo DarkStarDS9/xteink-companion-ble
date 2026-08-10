@@ -56,6 +56,9 @@
 // header's API. CompanionBle.h is enum/constant declarations only (it pulls in
 // nothing but <cstddef>/<cstdint>), so this costs no dependency.
 #include "CompanionBle.h"
+// For companiontodo::Diff, the list_state.bin payload type. Dependency-free by
+// charter (<cstdint>/<cstddef> only), so this costs nothing here either.
+#include "CompanionTodoDiff.h"
 
 namespace companionpeer {
 
@@ -271,6 +274,61 @@ size_t listDocumentSize(const char* peerKey);
 // that validated the wire push before it was ever stored -- there is no
 // separate on-device reader to keep in sync with that one.
 size_t readListDocument(const char* peerKey, uint8_t* buf, size_t bufLen);
+
+// ---- list_state.bin: the on-device check-off diff (ToDo List Phase B) ----
+//
+// Stored at peers/<key>/list_state.bin, in exactly the bytes
+// companiontodo::Diff::encode() produces. lists.bin is never touched by any of
+// this: the pushed document stays the verbatim thing the phone sent, and every
+// on-device edit lives here as a deviation from it. See CompanionTodoDiff.h for
+// why that split exists.
+//
+// Same "NOTHING HERE IS RESIDENT" discipline as everything above -- the diff is
+// read from SD, used, and dropped. It is 1096 bytes when materialised, which is
+// affordable transiently and not affordable resident alongside NimBLE.
+
+// Size in bytes of this peer's stored list_state.bin, or 0 if this peer has
+// none. Mirrors listDocumentSize() above.
+size_t listStateSize(const char* peerKey);
+
+// Reads and decodes this peer's stored diff into `out`. False -- with `out`
+// cleared -- when there is no file, or the file fails Diff::decode()'s
+// validation. A corrupt diff is treated as no diff at all rather than as an
+// error to surface: the document alone still renders correctly, and the phone
+// re-pushing is the recovery path.
+bool readListState(const char* peerKey, companiontodo::Diff& out);
+
+// Writes `in` as this peer's list_state.bin, replacing whatever was there.
+// Uses the identical temp-file + rename discipline as storeListDocument()
+// above, for the identical reason: a mid-write SD failure must not leave a
+// truncated file clobbering the user's previously-good edits.
+bool writeListState(const char* peerKey, const companiontodo::Diff& in);
+
+// Copies up to `maxEntries` encoded entries, starting at entry index `offset`,
+// straight out of list_state.bin into `out` (3 bytes each, the exact wire
+// encoding -- see CompanionTodoDiff.h). `revisionOut` and `totalOut` (both may
+// be null) receive the file's header fields. Returns the number of ENTRIES
+// written, which is 0 -- not an error -- when `offset` is at or past the total,
+// when there is no file, or when the header does not validate.
+//
+// This exists so the pull path needs no resident structure and no materialised
+// Diff at all: a header read, one seek to 7 + 3*offset, one read. The entry
+// encoding on disk being byte-identical to the wire body is what makes that
+// possible, and is why that identity is asserted in
+// test/companion_todo_diff/.
+size_t readListStateEntries(const char* peerKey, uint16_t offset, uint16_t maxEntries, uint8_t* out,
+                            uint32_t* revisionOut, uint16_t* totalOut);
+
+// Deletes this peer's stored diff. Called unconditionally whenever a new
+// document lands -- see storeListDocument()'s comment for why the device does
+// not get a say in whether the diff is still applicable.
+void clearListState(const char* peerKey);
+
+// Entry count from list_state.bin's header alone -- one open, one 7-byte read,
+// no body. For the "n unsynced edits" style of caller that needs the number and
+// nothing else; readListState() is the wrong tool for that and costs 1096 bytes
+// of stack or heap to answer the same question.
+uint16_t listStateCount(const char* peerKey);
 
 // Marks the peer as most recently seen and evicts beyond kMaxPeers.
 void touch(const char* peerKey);

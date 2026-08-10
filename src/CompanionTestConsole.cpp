@@ -225,6 +225,43 @@ bool handleCommand(const String& command) {
     }
     return true;
   }
+  if (command == "CLIST") {
+    // Read-only, and justified exactly as CTAGS above is: it reports state the
+    // device already holds on SD, it adds no capability, and it is the only way
+    // a host harness can see the check-off diff without a phone (CLAUDE.md,
+    // "The phone is not a test harness").
+    const char* peerKey = companionble::foregroundPeerKey();
+    if (peerKey[0] == '\0') {
+      reply("list none: no foreground peer");
+      return true;
+    }
+
+    uint32_t revision = 0;
+    uint16_t total = 0;
+    // Entries are streamed a window at a time rather than through a whole
+    // companiontodo::Diff: 1096 bytes of stack for a diagnostic print is not a
+    // trade this part can make, and readListStateEntries() exists precisely so
+    // no caller has to.
+    uint8_t entries[32 * 3];
+    constexpr uint16_t kWindow = sizeof(entries) / 3;
+
+    // maxEntries 0 asks for the header alone. A peer with no stored diff at all
+    // reports the same revision=0 count=0 as one whose edits are all synced
+    // away, which is the honest answer: neither has anything pending.
+    companionpeer::readListStateEntries(peerKey, 0, 0, nullptr, &revision, &total);
+    reply("list peer=%s revision=%u count=%u", peerKey, static_cast<unsigned>(revision), static_cast<unsigned>(total));
+
+    for (uint16_t offset = 0; offset < total;) {
+      const size_t got = companionpeer::readListStateEntries(peerKey, offset, kWindow, entries, nullptr, nullptr);
+      if (got == 0) break;
+      for (size_t i = 0; i < got; ++i) {
+        const uint16_t id = static_cast<uint16_t>(entries[i * 3] | (entries[i * 3 + 1] << 8));
+        reply("listitem id=%u checked=%u", static_cast<unsigned>(id), static_cast<unsigned>(entries[i * 3 + 2]));
+      }
+      offset = static_cast<uint16_t>(offset + got);
+    }
+    return true;
+  }
   if (command == "CUI" || command.startsWith("CUI ")) {
     String arg = command == "CUI" ? "" : command.substring(4);
     arg.trim();
@@ -234,8 +271,7 @@ bool handleCommand(const String& command) {
       return true;
     }
     uint8_t raw[companionpeer::kMaxUiDeclarationLen];
-    const size_t length =
-        companionpeer::readAssetBody(peerKey, companionpeer::kAssetUiDeclaration, raw, sizeof(raw));
+    const size_t length = companionpeer::readAssetBody(peerKey, companionpeer::kAssetUiDeclaration, raw, sizeof(raw));
     if (length < 1) {
       reply("ui none: peer %s has no stored declaration", peerKey);
       return true;
