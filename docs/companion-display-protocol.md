@@ -808,6 +808,47 @@ that arrives for a peer with no stored diff, is answered `LIST_STATE` with
 logs nothing and there is no error result: "read until `n` is 0, or until
 `offset + n` reaches `total`" is the whole client-side loop.
 
+**A client MUST compare `total` across the pages of one walk.** This is the one
+rule a correct-looking implementation gets wrong, so it is stated as a
+requirement rather than left to be inferred from the stateless-pull paragraph
+above. `offset` indexes the stored diff, which is ordered ascending by `itemId`
+(see "List-state storage"), and the user can check something off *during* a
+walk — the device serves each `LIST_STATE_GET` from the file as it is at that
+moment, by design, because holding a snapshot across a conversation is exactly
+the state the stateless pull exists to avoid. A toggle between two pages
+inserts or erases an entry and shifts every later one by a position:
+
+- an **erase** shifts entries left, so the next window **skips** one;
+- an **insert** shifts them right, so the next window **repeats** one.
+
+The repeat is harmless — a client keyed by `itemId` overwrites with the same
+value. **The skip is not**: the deviation is missing from the pull, so it is
+missing from the merge, and the document push that concludes a merge clears the
+device's diff, taking the un-pulled edit with it. The user's check-off is gone
+and nothing is left to re-pull.
+
+`revision` does **not** catch this and cannot: it is the revision of the
+document the diff was taken against, so a check-off leaves it untouched. `total`
+does catch it, and exactly: every toggle changes the entry count by one, because
+an entry exists only while it deviates, so toggling an item that already has an
+entry necessarily erases it rather than updating it in place. **If `total`
+differs from the first page's, discard the accumulated result and walk again
+from `offset 0`** — a shifting table means the user is pressing Confirm right
+now, and a fresh walk moments later gets a clean read. Do not attempt to patch
+up a partial result.
+
+Two caveats worth stating plainly. A toggle that inserts one entry and erases
+another between the same two pages leaves `total` unchanged and is undetectable;
+that needs two presses inside a page-to-page gap measured at ~30 ms on real
+hardware, and no client is expected to handle it. And a walk whose `revision`
+changes is a **different** condition with a different remedy: the only thing
+that changes `revision` is a document push, which deletes the diff outright, so
+`revision` changing mid-walk (in practice to `0`, since a cleared diff reports
+`revision 0`/`total 0`) means the diff is gone, not that it moved. Check
+`revision` **before** `total` and do not retry that case — a retry would
+"succeed" against the now-empty diff and hand back no deviations at all, which
+merges and pushes as "the user checked nothing off".
+
 **When `LIST_STATE_AVAIL` is sent — and the gate.** The device sends it **if
 and only if** the peer has a stored diff with at least one entry. There is no
 capability bit for "this peer does ToDo lists": a non-`LIST` peer structurally
