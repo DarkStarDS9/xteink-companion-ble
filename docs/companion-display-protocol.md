@@ -894,6 +894,11 @@ whose name is no longer on screen.
 answer. **Retrying means reconnecting**, not re-sending `HELLO` on the same link:
 there is no "start over on this connection" message, by design — one handshake
 per link keeps the session table's lifetime trivially tied to the connection.
+A well-behaved client never needs to re-`HELLO` on a link it already has a
+session on. If one does anyway (a retry bug, a duplicate write), the device
+does not grow a second session for that peer: an already-admitted peer's
+`HELLO` reuses its existing `sessionId` rather than consuming another of the 4
+slots, since it is the same install re-identifying itself, not a second app.
 
 A known peer presenting its correct token gets `HELLO_OK` immediately, with no
 prompt. That is the whole of the "connects automatically" relationship.

@@ -45,6 +45,9 @@ Covered:
   buttonmap    ACQUIRE denied with no declaration; accepted after pushing one
   content      atomic title+body+content-id, v11 RENDER_STATUS, held button round trip
   seqgap       v10/v11: a batch that loses a field is discarded whole and answered
+  duphello    a second HELLO for a peer that's already admitted, same link: must
+              not grow the session table (sessionIdForPeer's "at most one
+              session per peerKey" comment, currently unenforced by admitPeer)
   preemption   two sessions on one link, last-requester-wins, in-flight discard
   image        raw packed 2bpp full-screen push, chunk acks, and the decode verdict
   tags         app-declared tags: atomic with content, and state-only writes
@@ -1108,6 +1111,30 @@ async def run_tests(args, console: Console, results: Results) -> None:
                 peers = console.await_peers(1)
                 results.check("peer appears in the device's index", len(peers) >= 1, str(peers))
             check_no_errors(console, results, "enrollment")
+
+        # --- duplicate HELLO for an already-admitted peer, same link -------- #
+        if enabled("duphello") and session_a.session_id:
+            print("\n[duphello] a second HELLO for an already-admitted peer, same link")
+            first_session_id = session_a.session_id
+            reply = await session_a.hello()  # known peer, valid token: auto-accept path
+            results.check(
+                "second HELLO for the same peer is answered HELLO_OK",
+                reply.ok, "" if reply.ok else reply.reason_text,
+            )
+            if reply.ok:
+                # session_a.wait_hello() already overwrote session_a.session_id
+                # with whatever this second HELLO_OK carried -- which is exactly
+                # the client-side behaviour that makes a stale slot dangerous:
+                # the app moves on to the newest id, so anything still
+                # addressed to the old one is unroutable, not just redundant.
+                await asyncio.sleep(0.3)  # CSTATE settles on the next main-loop tick
+                results.check(
+                    "a second HELLO from the same peer does not grow the session table",
+                    console.state().get("sessions") == "1",
+                    f"sessions={console.state().get('sessions')} (first sessionId "
+                    f"{first_session_id}, second HELLO_OK gave {reply.session_id})",
+                )
+            check_no_errors(console, results, "duphello")
 
         # --- ACQUIRE gating ------------------------------------------------ #
         if enabled("buttonmap") and session_a.session_id:

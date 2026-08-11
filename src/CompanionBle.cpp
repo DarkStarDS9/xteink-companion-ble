@@ -973,10 +973,19 @@ void computeCapabilityValue(const GfxRenderer& renderer, int fontId) {
 // the session and answers HELLO_OK. Shared by the auto-accept path (known peer,
 // valid token) and resolvePairing()'s accept path.
 void admitPeer(uint16_t helloTag, const char* peerKey, const uint8_t token[16]) {
-  const uint8_t sessionId = allocateSession(peerKey);
+  // A second HELLO for a peer that already has a live session is the same
+  // install reconnecting, not a second app -- see sessionIdForPeer's doc
+  // comment. Reuse its slot rather than handing out a second one: two active
+  // slots for one peerKey would leave sessionIdForPeer's oldest-match lookup
+  // routing session-scoped notifications (LIST_STATE_AVAIL among them) to the
+  // slot this HELLO is superseding, which the app has already moved past.
+  uint8_t sessionId = sessionIdForPeer(peerKey);
   if (sessionId == kNoSession) {
-    notifyHelloDenied(helloTag, kDeniedNoSlots);
-    return;
+    sessionId = allocateSession(peerKey);
+    if (sessionId == kNoSession) {
+      notifyHelloDenied(helloTag, kDeniedNoSlots);
+      return;
+    }
   }
   companionpeer::touch(peerKey);
   notifyHelloOk(helloTag, sessionId, peerKey, token);
