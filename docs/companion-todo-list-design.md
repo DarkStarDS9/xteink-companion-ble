@@ -20,8 +20,20 @@ implemented and hardware-verified.** Landed: the on-device diff
 (`list_state.bin` — **binary, not the JSON this document originally specified; see §3**), `Confirm`
 toggling on `Screen::List`, and the `LIST_STATE_AVAIL`/`LIST_STATE_GET`/`LIST_STATE` conversation
 on the Session characteristic. The full `scripts/companion_e2e_test.py` suite passed **159 passed,
-0 failed, 0 skipped** against a real X3 reader on three consecutive runs. **Not** landed: phase C
-(CompanionKit surface).
+0 failed, 0 skipped** against a real X3 reader on three consecutive runs.
+
+**STATUS (2026-08-11): Phase C is implemented and hardware-verified — every phase of this design
+has now landed.** Phase C lives in the CompanionKit repo, not this one (commits `f5a4d6e`,
+`faeebc4`): the `LIST_STATE_AVAIL`/`LIST_STATE` decoders, `pullListState()`'s paginated walk, and
+`TodoDocument.mergingDeviceDeviations()` — the merge policy §4 pushed onto the phone. Verified
+against a real X3 by two `companion-bench` scenarios that drive the reader over BLE while injecting
+the check-off button presses over the test console's serial port, **28/28 assertions**. The
+pagination case is the one that needed hardware: `kListStateEntriesPerNotify` is a firmware
+constant, so a host fixture asserting a 30-entry page boundary only proves the fixture agrees with
+itself. The observed walk was `[30, 5, 0]` over 35 deviations — a full page, a short final page,
+then the `n = 0` terminator — with 37 live `LIST_STATE_AVAIL` notifications counting 1 → 35 as the
+toggles landed. Both scenarios cross-check the BLE pull against `CMD:CLIST`, the device's own
+SD-read view of the same diff, which shares no code with the BLE path.
 
 **Both phases are part of protocol v12, not a new version.** v12 already reserved
 `ContentShape::List = 0x03` (`docs/companion-declared-shape-design.md`); phase A gave the
@@ -353,6 +365,27 @@ version). New first-class Swift types, not opaque-bytes round-tripping:
   with the app's own edits into a new revision — lives here, in the app-facing package, per "the
   device never merges" in §4/§6.
 
+**As implemented**, with two decisions this section did not anticipate:
+
+- **The deviations are their own type, not a bare `[itemId: Bool]`.** `TodoDeviations` carries the
+  `revision` alongside the map, because a map on its own loses the one piece of context that decides
+  whether it may be applied at all. `TodoDocument.mergingDeviceDeviations(_:newRevision:)` throws
+  `TodoMergeError.revisionMismatch` when the deviations were taken against a different revision than
+  the document being merged into, unless the caller passes `evenIfRevisionMismatched: true`. §4 says
+  the device "records, never interprets" `revision` and leaves resolution to the phone; making the
+  phone's resolution an explicit argument is what that looks like at a call site. A deviation naming
+  an `itemId` the document no longer contains is silently unapplied — the normal shape of "the
+  device recorded a toggle on an item the phone has since deleted", not a corruption signal.
+- **The pull requires the foreground**, which is a client-side choice, not a wire rule — the device
+  answers `LIST_STATE_GET` from any admitted session, foreground or not. A screen-free pull would be
+  a background sync running underneath whichever app owns the display, against this protocol's
+  one-app-at-a-time shape. It costs the real workflow nothing, because the round trip is pull →
+  merge → push and the push requires foreground regardless. Note this does **not** weaken §4's
+  "`HELLO_OK` ordering is load-bearing" guarantee: that guarantee is about the phone being *told*
+  before it is *able* to destroy a diff, and acquiring the screen never clears one — only a document
+  push does. So `AVAIL → acquire → pull → merge → push` is safe, and the event is a signal to
+  schedule a pull rather than to issue one immediately.
+
 ## 8. Memory
 
 | Item | Where it lives | Cost |
@@ -416,6 +449,13 @@ way for `Screen::List` to hold a cursor or claim its buttons — see §4 above a
   terminator, and that a re-push clears the diff. Per this repo's "every fix starts red" /
   no-phone-as-test-harness rules — this is protocol and firmware behaviour, not something that needs
   a phone to prove.
-- **C — CompanionKit surface.** §7. Can start once A's wire format is stable; does not need B to land
-  first, since the merge logic it owns is exercised by the harness fake in B, not required to be a
-  real iOS app for either A or B to be provable.
+- **C — CompanionKit surface.** §7. **Landed 2026-08-11** (CompanionKit `f5a4d6e`, `faeebc4`); see
+  the status block at the top of this document. Can start once A's wire format is stable; does not
+  need B to land first, since the merge logic it owns is exercised by the harness fake in B, not
+  required to be a real iOS app for either A or B to be provable.
+  **The "does not need B" reasoning held only for writing it, not for trusting it.** Phase C's
+  decoder was host-testable against fixtures exactly as predicted, but a fixture cannot prove the
+  page boundary, since the 30 is B's constant and a hand-built fixture asserting it only agrees with
+  itself. What closed that gap was driving a real device from CompanionKit's own bench — the same
+  no-phone-as-test-harness discipline the root `CLAUDE.md` demands of firmware, applied to the
+  client. A consumer app was still not needed; a real device was.
