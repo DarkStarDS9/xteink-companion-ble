@@ -370,15 +370,48 @@ class Console:
             errors, self._errors = self._errors, []
         return errors
 
-    def send(self, command: str, expect: str | None = None, timeout: float = 5.0) -> list[str]:
-        """Sends one command and collects `CT:` replies until the stream goes quiet."""
+    def _write_command(self, command: str) -> None:
+        self.serial.write(f"CMD:{command}\n".encode())
+        self.serial.flush()
+
+    def _barrier(self, timeout: float = 2.0) -> bool:
+        """Draws a line in the reply stream: everything before it is the past.
+
+        Draining the queue before writing is not enough, because the reader is a
+        concurrent thread: a straggler from the *previous* command can be queued
+        after the drain has already run and be read back as this command's
+        answer -- a stale value rather than a missing one, and the most likely
+        story behind the "device reports two live sessions" flake that never
+        reproduced. A generation counter cannot fix that either; nothing in the
+        line itself says which command it answers (see
+        docs/companion-test-console.md -- replies carry no correlation token).
+
+        So mark the boundary in the byte stream itself: send CPING and discard
+        everything up to and including its `pong`. Costs one round trip, uses
+        only a command the firmware already has, and needs no blanket sleep. If
+        the device is too busy to answer in time we fall back to the old
+        best-effort drain rather than failing the command.
+        """
+        self._write_command("CPING")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                reply = self._ct_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if reply.startswith("pong"):
+                return True
         while not self._ct_queue.empty():
             try:
                 self._ct_queue.get_nowait()
             except queue.Empty:
                 break
-        self.serial.write(f"CMD:{command}\n".encode())
-        self.serial.flush()
+        return False
+
+    def send(self, command: str, expect: str | None = None, timeout: float = 5.0) -> list[str]:
+        """Sends one command and collects `CT:` replies until the stream goes quiet."""
+        self._barrier()
+        self._write_command(command)
 
         replies: list[str] = []
         deadline = time.time() + timeout

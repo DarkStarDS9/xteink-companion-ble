@@ -73,12 +73,16 @@ class FakeSerial:
     algorithm verbatim -- accumulate until b"\\n" *or* an empty read -- which is
     the whole point: that is what returns a partial line.
 
-"""
+    `responder` turns it into a device: each full `CMD:...` line written is
+    passed to it, and whatever chunks it returns are appended to the script.
+    """
 
-    def __init__(self, script=()):
+    def __init__(self, script=(), responder=None):
         self._script = list(script)
         self._lock = threading.Lock()
-        self.written = bytearray()
+        self._responder = responder
+        self._pending_write = bytearray()
+        self.commands: list[str] = []
         self.closed = False
         self.resets = 0
         self.exhausted = threading.Event()
@@ -125,8 +129,18 @@ class FakeSerial:
         return bytes(line)
 
     def write(self, data):
-        with self._lock:
-            self.written.extend(data)
+        self._pending_write.extend(data)
+        while b"\n" in self._pending_write:
+            raw, _, rest = bytes(self._pending_write).partition(b"\n")
+            self._pending_write = bytearray(rest)
+            command = raw.decode().strip()
+            self.commands.append(command)
+            if self._responder is not None:
+                chunks = self._responder(command) or []
+                with self._lock:
+                    self._script.extend(chunks)
+                    if self._script:
+                        self.exhausted.clear()
         return len(data)
 
     def flush(self):
@@ -139,9 +153,9 @@ class FakeSerial:
         self.closed = True
 
 
-def make_console(script=()):
+def make_console(script=(), responder=None):
     """A Console wired to a FakeSerial, bypassing __init__'s real port open."""
-    fake = FakeSerial(script)
+    fake = FakeSerial(script, responder)
     console = companion_e2e_test.Console(port="fake", serial_port=fake)
     return console, fake
 
@@ -314,6 +328,46 @@ class RandomSplitTest(unittest.TestCase):
                     self.assertEqual(console.pop_errors(), ["[ERR] CompanionBle: refused image"])
                 finally:
                     console.close()
+
+
+class StaleReplyTest(unittest.TestCase):
+    """send() must never attribute a previous command's reply to a new command."""
+
+    STALE = b"CT:state screen=waiting_app connected=0 sessions=2 heap=1\n"
+    FRESH = b"CT:state screen=list connected=1 sessions=1 heap=2\n"
+    FRESH_REPLY = "state screen=list connected=1 sessions=1 heap=2"
+
+    def _responder(self, delay_before_pong=0.0):
+        def respond(command):
+            if command == "CMD:CPING":
+                if delay_before_pong:
+                    return [lambda: (time.sleep(delay_before_pong), self.STALE)[1], b"CT:pong v12\n"]
+                return [b"CT:pong v12\n"]
+            if command == "CMD:CSTATE":
+                return [self.FRESH, TIMEOUT]
+            return [TIMEOUT]
+
+        return respond
+
+    def test_a_line_already_queued_is_not_attributed_to_the_next_command(self):
+        console, fake = make_console([self.STALE, TIMEOUT], self._responder())
+        try:
+            time.sleep(0.05)  # let the stale line reach the queue first
+            replies = console.send("CSTATE", expect="state", timeout=3.0)
+            self.assertEqual(replies, [self.FRESH_REPLY])
+        finally:
+            console.close()
+
+    def test_a_line_landing_after_the_drain_is_still_discarded(self):
+        """The old drain-then-write order lost this one: the reader is concurrent,
+        so a straggler from the previous command could be queued after the drain
+        had already run and be read back as this command's answer."""
+        console, fake = make_console([TIMEOUT], self._responder(delay_before_pong=0.05))
+        try:
+            replies = console.send("CSTATE", expect="state", timeout=3.0)
+            self.assertEqual(replies, [self.FRESH_REPLY])
+        finally:
+            console.close()
 
 
 if __name__ == "__main__":
