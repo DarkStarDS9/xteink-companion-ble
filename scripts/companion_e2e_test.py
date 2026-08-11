@@ -281,10 +281,23 @@ class Console:
     Everything else (INF/DBG lines) is dropped, same as before.
     """
 
-    def __init__(self, port: str, baud: int = 115200):
-        self.serial = serial.Serial(port, baud, timeout=0.2)
-        time.sleep(0.3)
-        self.serial.reset_input_buffer()
+    #: Cap on an unterminated run of bytes held in the reassembly buffer. A
+    #: device that emits a huge line with no newline (or a wedged UART) must
+    #: not be able to grow this without bound; past the cap the partial run is
+    #: dropped and reassembly restarts at the next newline.
+    MAX_LINE_BYTES = 8192
+
+    def __init__(self, port: str, baud: int = 115200, serial_port=None):
+        # serial_port is the host-test seam: test/host_python/test_console_reader.py
+        # injects a fake with pyserial's readline() semantics, so the reassembly
+        # logic below is testable with no hardware and no pyserial.
+        if serial_port is not None:
+            self.serial = serial_port
+        else:
+            self.serial = serial.Serial(port, baud, timeout=0.2)
+            time.sleep(0.3)
+            self.serial.reset_input_buffer()
+        self._rx_buffer = b""
         self._ct_queue: queue.Queue[str] = queue.Queue()
         self._errors: list[str] = []
         self._errors_lock = threading.Lock()
@@ -294,25 +307,61 @@ class Console:
         self._reader_thread.start()
 
     def _read_loop(self) -> None:
+        """Reassembles whole lines out of a stream that arrives in fragments.
+
+        pyserial's readline() is io.IOBase's, which stops at a newline *or* at
+        an empty read -- and pyserial's read() returns b"" when its timeout
+        expires. A readline() that straddles the 0.2s port timeout therefore
+        returns a PARTIAL line, with no way to tell it from a whole one. The
+        reader used to dispatch that fragment as a complete reply (it still
+        contains "CT:") and silently drop the remainder (it contains neither
+        "CT:" nor "[ERR]", so it fell through both branches), which is how
+        state() came back with screen= truncated to "" or sessions= missing
+        altogether. Buffer instead, and only dispatch on a real newline.
+        """
         while not self._stop.is_set():
             if self._reader_paused.is_set():
+                # read_screenshot() is about to reset_input_buffer() and read the
+                # port raw; a half-line held here would be stitched onto whatever
+                # follows the dump, so drop it with the bytes it belongs to.
+                self._rx_buffer = b""
                 time.sleep(0.02)
                 continue
             raw = self.serial.readline()
             if not raw:
                 continue
-            line = raw.decode("utf-8", "replace").strip()
-            if not line:
-                continue
-            if "CT:" in line:
-                self._ct_queue.put(line[line.index("CT:") + 3 :])
-            elif "[ERR]" in line:
-                with self._errors_lock:
-                    self._errors.append(line)
+            self._rx_buffer += raw
+            while b"\n" in self._rx_buffer:
+                line, _, self._rx_buffer = self._rx_buffer.partition(b"\n")
+                self._dispatch(line)
+            if len(self._rx_buffer) > self.MAX_LINE_BYTES:
+                # No newline in sight and past the cap: a wedged UART or a
+                # binary dump leaking into the log stream. Drop what is held
+                # rather than growing forever; reassembly resumes at the next
+                # newline. Costs at most one already-unparseable line.
+                self._rx_buffer = b""
+
+    def _dispatch(self, raw_line: bytes) -> None:
+        """Routes one *whole* line: CT: replies to the queue, [ERR] to the log."""
+        line = raw_line.decode("utf-8", "replace").strip()
+        if not line:
+            return
+        # "CT:" is searched for, not required at the start: a log line can share
+        # the wire with a reply and prefix it.
+        if "CT:" in line:
+            self._ct_queue.put(line[line.index("CT:") + 3 :])
+        elif "[ERR]" in line:
+            with self._errors_lock:
+                self._errors.append(line)
 
     def close(self) -> None:
         self._stop.set()
         self._reader_thread.join(timeout=1.0)
+        # A last reply with no trailing newline (device reset mid-line, or the
+        # port closed between the text and the "\n") is still a reply.
+        tail, self._rx_buffer = self._rx_buffer, b""
+        if tail:
+            self._dispatch(tail)
         self.serial.close()
 
     def pop_errors(self) -> list[str]:

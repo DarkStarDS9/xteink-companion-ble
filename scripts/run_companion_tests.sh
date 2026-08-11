@@ -32,6 +32,22 @@ else
   note_fail "host unit tests"
 fi
 
+# --- (a2) host python tests: the harness's own seams, no hardware --------- #
+# Console's serial reader is a host seam (test/host_python/test_console_reader.py
+# injects a fake port), and it is where the harness's long-standing "known flake"
+# actually lived. Uses .venv if present, but the tests stub bleak and pyserial,
+# so a plain python3 runs them too.
+echo
+echo "== host python tests (test/host_python) =="
+PY_UNIT="python3"
+[ -x ".venv/bin/python3" ] && PY_UNIT=".venv/bin/python3"
+if "$PY_UNIT" -m unittest discover -s test/host_python -p 'test_*.py'; then
+  note_pass "host python tests"
+else
+  note_fail "host python tests"
+fi
+echo
+
 # --- parse this script's own flags; --ble hands off everything after it --- #
 DO_FLASH=0
 DO_BLE=0

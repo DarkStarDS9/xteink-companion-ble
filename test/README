@@ -13,3 +13,10 @@ Run a single suite directly:
 
 Google Test is fetched via CMake FetchContent on first configure; the pinned
 version lives in test/CMakeLists.txt.
+
+test/host_python/ holds host tests for the BLE harness's own seams -- the parts
+of scripts/companion_e2e_test.py that need neither hardware nor a phone. They
+are stdlib-only (bleak and pyserial are stubbed) and run from the same loop:
+
+  python3 -m unittest discover -s test/host_python -p 'test_*.py'
+  scripts/run_companion_tests.sh          # runs them after the gtest suites
