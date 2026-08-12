@@ -1,17 +1,18 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include "CompanionBle.h"
 
 // The "what does this button do right now" decision, extracted out of
-// CompanionModeActivity.cpp's handleMappedButton()/labelFor()/listLabelFor()
-// so it can be covered by a host gtest suite instead of only hardware
-// regressions (see test/companion_button_policy/), exactly as
-// CompanionBatchModel, CompanionConnPolicy and the UI-declaration codec were
-// extracted before it. CompanionModeActivity.cpp pulls in Arduino, NimBLE and
-// the HAL and therefore cannot be host-built at all; nothing in here may
-// acquire a dependency that changes that. <cstdint> and CompanionBle.h's
+// CompanionModeActivity.cpp's handleMappedButton()/labelFor() so it can be
+// covered by a host gtest suite instead of only hardware regressions (see
+// test/companion_button_policy/), exactly as CompanionBatchModel,
+// CompanionConnPolicy and the UI-declaration codec were extracted before it.
+// CompanionModeActivity.cpp pulls in Arduino, NimBLE and the HAL and
+// therefore cannot be host-built at all; nothing in here may acquire a
+// dependency that changes that. <cstddef>, <cstdint> and CompanionBle.h's
 // enums, and nothing else.
 //
 // Stateless: one call in, one struct out, no clock, no allocation. The
@@ -31,8 +32,7 @@ struct ButtonDecision {
   // Whether a button event should be sent to the app over the wire.
   bool notify;
   // Whether pressing this button would do anything right now -- the signal
-  // labelFor()/listLabelFor() use to decide whether to draw the button's
-  // hint at all.
+  // labelFor() uses to decide whether to draw the button's hint at all.
   bool showHint;
 };
 
@@ -48,5 +48,21 @@ struct ButtonDecision {
 // action for them to modify. See docs/companion-multi-app-design.md §7 for
 // the full behaviour table.
 ButtonDecision decide(uint8_t flags, companionble::ButtonRouting routing, bool peerConnected);
+
+// Whether any entry of a button map (one ButtonRouting per physical button,
+// `count` of them) is bound to something other than ButtonRouting::None --
+// i.e. whether the peer declared ANY control-scheme binding at all, across
+// the whole map, not just a subset of buttons.
+//
+// Used to decide whether firmware may supply its own fallback out of a
+// screen whose navigation is otherwise fully app-declared with no default
+// (Screen::List's Back, see CompanionModeActivity::handleListNav()): with
+// bindings fully app-declared and no defaults, a peer that binds no Back at
+// all leaves the screen with no way out but the power button, and -- during
+// an offline browse, where BLE never starts -- no app around to push a
+// corrected map. Firmware may only step in when the peer bound NOTHING,
+// i.e. this returns false for the whole map; a peer that bound exactly one
+// unrelated button is still taken at face value, absence of Back included.
+bool anyBound(const companionble::ButtonRouting* routings, size_t count);
 
 }  // namespace companionbuttons

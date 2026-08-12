@@ -407,6 +407,14 @@ void CompanionModeActivity::onEnter() {
         // through to the picker below.
         freeListDocBuf();
         listPeerKey.clear();
+        // enterListDocument() already loaded savedPos.peerKey's map into
+        // `buttons` (via loadListButtonRouting()) before the document read
+        // failed -- clear it now that this is falling back to the picker
+        // rather than staying on Screen::List, same as leaveListScreen()
+        // does for the equivalent live edge (an offline picker return must
+        // never leave a browsed peer's map to be misread by whatever the
+        // picker shows next -- see `buttons`' doc comment).
+        clearUiDeclaration();
         screen = Screen::GalleryPicker;
       }
     } else if (peerStillEligible && savedPos.screen == CrossPointState::OfflineBrowseScreen::Image) {
@@ -529,6 +537,10 @@ void CompanionModeActivity::clearUiDeclaration() {
     spec.flags = 0;
     spec.label.clear();
   }
+  // A just-cleared map is trivially unbound -- no need to route this through
+  // recomputeButtonsAnyBound()/companionbuttons::anyBound() when the answer
+  // is already known.
+  buttonsAnyBound = false;
   tagRenderStyle = static_cast<uint8_t>(companionble::TagRenderStyle::Bordered);
   // Tags are re-populated from scratch by loadUiDeclaration() right after this
   // call (which captures the pre-clear state to restore by id). Without this
@@ -574,19 +586,24 @@ void CompanionModeActivity::parseButtonEntries(const uint8_t* raw, size_t len, s
   }
 }
 
-// Reads `peerKey`'s persisted UI declaration and fills `listButtons` with its
-// button map, for Screen::List -- see listButtons' doc comment on why this
-// cannot simply reuse `buttons`/loadUiDeclaration(). No default: a peer that
-// never declared a LocalList* routing for a button leaves it in `None`, same
-// as clearUiDeclaration() leaves every other peer's map before a declaration
-// is read. Deliberately ignores the tag section -- Screen::List has no tag
-// row.
+// Reads `peerKey`'s persisted UI declaration and fills `buttons` with its
+// button map, for Screen::List. No default: a peer that never declared a
+// LocalList* routing for a button leaves it in `None`, same as
+// clearUiDeclaration() leaves every other peer's map before a declaration is
+// read. Deliberately ignores the tag section -- Screen::List has no tag row.
+//
+// Does NOT itself clear `buttons` on the way OUT (a caller leaving
+// Screen::List for the offline picker must do that once it knows where it's
+// going -- see `buttons`' doc comment and leaveListScreen()); it only resets
+// the map fresh on the way IN, same as loadUiDeclaration() does before it
+// parses.
 void CompanionModeActivity::loadListButtonRouting(const std::string& peerKey) {
-  for (auto& spec : listButtons) {
+  for (auto& spec : buttons) {
     spec.routing = companionble::ButtonRouting::None;
     spec.flags = 0;
     spec.label.clear();
   }
+  buttonsAnyBound = false;
   if (peerKey.empty()) return;
 
   uint8_t raw[companionpeer::kMaxUiDeclarationLen];
@@ -596,7 +613,8 @@ void CompanionModeActivity::loadListButtonRouting(const std::string& peerKey) {
   if (companionui::parseBody(raw, len, &info) != companionui::ParseResult::Ok) return;
 
   size_t offset = companionui::kBodyFirstButtonOffset;
-  parseButtonEntries(raw, len, offset, info.buttonCount, listButtons);
+  parseButtonEntries(raw, len, offset, info.buttonCount, buttons);
+  recomputeButtonsAnyBound();
 }
 
 // Reads the foreground peer's declared control scheme off the SD card. Called
@@ -632,6 +650,7 @@ void CompanionModeActivity::loadUiDeclaration() {
 
   size_t offset = companionui::kBodyFirstButtonOffset;
   parseButtonEntries(raw, len, offset, info.buttonCount, buttons);
+  recomputeButtonsAnyBound();
 
   // Tag section. Optional — an app with no tags may simply end after its
   // buttons. Every tag starts Hidden: the declaration says what exists, not
@@ -761,26 +780,16 @@ const char* CompanionModeActivity::labelFor(companionble::ButtonId button) const
              : "";
 }
 
-// listButtons' counterpart to routingFor() -- see that member's doc comment
-// on why Screen::List does not simply consult `buttons`.
-companionble::ButtonRouting CompanionModeActivity::listRoutingFor(companionble::ButtonId button) const {
-  const size_t index = static_cast<size_t>(button);
-  return index < kButtonCount ? listButtons[index].routing : companionble::ButtonRouting::None;
-}
-
-uint8_t CompanionModeActivity::listFlagsFor(companionble::ButtonId button) const {
-  const size_t index = static_cast<size_t>(button);
-  return index < kButtonCount ? listButtons[index].flags : 0;
-}
-
-// listButtons' counterpart to labelFor().
-const char* CompanionModeActivity::listLabelFor(companionble::ButtonId button) const {
-  const size_t index = static_cast<size_t>(button);
-  if (index >= kButtonCount) return "";
-  const bool peerConnected = !foregroundPeerKey.empty();
-  return companionbuttons::decide(listButtons[index].flags, listButtons[index].routing, peerConnected).showHint
-             ? listButtons[index].label.c_str()
-             : "";
+// Recomputes buttonsAnyBound (see its doc comment) from the current
+// `buttons` contents. Delegates to companionbuttons::anyBound()
+// (CompanionButtonPolicy.h) so the "did this peer bind anything" predicate
+// stays host-tested (test/companion_button_policy/) rather than living only
+// here, where CompanionModeActivity.cpp's hardware/BLE/HAL coupling puts it
+// out of host-test reach.
+void CompanionModeActivity::recomputeButtonsAnyBound() {
+  companionble::ButtonRouting routings[kButtonCount];
+  for (size_t i = 0; i < kButtonCount; ++i) routings[i] = buttons[i].routing;
+  buttonsAnyBound = companionbuttons::anyBound(routings, kButtonCount);
 }
 
 // ---------------------------------------------------------------------------
@@ -1422,11 +1431,30 @@ constexpr ListNavButton kListNavButtons[] = {
 };
 }  // namespace
 
+// See the header's doc comment. Caller must already hold a RenderLock, same
+// precondition as enterListDocument().
+void CompanionModeActivity::leaveListScreen() {
+  screen = listReturnScreen;
+  freeListDocBuf();  // leaving Screen::List -- see the header's audit note
+  // Only the offline-picker return edge needs `buttons` cleared: a live
+  // foreground LIST peer's Screen::Text return keeps its own map as-is (it
+  // already IS that same peer's map -- loadUiDeclaration() loaded it just
+  // before applyForegroundChange() called enterListDocument()). The picker
+  // return, though, can hand the screen to a DIFFERENT peer's gallery next
+  // (selectGalleryPickerPeer()'s non-LIST branch, which never itself loads a
+  // button map) -- without this, that gallery's handleGalleryNav() would
+  // read the just-left LIST peer's routingFor(Up)/routingFor(Down) instead
+  // of the None an offline browse with no foreground peer should always see.
+  if (listReturnScreen == Screen::GalleryPicker) clearUiDeclaration();
+  syncOfflineBrowsePosition();
+  requestUpdate();
+}
+
 bool CompanionModeActivity::handleListNav() {
   if (screen != Screen::List) return false;
 
   // Which physical button performs which List action is now the browsed
-  // peer's own choice (listButtons, loaded by enterListDocument() -- see its
+  // peer's own choice (`buttons`, loaded by enterListDocument() -- see its
   // doc comment), the same "declared, not fixed" model every other screen's
   // ButtonRouting already uses (docs/companion-multi-app-design.md §7). There
   // is no default routing: a button this peer never bound to a LocalList*
@@ -1446,7 +1474,7 @@ bool CompanionModeActivity::handleListNav() {
   for (const auto& nav : kListNavButtons) {
     if (!buttonWasPressed(nav.role, nav.id)) continue;
 
-    const auto decision = companionbuttons::decide(listFlagsFor(nav.id), listRoutingFor(nav.id), peerConnected);
+    const auto decision = companionbuttons::decide(flagsFor(nav.id), routingFor(nav.id), peerConnected);
 
     // ALSO_NOTIFY means a local action's press is *also* relayed to the app,
     // on top of whatever the switch below does locally -- see decide()'s doc
@@ -1456,10 +1484,7 @@ bool CompanionModeActivity::handleListNav() {
     switch (decision.action) {
       case companionble::ButtonRouting::LocalListBack: {
         RenderLock lock;
-        screen = listReturnScreen;
-        freeListDocBuf();  // leaving Screen::List -- see the header's audit note
-        syncOfflineBrowsePosition();
-        requestUpdate();
+        leaveListScreen();
         return true;
       }
       case companionble::ButtonRouting::LocalListToggleCheck: {
@@ -1555,9 +1580,22 @@ bool CompanionModeActivity::handleListNav() {
         // Not bound to a List action by this peer, or a LOCAL_ONLY_OFFLINE
         // LocalList* action decide() just collapsed to None because a peer
         // is connected (decision.notify, handled above, already relayed the
-        // press in that case) -- claimed, no-op either way. See the comment
-        // above the loop for why this still returns true rather than
-        // falling through to handleMappedButton().
+        // press in that case) -- claimed, no-op either way, with one
+        // exception: firmware supplies its own Back-leaves-the-screen
+        // fallback, but ONLY when the peer bound NOTHING at all
+        // (!buttonsAnyBound -- the whole map, not just Back; see that
+        // member's doc comment). With bindings fully app-declared and no
+        // defaults, a LIST peer that binds no Back leaves this screen with
+        // no way out but the power button, and an offline browse has no BLE
+        // for a phone to push a corrected map. A peer that bound anything
+        // at all is taken at face value, absence of Back included -- that
+        // is a deliberate app choice, not an omission to paper over. See
+        // the comment above the loop for why every other case still
+        // returns true rather than falling through to handleMappedButton().
+        if (nav.id == companionble::ButtonId::Back && !buttonsAnyBound) {
+          RenderLock lock;
+          leaveListScreen();
+        }
         return true;
     }
   }
@@ -2993,20 +3031,20 @@ void CompanionModeActivity::renderList() {
 
   if (!mappedInput.hasTouch()) {
     // Hints come straight from the browsed peer's declared labels (see
-    // listLabelFor()), the same idiom Screen::Text uses for its own map --
-    // there is no fixed physical meaning left to show a fixed string for. A
+    // labelFor()), the same idiom Screen::Text uses for its own map -- there
+    // is no fixed physical meaning left to show a fixed string for. A
     // switch-list button's hint is hidden when there is only one list to
     // switch between, same "hide, don't grey out" convention renderPage()
     // uses for page-turn buttons at either end.
-    const char* backLabel = listLabelFor(companionble::ButtonId::Back);
-    const char* confirmLabel = listLabelFor(companionble::ButtonId::Confirm);
-    const char* leftLabel = listLabelFor(companionble::ButtonId::Left);
-    const char* rightLabel = listLabelFor(companionble::ButtonId::Right);
-    if (listRoutingFor(companionble::ButtonId::Left) == companionble::ButtonRouting::LocalListSwitchLeft &&
+    const char* backLabel = labelFor(companionble::ButtonId::Back);
+    const char* confirmLabel = labelFor(companionble::ButtonId::Confirm);
+    const char* leftLabel = labelFor(companionble::ButtonId::Left);
+    const char* rightLabel = labelFor(companionble::ButtonId::Right);
+    if (routingFor(companionble::ButtonId::Left) == companionble::ButtonRouting::LocalListSwitchLeft &&
         listNav.listCount() <= 1) {
       leftLabel = "";
     }
-    if (listRoutingFor(companionble::ButtonId::Right) == companionble::ButtonRouting::LocalListSwitchRight &&
+    if (routingFor(companionble::ButtonId::Right) == companionble::ButtonRouting::LocalListSwitchRight &&
         listNav.listCount() <= 1) {
       rightLabel = "";
     }

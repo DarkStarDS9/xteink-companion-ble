@@ -197,4 +197,48 @@ INSTANTIATE_TEST_SUITE_P(AllLocalRoutings, CompanionButtonPolicyFlagsTest,
                                            ButtonRouting::LocalListSwitchRight, ButtonRouting::LocalListToggleCheck,
                                            ButtonRouting::LocalListBack));
 
+// companionbuttons::anyBound() -- whether a peer declared ANY binding at all
+// across a whole button map. Backs the firmware-owned Back fallback in
+// CompanionModeActivity::handleListNav()'s default: arm: it may only fire
+// when this is false for the peer's entire map, not just the Back button.
+
+TEST(CompanionButtonPolicyAnyBound, EmptyMapIsUnbound) {
+  const ButtonRouting routings[] = {ButtonRouting::None, ButtonRouting::None, ButtonRouting::None, ButtonRouting::None,
+                                    ButtonRouting::None, ButtonRouting::None, ButtonRouting::None};
+  EXPECT_FALSE(companionbuttons::anyBound(routings, 7));
+}
+
+TEST(CompanionButtonPolicyAnyBound, ZeroCountIsUnbound) {
+  const ButtonRouting routings[] = {ButtonRouting::Remote};
+  EXPECT_FALSE(companionbuttons::anyBound(routings, 0));
+}
+
+// The must-be-false-only-for-the-whole-map requirement: a peer that bound
+// exactly one button, anywhere in the map, is bound -- not just a peer that
+// bound Back specifically.
+TEST(CompanionButtonPolicyAnyBound, OneUnrelatedButtonBoundIsBound) {
+  const ButtonRouting routings[] = {ButtonRouting::None, ButtonRouting::None, ButtonRouting::Remote,
+                                    ButtonRouting::None, ButtonRouting::None, ButtonRouting::None,
+                                    ButtonRouting::None};
+  EXPECT_TRUE(companionbuttons::anyBound(routings, 7));
+}
+
+TEST(CompanionButtonPolicyAnyBound, LastEntryBoundIsBound) {
+  const ButtonRouting routings[] = {ButtonRouting::None,         ButtonRouting::None, ButtonRouting::None,
+                                    ButtonRouting::None,         ButtonRouting::None, ButtonRouting::None,
+                                    ButtonRouting::LocalListBack};
+  EXPECT_TRUE(companionbuttons::anyBound(routings, 7));
+}
+
+TEST(CompanionButtonPolicyAnyBound, EveryEntryBoundIsBound) {
+  const ButtonRouting routings[] = {ButtonRouting::LocalListMoveUp,
+                                    ButtonRouting::LocalListMoveDown,
+                                    ButtonRouting::LocalListSwitchLeft,
+                                    ButtonRouting::LocalListSwitchRight,
+                                    ButtonRouting::LocalListToggleCheck,
+                                    ButtonRouting::LocalListBack,
+                                    ButtonRouting::Remote};
+  EXPECT_TRUE(companionbuttons::anyBound(routings, 7));
+}
+
 }  // namespace

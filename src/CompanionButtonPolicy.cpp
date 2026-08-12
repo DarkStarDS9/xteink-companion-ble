@@ -43,4 +43,11 @@ ButtonDecision decide(uint8_t flags, companionble::ButtonRouting routing, bool p
   return {ButtonRouting::None, false, false};
 }
 
+bool anyBound(const companionble::ButtonRouting* routings, size_t count) {
+  for (size_t i = 0; i < count; ++i) {
+    if (routings[i] != companionble::ButtonRouting::None) return true;
+  }
+  return false;
+}
+
 }  // namespace companionbuttons
