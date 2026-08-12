@@ -87,4 +87,10 @@ bool Nav::switchListRight() {
   return true;
 }
 
+void Nav::restorePosition(uint16_t listIndex, uint16_t cursor, uint16_t windowStart) {
+  listIndex_ = listIndex;
+  cursor_ = cursor;
+  windowStart_ = windowStart;
+}
+
 }  // namespace companiontodo

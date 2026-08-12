@@ -69,6 +69,17 @@ class Nav {
   bool switchListLeft();
   bool switchListRight();
 
+  // Restores a previously-saved position (CompanionModeActivity's
+  // offline-browse resume, CrossPointState::OfflineBrowsePosition) verbatim
+  // -- no clamping here. Call this right after reset() and before the
+  // caller's own reload pass (setListCount() then setCurrentList()): those
+  // already clamp listIndex()/cursor()/windowStart() into whatever the
+  // just-reloaded document actually has, which is exactly what makes a
+  // position saved against a document that has since shrunk (or grown) need
+  // no special handling -- the same clamp runs on every reload regardless of
+  // where cursor()/windowStart() came from.
+  void restorePosition(uint16_t listIndex, uint16_t cursor, uint16_t windowStart);
+
   uint16_t listIndex() const { return listIndex_; }
   uint16_t listCount() const { return listCount_; }
   uint16_t cursor() const { return cursor_; }

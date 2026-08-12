@@ -378,23 +378,86 @@ void CompanionModeActivity::onEnter() {
     // actually about to render.
     buildPickerPeerKeys();
 
-    if (pickerPeerKeys.empty()) {
-      // The picker would be empty: this is the loop guard against rebooting
-      // straight back into this same dead end. Clear the flag and fall back
-      // to the normal idle screen instead of showing an empty picker or
-      // rebooting again.
-      APP_STATE.companionOfflineBrowse = false;
-      APP_STATE.saveToFile();
-      chooseIdleScreen();
-    } else {
-      pickerCursor = 0;
-      screen = Screen::GalleryPicker;
+    // Try to resume straight into whatever peer/screen/cursor was saved
+    // (CrossPointState::companionOfflineBrowsePosition, kept live by
+    // syncOfflineBrowsePosition() as the previous boot navigated) before
+    // falling back to the plain picker. A copy, not a reference: the
+    // fallback path below may overwrite APP_STATE.companionOfflineBrowsePosition
+    // itself, and reading through a reference to the thing just cleared
+    // would silently pick up the cleared value instead of what was saved.
+    const CrossPointState::OfflineBrowsePosition savedPos = APP_STATE.companionOfflineBrowsePosition;
+    const bool hadSavedPeer = !savedPos.peerKey.empty();
+    // Reuses buildPickerPeerKeys()'s own eligibility filter (image-capable OR
+    // declared LIST shape, still enrolled) rather than re-deriving it --
+    // that is what "peer no longer enrolled, or its document/gallery is
+    // gone" resolves to for a peer that dropped out of this same list.
+    const bool peerStillEligible = hadSavedPeer && std::find(pickerPeerKeys.begin(), pickerPeerKeys.end(),
+                                                             savedPos.peerKey) != pickerPeerKeys.end();
+
+    bool restoredIntoContent = false;
+    if (peerStillEligible && savedPos.screen == CrossPointState::OfflineBrowseScreen::List) {
+      const ListNavPosition navPos{savedPos.listIndex, savedPos.listCursor, savedPos.listWindowStart};
+      if (enterListDocument(savedPos.peerKey, Screen::GalleryPicker, &navPos)) {
+        restoredIntoContent = true;
+      } else {
+        // Still enrolled and eligible, but the document itself is gone or no
+        // longer parses (enterListDocument() otherwise leaves screen == List
+        // showing its own "nothing yet" placeholder, which is not the same
+        // as actually falling back to the picker) -- undo that and fall
+        // through to the picker below.
+        freeListDocBuf();
+        listPeerKey.clear();
+        screen = Screen::GalleryPicker;
+      }
+    } else if (peerStillEligible && savedPos.screen == CrossPointState::OfflineBrowseScreen::Image) {
+      loadGalleryForPeer(savedPos.peerKey);
+      if (!galleryImages.empty()) {
+        browsingPeerKey = savedPos.peerKey;
+        galleryPickerBrowsing = true;
+        // loadGalleryForPeer() already points at the most recent image;
+        // override with the saved one only if still in range -- the peer may
+        // have fewer images now than when this was saved.
+        galleryIndex = savedPos.galleryIndex < galleryImages.size() ? savedPos.galleryIndex : galleryImages.size() - 1;
+        displayedImagePath = galleryImages[galleryIndex];
+        screen = Screen::Image;
+        restoredIntoContent = true;
+      }
+      // Else: the gallery is gone (every image removed since) -- fall
+      // through to the picker below.
+    }
+    // Else: no peer was saved, or the saved peer is no longer enrolled or no
+    // longer eligible -- falls straight through to the picker below.
+
+    if (!restoredIntoContent) {
+      // Whatever was saved (if anything) did not pan out. Clear it -- but
+      // only actually spend the SD write on it if there was something to
+      // clear, so a boot with nothing saved (the common case: still at the
+      // picker, or offline browse just started) costs no more than before
+      // this feature.
+      if (hadSavedPeer) APP_STATE.companionOfflineBrowsePosition = CrossPointState::OfflineBrowsePosition{};
+      if (pickerPeerKeys.empty()) {
+        // The picker itself would be empty too: this is the loop guard
+        // against rebooting straight back into this same dead end. Clear
+        // the flag and fall back to the normal idle screen instead of
+        // showing an empty picker or rebooting again.
+        APP_STATE.companionOfflineBrowse = false;
+        APP_STATE.saveToFile();
+        chooseIdleScreen();
+      } else {
+        pickerCursor = 0;
+        screen = Screen::GalleryPicker;
+        if (hadSavedPeer) APP_STATE.saveToFile();
+      }
     }
 
     idleSinceMs = millis();
     renderer.clearScreen();
     if (screen == Screen::GalleryPicker) {
       renderGalleryPicker();
+    } else if (screen == Screen::List) {
+      renderList();
+    } else if (screen == Screen::Image) {
+      renderImage();
     } else if (screen == Screen::IconGrid) {
       renderIconGrid();
     } else {
@@ -941,6 +1004,18 @@ void CompanionModeActivity::checkIdleTimers() {
     RenderLock lock;
     renderPreSleepScreen();
   }
+  // This path bypasses main.cpp's enterDeepSleep() entirely -- it calls
+  // startDeepSleep() directly, unlike the power-button/general-timeout path,
+  // which saves APP_STATE for us before ever reaching
+  // Activity::customDeepSleep(). Without this, an offline-browse idle
+  // timeout (companionOfflineBrowsePosition, kept current in RAM only by
+  // syncOfflineBrowsePosition() -- see its doc comment) would power off with
+  // the last-navigated position never reaching disk, silently losing exactly
+  // the "sleep while browsing, wake up in the same place" case this exists
+  // for. Unconditional, not offline-browse-only: harmless on any other idle
+  // sleep, since nothing else in this activity mutates APP_STATE in RAM
+  // without also going through saveToFile() itself.
+  APP_STATE.saveToFile();
   powerManager.startDeepSleep(gpio);  // [[noreturn]] — wakes on power button, panel keeps its last image
 }
 
@@ -1112,6 +1187,10 @@ void CompanionModeActivity::showGalleryImage(size_t index) {
   RenderLock lock;
   galleryIndex = index;
   displayedImagePath = galleryImages[index];
+  // No-ops unless this is an offline-picker browse of galleryPickerBrowsing's
+  // peer -- see syncOfflineBrowsePosition()'s doc comment; a live foreground
+  // peer's own gallery (galleryPickerBrowsing false) never persists here.
+  syncOfflineBrowsePosition();
   requestUpdate();
 }
 
@@ -1166,10 +1245,15 @@ bool CompanionModeActivity::handleGalleryNav() {
 // is not recursive). applyForegroundChange() already holds one for its whole
 // body; the picker entry point added in this feature's second commit takes
 // its own around this call, mirroring selectGalleryPickerPeer().
-bool CompanionModeActivity::enterListDocument(const std::string& peerKey, Screen returnTo) {
+bool CompanionModeActivity::enterListDocument(const std::string& peerKey, Screen returnTo,
+                                              const ListNavPosition* restore) {
   listPeerKey = peerKey;
   listReturnScreen = returnTo;
   listNav.reset();
+  // See the header's doc comment: this must land between reset() and the
+  // reload pass below so setListCount()/setCurrentList() (inside
+  // reloadListView()) clamp it against whatever the document actually has.
+  if (restore) listNav.restorePosition(restore->listIndex, restore->cursor, restore->windowStart);
   loadListButtonRouting(peerKey);
   loadListDocBuf();
   reloadListView();
@@ -1374,6 +1458,7 @@ bool CompanionModeActivity::handleListNav() {
         RenderLock lock;
         screen = listReturnScreen;
         freeListDocBuf();  // leaving Screen::List -- see the header's audit note
+        syncOfflineBrowsePosition();
         requestUpdate();
         return true;
       }
@@ -1438,6 +1523,7 @@ bool CompanionModeActivity::handleListNav() {
         if (listNav.moveUp()) {
           RenderLock lock;
           reloadListView(/*recountTotals=*/false);
+          syncOfflineBrowsePosition();
           requestUpdate();
         }
         return true;
@@ -1445,6 +1531,7 @@ bool CompanionModeActivity::handleListNav() {
         if (listNav.moveDown()) {
           RenderLock lock;
           reloadListView(/*recountTotals=*/false);
+          syncOfflineBrowsePosition();
           requestUpdate();
         }
         return true;
@@ -1452,6 +1539,7 @@ bool CompanionModeActivity::handleListNav() {
         if (listNav.switchListLeft()) {
           RenderLock lock;
           reloadListView();
+          syncOfflineBrowsePosition();
           requestUpdate();
         }
         return true;
@@ -1459,6 +1547,7 @@ bool CompanionModeActivity::handleListNav() {
         if (listNav.switchListRight()) {
           RenderLock lock;
           reloadListView();
+          syncOfflineBrowsePosition();
           requestUpdate();
         }
         return true;
@@ -1522,6 +1611,38 @@ void CompanionModeActivity::buildPickerPeerKeys() {
   }
 }
 
+// See the header's doc comment. Written into APP_STATE directly (rather than
+// a local member CompanionModeActivity later copies over) so it is already
+// correct by the time either deep-sleep path saves it, whichever order that
+// happens to run in relative to any per-screen bookkeeping -- see this
+// feature's commit message for why that ordering would otherwise matter.
+void CompanionModeActivity::syncOfflineBrowsePosition() {
+  if (!offlineBrowse) return;
+  auto& pos = APP_STATE.companionOfflineBrowsePosition;
+  if (screen == Screen::List) {
+    pos.peerKey = listPeerKey;
+    pos.screen = CrossPointState::OfflineBrowseScreen::List;
+    pos.listIndex = listNav.listIndex();
+    pos.listCursor = listNav.cursor();
+    pos.listWindowStart = listNav.windowStart();
+  } else if (screen == Screen::Image && galleryPickerBrowsing) {
+    pos.peerKey = browsingPeerKey;
+    pos.screen = CrossPointState::OfflineBrowseScreen::Image;
+    pos.galleryIndex = static_cast<uint16_t>(galleryIndex);
+  } else if (screen == Screen::GalleryPicker) {
+    // Back at the picker with nothing chosen -- the resume default, so a
+    // stale peer/screen from earlier this same browse must not survive.
+    pos = CrossPointState::OfflineBrowsePosition{};
+  }
+  // Any other screen (IconGrid, Waiting, ...) is not a resumable
+  // offline-browse position -- e.g. the picker-would-be-empty fallback in
+  // onEnter() lands on IconGrid/Waiting with offlineBrowse still true for
+  // the rest of this boot even though it already cleared and persisted the
+  // flag itself. Nothing calls this function from those screens, but left
+  // unhandled here too rather than asserted against, since landing there is
+  // not itself a bug.
+}
+
 // Confirm on the idle icon grid. Despite the name this does not itself show
 // the picker -- it only calls buildPickerPeerKeys() to learn whether the
 // picker WOULD be non-empty, then reboots into offline-browse mode (BLE off)
@@ -1569,6 +1690,7 @@ void CompanionModeActivity::selectGalleryPickerPeer() {
     // came from here and most likely wants to look at another peer's tile
     // next, same as leaving a gallery reached through the picker does below.
     enterListDocument(peerKey, Screen::GalleryPicker);
+    syncOfflineBrowsePosition();
     requestUpdate();
     return;
   }
@@ -1583,6 +1705,7 @@ void CompanionModeActivity::selectGalleryPickerPeer() {
   browsingPeerKey = peerKey;
   galleryPickerBrowsing = true;
   screen = Screen::Image;
+  syncOfflineBrowsePosition();
   requestUpdate();
 }
 
@@ -1630,6 +1753,13 @@ bool CompanionModeActivity::handlePickerInput() {
       // rather than called. Persist the cleared flag and reboot back to the
       // icon grid, which is what re-arms ensureStarted() on the next boot.
       APP_STATE.companionOfflineBrowse = false;
+      // The browse is over, not just paused -- clear the saved resume
+      // position too, rather than leave a stale peer/screen behind for a
+      // future browse that happens to start from a boot where onEnter()
+      // never re-populates this (defensive: the position writes above
+      // already keep this at Picker/empty by the time we can reach here,
+      // but "leaving offline browse" should not depend on that).
+      APP_STATE.companionOfflineBrowsePosition = CrossPointState::OfflineBrowsePosition{};
       APP_STATE.saveToFile();
       silentRestart();
       return true;
@@ -1642,6 +1772,7 @@ bool CompanionModeActivity::handlePickerInput() {
       RenderLock lock;
       screen = Screen::GalleryPicker;
       galleryPickerBrowsing = false;
+      syncOfflineBrowsePosition();
       requestUpdate();
       return true;
     }

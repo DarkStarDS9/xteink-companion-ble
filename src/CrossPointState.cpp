@@ -30,6 +30,17 @@ void CrossPointState::toJson(JsonDocument& doc) const {
   doc["lastSleepFromReader"] = lastSleepFromReader;
   doc["showBootScreen"] = showBootScreen;
   doc["companionOfflineBrowse"] = companionOfflineBrowse;
+
+  // Grouped under one nested object rather than scattered top-level keys --
+  // these five fields are only ever meaningful together (see the header's
+  // doc comment on OfflineBrowsePosition).
+  JsonObject pos = doc["companionOfflineBrowsePosition"].to<JsonObject>();
+  pos["peerKey"] = companionOfflineBrowsePosition.peerKey;
+  pos["screen"] = static_cast<uint8_t>(companionOfflineBrowsePosition.screen);
+  pos["listIndex"] = companionOfflineBrowsePosition.listIndex;
+  pos["listCursor"] = companionOfflineBrowsePosition.listCursor;
+  pos["listWindowStart"] = companionOfflineBrowsePosition.listWindowStart;
+  pos["galleryIndex"] = companionOfflineBrowsePosition.galleryIndex;
 }
 
 bool CrossPointState::fromJson(JsonVariantConst doc) {
@@ -53,5 +64,18 @@ bool CrossPointState::fromJson(JsonVariantConst doc) {
   lastSleepFromReader = doc["lastSleepFromReader"] | false;
   showBootScreen = doc["showBootScreen"] | true;
   companionOfflineBrowse = doc["companionOfflineBrowse"] | false;
+
+  JsonVariantConst posDoc = doc["companionOfflineBrowsePosition"];
+  // read as const char*, not | std::string("") -- see PersistableStore.h's
+  // doc comment on why that fallback drags the JSON serializer into flash.
+  companionOfflineBrowsePosition.peerKey = posDoc["peerKey"] | "";
+  const uint8_t screenRaw = posDoc["screen"] | static_cast<uint8_t>(OfflineBrowseScreen::Picker);
+  companionOfflineBrowsePosition.screen = screenRaw <= static_cast<uint8_t>(OfflineBrowseScreen::Image)
+                                              ? static_cast<OfflineBrowseScreen>(screenRaw)
+                                              : OfflineBrowseScreen::Picker;
+  companionOfflineBrowsePosition.listIndex = posDoc["listIndex"] | static_cast<uint16_t>(0);
+  companionOfflineBrowsePosition.listCursor = posDoc["listCursor"] | static_cast<uint16_t>(0);
+  companionOfflineBrowsePosition.listWindowStart = posDoc["listWindowStart"] | static_cast<uint16_t>(0);
+  companionOfflineBrowsePosition.galleryIndex = posDoc["galleryIndex"] | static_cast<uint16_t>(0);
   return true;
 }

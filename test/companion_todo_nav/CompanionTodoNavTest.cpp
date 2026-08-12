@@ -1,6 +1,6 @@
-#include "CompanionTodoNav.h"
-
 #include <gtest/gtest.h>
+
+#include "CompanionTodoNav.h"
 
 namespace {
 
@@ -173,6 +173,56 @@ TEST(CompanionTodoNav, ResetClearsDocumentStateButNotViewportCapacity) {
   EXPECT_EQ(nav.cursor(), 0u);
   EXPECT_EQ(nav.windowStart(), 0u);
   EXPECT_EQ(nav.visibleCapacity(), 7u) << "a viewport property, not document state";
+}
+
+// The offline-browse resume path (CompanionModeActivity::enterListDocument()'s
+// restore parameter): restorePosition() sets raw state, then the caller's own
+// setListCount()/setCurrentList() reload pass -- exactly what
+// CompanionModeActivity::reloadListView() does on every entry -- must clamp
+// it exactly like any other stale position, with zero special-casing.
+TEST(CompanionTodoNav, RestorePositionAgainstUnchangedDocumentIsExact) {
+  Nav nav;
+  nav.reset();
+  nav.restorePosition(/*listIndex=*/1, /*cursor=*/4, /*windowStart=*/2);
+  nav.setVisibleCapacity(3);
+  nav.setListCount(2);     // same as when saved -- listIndex 1 stays in range
+  nav.setCurrentList(10);  // same as when saved -- cursor 4 stays in range
+  EXPECT_EQ(nav.listIndex(), 1u);
+  EXPECT_EQ(nav.cursor(), 4u);
+  EXPECT_EQ(nav.windowStart(), 2u);
+}
+
+TEST(CompanionTodoNav, RestorePositionClampsCursorAgainstShrunkList) {
+  Nav nav;
+  nav.reset();
+  // Saved while the list had >= 16 items, cursor at 15.
+  nav.restorePosition(/*listIndex=*/0, /*cursor=*/15, /*windowStart=*/12);
+  nav.setVisibleCapacity(5);
+  nav.setListCount(1);
+  nav.setCurrentList(3);  // the app re-pushed a much shorter list while asleep
+  EXPECT_EQ(nav.cursor(), 2u) << "clamped to the new last item";
+  EXPECT_EQ(nav.windowStart(), 0u) << "clampWindow() re-anchors a window past maxStart";
+}
+
+TEST(CompanionTodoNav, RestorePositionClampsListIndexAgainstFewerLists) {
+  Nav nav;
+  nav.reset();
+  // Saved on the 4th of 5 lists.
+  nav.restorePosition(/*listIndex=*/4, /*cursor=*/0, /*windowStart=*/0);
+  nav.setListCount(2);  // only 2 lists now
+  nav.setCurrentList(6);
+  EXPECT_EQ(nav.listIndex(), 1u) << "clamped to the new last valid list index";
+}
+
+TEST(CompanionTodoNav, RestorePositionIntoEmptyDocumentIsSafe) {
+  Nav nav;
+  nav.reset();
+  nav.restorePosition(/*listIndex=*/2, /*cursor=*/7, /*windowStart=*/5);
+  nav.setListCount(0);  // the document is gone entirely
+  EXPECT_TRUE(nav.empty());
+  EXPECT_EQ(nav.listIndex(), 0u);
+  EXPECT_EQ(nav.cursor(), 0u);
+  EXPECT_EQ(nav.windowStart(), 0u);
 }
 
 }  // namespace

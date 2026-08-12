@@ -41,6 +41,17 @@ struct CompanionListRow {
   std::string text;
 };
 
+// A companiontodo::Nav position to restore into a freshly (re)loaded
+// document -- e.g. CrossPointState::OfflineBrowsePosition's list fields, on
+// an offline-browse resume. File-scope for the same reason as
+// CompanionListRow above: it needs no class access, and this keeps
+// enterListDocument()'s signature below from depending on CrossPointState.h.
+struct ListNavPosition {
+  uint16_t listIndex = 0;
+  uint16_t cursor = 0;
+  uint16_t windowStart = 0;
+};
+
 // Companion Mode: X3 as a BLE GATT peripheral, rendering whatever the
 // foreground phone app pushes — title/body text or a full-screen image — and
 // reporting the buttons that app declared as remote (see
@@ -370,6 +381,20 @@ class CompanionModeActivity final : public Activity {
   void enterOfflineBrowseMode();
   void selectGalleryPickerPeer();
   bool handlePickerInput();
+  // Mirrors the current offline-browse position (which peer, which of
+  // GalleryPicker/List/Image, and the List/Image cursor) into
+  // APP_STATE.companionOfflineBrowsePosition -- plain struct assignment
+  // only, never saveToFile() (see that field's doc comment on why: the
+  // per-keypress-SD-cost rule this feature must not reintroduce). No-op
+  // unless this boot is itself an offline-browse session (offlineBrowse) --
+  // a live foreground BLE session can never reach here anyway, since BLE is
+  // never started this boot when offlineBrowse is true, so the guard is
+  // defensive rather than load-bearing. Call after any press that actually
+  // moves listNav, changes galleryIndex, or changes `screen` among those
+  // three screens, so APP_STATE is already current by the time either
+  // deep-sleep path (main.cpp's enterDeepSleep(), checkIdleTimers()'s
+  // idle-timeout sleep) flushes it.
+  void syncOfflineBrowsePosition();
   // Enters Screen::List over `peerKey`'s stored document -- the one entry
   // point both a live LIST peer's applyForegroundChange() and the offline
   // icon-grid picker (enterListPicker()/selectListPickerPeer(), see the
@@ -377,7 +402,15 @@ class CompanionModeActivity final : public Activity {
   // takes the user (see listReturnScreen's doc comment). Shows a transient
   // "nothing yet" message and returns false, without switching screens, if
   // the peer has no (parseable) document -- fine to call speculatively.
-  bool enterListDocument(const std::string& peerKey, Screen returnTo);
+  //
+  // `restore`, when non-null, is applied to listNav right after reset() and
+  // before the normal loadListDocBuf()/reloadListView() reload pass -- see
+  // Nav::restorePosition()'s doc comment for why that ordering is what makes
+  // a saved position safe against a document that shrank while the device
+  // was asleep, with no special-casing here. Only the offline-browse resume
+  // path in onEnter() passes one; every other caller gets the default (start
+  // at the top), unaffected.
+  bool enterListDocument(const std::string& peerKey, Screen returnTo, const ListNavPosition* restore = nullptr);
   // Reads listPeerKey's stored document (companionpeer::listDocumentSize() +
   // readListDocument()) into listDocBuf, replacing whatever was held before.
   // This is the only place that touches SD for the list document; everything
