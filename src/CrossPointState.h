@@ -20,6 +20,12 @@ class CrossPointState : public PersistableStore<CrossPointState> {
   uint8_t readerActivityLoadCount = 0;
   bool lastSleepFromReader = false;
   bool showBootScreen = true;
+  // True while the device is in the offline gallery/ToDo-list picker flow:
+  // BLE was deliberately never started this boot, and a reboot is how the
+  // flow is entered and left (see CompanionModeActivity's enterOfflineBrowseMode()
+  // and handlePickerInput()). Not RTC memory: HalPowerManager::startDeepSleep()
+  // powers the MCU off on X4 battery, which RTC does not survive.
+  bool companionOfflineBrowse = false;
 
   static const char* getFilePath() { return "/.crosspoint/state.json"; }
   void toJson(JsonDocument& doc) const;

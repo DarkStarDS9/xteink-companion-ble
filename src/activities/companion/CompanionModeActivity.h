@@ -70,6 +70,14 @@ class CompanionModeActivity final : public Activity {
 
   Screen screen = Screen::Waiting;
 
+  // Set from the constructor argument of the same name; read once in
+  // onEnter() to decide whether to skip companionble::ensureStarted() and
+  // land directly on the picker. Not mutated after construction -- the two
+  // picker-boundary edges that flip CrossPointState::companionOfflineBrowse
+  // (enterOfflineBrowseMode(), handlePickerInput()'s Back-to-IconGrid case) both
+  // take effect via a reboot, not by mutating this flag in place.
+  const bool offlineBrowse;
+
   // What one physical button does in the foreground app. Mirrors one entry of
   // the pushed button map; NONE for every button the app did not declare.
   struct ButtonSpec {
@@ -353,7 +361,13 @@ class CompanionModeActivity final : public Activity {
   bool handleGalleryNav();
   void showGalleryImage(size_t index);
   void showTransientMessage(const std::string& text, Screen returnTo, unsigned long durationMs = 3000);
-  void enterGalleryPicker();
+  // Populates pickerPeerKeys with every enrolled peer that has something
+  // locally browsable -- an image gallery or a declared LIST document --
+  // capped at kMaxIconTiles. Callers decide what an empty result means; see
+  // enterOfflineBrowseMode() and onEnter()'s offline-resume branch, the two
+  // call sites.
+  void buildPickerPeerKeys();
+  void enterOfflineBrowseMode();
   void selectGalleryPickerPeer();
   bool handlePickerInput();
   // Enters Screen::List over `peerKey`'s stored document -- the one entry
@@ -458,8 +472,12 @@ class CompanionModeActivity final : public Activity {
   void checkIdleTimers();
 
  public:
-  explicit CompanionModeActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
-      : Activity("CompanionMode", renderer, mappedInput) {}
+  // offlineBrowse: true when main.cpp resolved this boot as a resume of the
+  // offline gallery/ToDo-list picker (CrossPointState::companionOfflineBrowse
+  // persisted before the reboot that entered it) -- see onEnter()'s handling.
+  // Defaults to false so every other construction site is unaffected.
+  explicit CompanionModeActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, bool offlineBrowse = false)
+      : Activity("CompanionMode", renderer, mappedInput), offlineBrowse(offlineBrowse) {}
 
   void onEnter() override;
   void onExit() override;

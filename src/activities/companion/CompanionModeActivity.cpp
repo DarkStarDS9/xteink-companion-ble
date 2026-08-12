@@ -18,9 +18,11 @@
 #include "CompanionTestConsole.h"
 #include "CompanionTodoDocument.h"
 #include "CompanionUiDeclaration.h"
+#include "CrossPointState.h"
 #include "Epub/converters/ImageDecoderFactory.h"
 #include "MappedInputManager.h"
 #include "Memory.h"
+#include "SilentRestart.h"
 #include "activities/reader/ReaderUtils.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -358,6 +360,48 @@ void CompanionModeActivity::onEnter() {
     return g_screenNameActivity ? g_screenNameActivity->reportTags(out, maxTags) : 0;
   });
 #endif
+
+  if (offlineBrowse) {
+    // Offline browse resume: BLE is either started at boot or never started
+    // that boot (see enterOfflineBrowseMode()/handlePickerInput()'s comments)
+    // -- deliberately skip ensureStarted() here rather than call and
+    // immediately stop it. Screen::StartFailed means "BLE never came up"
+    // (heap floor or NimBLE init failure), which is a different condition
+    // from "we chose not to start it" and is a dead end (loop() no-ops on
+    // it), so this must not route there.
+    //
+    // Populate pickerPeerKeys via the shared helper rather than calling
+    // enterOfflineBrowseMode() -- that function only populates the vector to
+    // decide whether the picker would be empty before committing to a
+    // reboot; it never actually shows the picker itself (see its comment).
+    // This is the call that populates it for real, for the screen that is
+    // actually about to render.
+    buildPickerPeerKeys();
+
+    if (pickerPeerKeys.empty()) {
+      // The picker would be empty: this is the loop guard against rebooting
+      // straight back into this same dead end. Clear the flag and fall back
+      // to the normal idle screen instead of showing an empty picker or
+      // rebooting again.
+      APP_STATE.companionOfflineBrowse = false;
+      APP_STATE.saveToFile();
+      chooseIdleScreen();
+    } else {
+      pickerCursor = 0;
+      screen = Screen::GalleryPicker;
+    }
+
+    idleSinceMs = millis();
+    renderer.clearScreen();
+    if (screen == Screen::GalleryPicker) {
+      renderGalleryPicker();
+    } else if (screen == Screen::IconGrid) {
+      renderIconGrid();
+    } else {
+      renderWaiting();
+    }
+    return;
+  }
 
   if (!companionble::ensureStarted(renderer, cachedFontId)) {
     LOG_ERR("CMA", "ensureStarted() failed (heap floor or NimBLE init)");
@@ -1446,24 +1490,26 @@ void CompanionModeActivity::showTransientMessage(const std::string& text, Screen
   requestUpdate();
 }
 
-// Confirm on the idle icon grid. Builds pickerPeerKeys from every enrolled
-// peer (companionpeer::listPeers() — ungrouped, unlike the decorative grid's
-// listIconTiles(), since two installs of the same app must stay two separate
-// tiles here) that declared either the image-gallery capability or the LIST
-// content shape, capped at kMaxIconTiles the same as the decorative grid's
-// tile budget. Falls back to a transient message rather than entering an
-// empty picker.
+// Populates pickerPeerKeys from every enrolled peer (companionpeer::listPeers()
+// — ungrouped, unlike the decorative grid's listIconTiles(), since two
+// installs of the same app must stay two separate tiles here) that declared
+// either the image-gallery capability or the LIST content shape, capped at
+// kMaxIconTiles the same as the decorative grid's tile budget. Callers decide
+// what an empty result means -- shared by enterOfflineBrowseMode() (which
+// only needs to know whether the picker would be empty before committing to
+// a reboot) and onEnter()'s offline-resume branch (which needs the real
+// list to render).
 //
-// One shared picker for both, not two separate entry points: this is the
-// same "local SD browse of content the app already pushed" argument for
-// both (docs/companion-multi-app-design.md §8's gallery-picker-is-not-a-
-// launcher reasoning, and docs/companion-todo-list-design.md §4's identical
-// argument for a LIST peer's document) — the tile grid is one idle-screen
-// affordance for "browse what an app already gave the device," and which
-// peers qualify is an ORed capability/shape check, not a second UI.
-// selectGalleryPickerPeer() is what actually branches on shape once a tile
-// is chosen.
-void CompanionModeActivity::enterGalleryPicker() {
+// One shared picker for both image galleries and ToDo lists, not two separate
+// entry points: this is the same "local SD browse of content the app already
+// pushed" argument for both (docs/companion-multi-app-design.md §8's
+// gallery-picker-is-not-a-launcher reasoning, and
+// docs/companion-todo-list-design.md §4's identical argument for a LIST
+// peer's document) — the tile grid is one idle-screen affordance for "browse
+// what an app already gave the device," and which peers qualify is an ORed
+// capability/shape check, not a second UI. selectGalleryPickerPeer() is what
+// actually branches on shape once a tile is chosen.
+void CompanionModeActivity::buildPickerPeerKeys() {
   char keys[companionpeer::kMaxPeers][companionpeer::kPeerKeyLen];
   const size_t total = companionpeer::listPeers(keys, companionpeer::kMaxPeers);
 
@@ -1474,16 +1520,36 @@ void CompanionModeActivity::enterGalleryPicker() {
         companionpeer::readDeclaredShape(keys[i], &shape) && shape == companionble::ContentShape::List;
     if (companionpeer::isImageCapable(keys[i]) || isListPeer) pickerPeerKeys.emplace_back(keys[i]);
   }
+}
+
+// Confirm on the idle icon grid. Despite the name this does not itself show
+// the picker -- it only calls buildPickerPeerKeys() to learn whether the
+// picker WOULD be non-empty, then reboots into offline-browse mode (BLE off)
+// to actually open it; onEnter()'s offline-resume branch is what populates
+// pickerPeerKeys for real and renders Screen::GalleryPicker after the reset.
+// Falls back to a transient message, staying on IconGrid with BLE still up,
+// rather than rebooting into an empty picker.
+void CompanionModeActivity::enterOfflineBrowseMode() {
+  buildPickerPeerKeys();
 
   if (pickerPeerKeys.empty()) {
     showTransientMessage(tr(STR_COMPANION_PICKER_EMPTY), Screen::IconGrid);
     return;
   }
 
-  RenderLock lock;
-  pickerCursor = 0;
-  screen = Screen::GalleryPicker;
-  requestUpdate();
+  // The picker would genuinely open: this is the IconGrid->GalleryPicker
+  // offline-browse edge. BLE stays advertising on the icon grid (that's how a
+  // phone reaches an idle device) but a picker browse is a deliberate offline
+  // act with no need for the radio, and there is no runtime NimBLE
+  // teardown/restart in this firmware -- ensureStarted() must still only ever
+  // run once per boot. So: persist the mode and reboot into it rather than
+  // just switching `screen`. Explicitly stop() BLE first -- onExit() will NOT
+  // run (a reset is not an activity transition), and we want any connected
+  // central dropped cleanly here rather than left to time out.
+  APP_STATE.companionOfflineBrowse = true;
+  APP_STATE.saveToFile();
+  companionble::stop();
+  silentRestart();
 }
 
 // Confirm on the picker grid: for a LIST peer, open its stored ToDo List
@@ -1528,14 +1594,17 @@ void CompanionModeActivity::selectGalleryPickerPeer() {
 bool CompanionModeActivity::handlePickerInput() {
   if (screen == Screen::IconGrid) {
     if (buttonWasPressed(MappedInputManager::Button::Confirm, companionble::ButtonId::Confirm)) {
-      enterGalleryPicker();
+      enterOfflineBrowseMode();
       return true;
     }
     return false;
   }
 
   if (screen == Screen::GalleryPicker) {
-    if (pickerPeerKeys.empty()) return false;  // defensive; enterGalleryPicker() never leaves this empty
+    // defensive; onEnter()'s offline-resume branch is what guarantees this
+    // non-empty (its own empty case clears the flag and falls back to the
+    // idle screen instead of ever landing here)
+    if (pickerPeerKeys.empty()) return false;
     if (buttonWasPressed(MappedInputManager::Button::Up, companionble::ButtonId::Up)) {
       RenderLock lock;
       pickerCursor = pickerCursor == 0 ? pickerPeerKeys.size() - 1 : pickerCursor - 1;
@@ -1553,9 +1622,16 @@ bool CompanionModeActivity::handlePickerInput() {
       return true;
     }
     if (buttonWasPressed(MappedInputManager::Button::Back, companionble::ButtonId::Back)) {
-      RenderLock lock;
-      screen = Screen::IconGrid;
-      requestUpdate();
+      // Leaving the offline-browse mode: the GalleryPicker->IconGrid edge.
+      // enterOfflineBrowseMode() reboots into this screen rather than
+      // switching to it live (see its comment), so reaching Screen::GalleryPicker
+      // at all means this boot is an offline-browse resume and BLE was never
+      // started -- companionble::stop() has nothing to do, asserted here
+      // rather than called. Persist the cleared flag and reboot back to the
+      // icon grid, which is what re-arms ensureStarted() on the next boot.
+      APP_STATE.companionOfflineBrowse = false;
+      APP_STATE.saveToFile();
+      silentRestart();
       return true;
     }
     return false;
@@ -2360,8 +2436,8 @@ void CompanionModeActivity::renderIconGrid(bool inverted, const char* label) {
 }
 
 // The interactive counterpart to renderIconGrid(): one tile per peer that
-// declared the image-gallery capability (pickerPeerKeys, built once in
-// enterGalleryPicker() — not grouped by appId, unlike the decorative grid,
+// declared the image-gallery capability (pickerPeerKeys, built by
+// buildPickerPeerKeys() — not grouped by appId, unlike the decorative grid,
 // since two installs of the same app have two separate galleries and must
 // stay two separate tiles). A thick outline marks the cursor; the existing
 // thin "currently connected" marker still applies if that peer also happens
@@ -2371,9 +2447,9 @@ void CompanionModeActivity::renderIconGrid(bool inverted, const char* label) {
 void CompanionModeActivity::renderGalleryPicker() {
   const size_t count = pickerPeerKeys.size();
   if (count == 0) {
-    // Shouldn't happen — enterGalleryPicker() only switches to this screen
-    // when pickerPeerKeys is non-empty — but fail safe rather than draw an
-    // empty grid.
+    // Shouldn't happen — onEnter()'s offline-resume branch only switches to
+    // this screen when pickerPeerKeys is non-empty — but fail safe rather
+    // than draw an empty grid.
     chooseIdleScreen();
     renderIconGrid();
     return;

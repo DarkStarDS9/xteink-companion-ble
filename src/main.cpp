@@ -446,7 +446,15 @@ void setup() {
     // openEpubPath/lastSleepFromReader/readerActivityLoadCount bookkeeping above
     // is vestigial from the upstream reader-boot flow and intentionally unused
     // here — recovery mode and crash-report are the only other boot targets.
-    activityManager.replaceActivity(std::make_unique<CompanionModeActivity>(renderer, mappedInputManager));
+    //
+    // companionOfflineBrowse: BLE is either started at boot or never started
+    // that boot -- see CompanionModeActivity's enterOfflineBrowseMode()/
+    // handlePickerInput() for the two picker-boundary edges that persist this
+    // flag and reboot to flip it. Passed through unconditionally; the panic
+    // and recovery-firmware branches above already take precedence over this
+    // one regardless of the flag's value.
+    activityManager.replaceActivity(
+        std::make_unique<CompanionModeActivity>(renderer, mappedInputManager, APP_STATE.companionOfflineBrowse));
   }
 
   if (resume == BootResume::Silent) {
