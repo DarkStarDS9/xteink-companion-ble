@@ -74,6 +74,11 @@ class CompanionModeActivity final : public Activity {
   // the pushed button map; NONE for every button the app did not declare.
   struct ButtonSpec {
     companionble::ButtonRouting routing = companionble::ButtonRouting::None;
+    // High-nibble flags from the declaration's byte 0 -- kButtonFlagAlso-
+    // Notify / kButtonFlagLocalOnlyOffline (reserved bits may also be set
+    // here; companionbuttons::decide() ignores anything it doesn't
+    // recognise). See CompanionBle.h.
+    uint8_t flags = 0;
     std::string label;
   };
   static constexpr size_t kButtonCount = 7;  // one per companionble::ButtonId
@@ -334,8 +339,10 @@ class CompanionModeActivity final : public Activity {
   void measureTagRow();
   bool tagIsDrawn(const TagSpec& tag) const;
   companionble::ButtonRouting routingFor(companionble::ButtonId button) const;
+  uint8_t flagsFor(companionble::ButtonId button) const;
   const char* labelFor(companionble::ButtonId button) const;
   companionble::ButtonRouting listRoutingFor(companionble::ButtonId button) const;
+  uint8_t listFlagsFor(companionble::ButtonId button) const;
   const char* listLabelFor(companionble::ButtonId button) const;
   bool handleMappedButton(MappedInputManager::Button role, companionble::ButtonId id);
   void applyForegroundChange();

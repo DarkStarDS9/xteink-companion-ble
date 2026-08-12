@@ -1423,7 +1423,9 @@ bytes 0..3   asset digest (opaque, stored verbatim — see "Asset digests")
 
 byte 4       content shape              <- MANDATORY, new in v12
 byte 5       button entry count N
-N x {  buttonId : 1
+N x {  buttonId : 1     <- bits 3-0 button id, bits 5-4 reserved (must be 0,
+                            ignored not rejected), bit 6 LOCAL_ONLY_OFFLINE,
+                            bit 7 ALSO_NOTIFY -- see "Button behaviour flags"
        routing  : 1
        labelLen : 1
        label    : labelLen bytes, UTF-8, may be empty  }
@@ -1505,8 +1507,8 @@ An app with no tags may simply stop after its buttons; the tag count byte is
 optional. An app with no buttons still needs this asset — `ACQUIRE` is gated on
 it existing.
 
-`buttonId` uses the same values as the button-event characteristic (table
-below). A button not listed behaves as `NONE`.
+`buttonId` (the low nibble of byte 0) uses the same values as the button-event
+characteristic (table below). A button not listed behaves as `NONE`.
 
 `routing` is a small **closed** enum — the complete set of things the firmware
 can do by itself, closed on purpose:
@@ -1524,6 +1526,50 @@ can do by itself, closed on purpose:
 0x09  LOCAL_LIST_TOGGLE_CHECK Screen::List only — toggle checked on the item under the cursor
 0x0A  LOCAL_LIST_BACK         Screen::List only — leave the screen, back to wherever it was entered from
 ```
+
+#### Button behaviour flags (byte 0, bits 7-6)
+
+Physical buttons are hardware-limited to 7 values, so `buttonId` only ever
+needs a nibble; the routing enum above, by contrast, is open-ended (a new
+`LOCAL_*` action is always one more enumerator away), so `routing` keeps its
+own full byte rather than sharing one with the id. The two spare bits in
+`buttonId`'s byte carry flags that modify a **local** routing (`LOCAL_PAGE_PREV`
+… `LOCAL_LIST_BACK`) without needing a second routing enum per combination:
+
+```
+bit 7  ALSO_NOTIFY          also send a button event to the connected peer,
+                             in addition to running the local action
+bit 6  LOCAL_ONLY_OFFLINE    run the local action only while no peer is
+                             connected; while connected, the local action is
+                             suppressed instead
+bits 5-4  reserved           must be sent as 0; a device that finds them set
+                             ignores them rather than rejecting the entry, so
+                             future flags can be added without another bump
+```
+
+Both flags are **inert on `NONE` and `REMOTE`** — there is no local action for
+them to modify. `REMOTE` already notifies exactly when a peer is connected and
+does nothing when it isn't, so `ALSO_NOTIFY` on a `REMOTE` entry is a no-op,
+and `LOCAL_ONLY_OFFLINE` has nothing to suppress.
+
+The combined behaviour for a local routing `X`, by flags and connection state:
+
+| flags on `X` | peer connected | peer not connected |
+| --- | --- | --- |
+| (none) | run `X` | run `X` |
+| `ALSO_NOTIFY` | run `X` **and** notify | run `X` |
+| `LOCAL_ONLY_OFFLINE` | nothing; no hint drawn | run `X` |
+| `ALSO_NOTIFY` + `LOCAL_ONLY_OFFLINE` | notify only; hint still drawn | run `X` |
+
+This lets an app express "this is an internal action, but notify me too"
+(`ALSO_NOTIFY` alone) and "run the internal action when I'm not connected, but
+just tell me about it while I am" (both flags together) — neither was sayable
+with a single-behaviour `routing` byte.
+
+Every declaration written before these flags existed has both high bits clear
+on every entry, so it parses byte-identically under this section: nothing
+about the wire layout changed, only what a device now does with bits that used
+to be silently zero.
 
 Notes:
 

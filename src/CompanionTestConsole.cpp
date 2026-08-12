@@ -6,6 +6,7 @@
 #include <Logging.h>
 
 #include <cstdio>
+#include <cstring>
 
 #include "CompanionPeerStore.h"
 #include "CompanionUiDeclaration.h"
@@ -303,7 +304,13 @@ bool handleCommand(const String& command) {
           static_cast<unsigned>(buttonCount));
     size_t offset = companionui::kBodyFirstButtonOffset;
     for (uint8_t i = 0; i < buttonCount && offset + 3 <= length; ++i) {
-      const uint8_t id = raw[offset];
+      // Byte 0 packs the button id into its low nibble and behaviour flags
+      // into its high nibble -- see CompanionBle.h's
+      // kButtonIdMask/kButtonFlagAlsoNotify/kButtonFlagLocalOnlyOffline.
+      // Masked here so a declaration using the flags is legible instead of
+      // printing a raw id like "id=142".
+      const uint8_t rawByte0 = raw[offset];
+      const uint8_t id = rawByte0 & companionble::kButtonIdMask;
       const uint8_t routing = raw[offset + 1];
       const uint8_t labelLen = raw[offset + 2];
       offset += 3;
@@ -312,8 +319,11 @@ bool handleCommand(const String& command) {
       const size_t copy = labelLen < sizeof(label) - 1 ? labelLen : sizeof(label) - 1;
       memcpy(label, raw + offset, copy);
       offset += labelLen;
-      reply("button id=%u routing=%s label=%s", static_cast<unsigned>(id),
-            routingName(static_cast<companionble::ButtonRouting>(routing)), label);
+      char flagsSuffix[32] = {0};
+      if (rawByte0 & companionble::kButtonFlagAlsoNotify) strcat(flagsSuffix, " +notify");
+      if (rawByte0 & companionble::kButtonFlagLocalOnlyOffline) strcat(flagsSuffix, " +offline_only");
+      reply("button id=%u routing=%s label=%s%s", static_cast<unsigned>(id),
+            routingName(static_cast<companionble::ButtonRouting>(routing)), label, flagsSuffix);
     }
 
     // The tag section is optional — an app with no tags simply ends here.

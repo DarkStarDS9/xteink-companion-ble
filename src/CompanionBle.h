@@ -179,6 +179,24 @@ enum class ButtonRouting : uint8_t {
 // anything past this rather than trust an unknown byte verbatim.
 inline constexpr uint8_t kMaxButtonRouting = static_cast<uint8_t>(ButtonRouting::LocalListBack);
 
+// Button-map entry byte 0 packs the (hardware-limited, 7-value) button id
+// into its low nibble and reserves the high nibble for behaviour flags --
+// see docs/companion-multi-app-design.md §7. Bits 5-4 are reserved: a
+// declaration that sets them is parsed as if it hadn't (ignored, not
+// rejected), leaving room to widen the flag set later without a version
+// bump. Every declaration written before these flags existed has both high
+// bits clear, so parsing is byte-identical for them.
+inline constexpr uint8_t kButtonIdMask = 0x0F;
+// Also relay a button event to the connected peer even though the button
+// resolved to a local action. Inert on ButtonRouting::None and ::Remote --
+// see companionbuttons::decide().
+inline constexpr uint8_t kButtonFlagAlsoNotify = 0x80;
+// Run the local action only while no peer is connected; when a peer holds
+// the foreground link, the local action is suppressed (and, combined with
+// kButtonFlagAlsoNotify, only the notify fires). Inert on
+// ButtonRouting::None and ::Remote.
+inline constexpr uint8_t kButtonFlagLocalOnlyOffline = 0x40;
+
 // What kind of content a peer pushes, declared once per peer in its UI
 // declaration (kFieldUiDeclaration) rather than inferred from whichever field
 // happened to arrive last. See docs/companion-declared-shape-design.md: the

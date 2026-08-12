@@ -36,9 +36,17 @@ struct ButtonDecision {
   bool showHint;
 };
 
-// Decides what `routing` resolves to given whether a peer currently holds
-// the foreground link (CompanionModeActivity's `!foregroundPeerKey.empty()`
-// test, not the raw `connected` member -- see the call sites this replaces).
-ButtonDecision decide(companionble::ButtonRouting routing, bool peerConnected);
+// Decides what `routing` resolves to given `flags` (the high nibble of the
+// button-map entry's byte 0 -- kButtonFlagAlsoNotify / kButtonFlagLocalOnly-
+// Offline, see CompanionBle.h; reserved bits 0x30 are ignored, not
+// validated -- that is the caller's job, this function tolerates them) and
+// whether a peer currently holds the foreground link
+// (CompanionModeActivity's `!foregroundPeerKey.empty()` test, not the raw
+// `connected` member -- see the call sites this replaces).
+//
+// flags are inert on ButtonRouting::None and ::Remote: there is no local
+// action for them to modify. See docs/companion-multi-app-design.md §7 for
+// the full behaviour table.
+ButtonDecision decide(uint8_t flags, companionble::ButtonRouting routing, bool peerConnected);
 
 }  // namespace companionbuttons

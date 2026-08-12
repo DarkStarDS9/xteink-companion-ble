@@ -196,11 +196,41 @@ reconnect and can still be rendered while disconnected — which is what lets th
 ```
 bytes 0..3: asset tag (opaque, stored verbatim — see §5)
 byte 4:  entry count N
-N × {  buttonId : 1
+N × {  buttonId : 1     bits 3-0 button id, bits 5-4 reserved (must be 0,
+                         ignored not rejected), bit 6 LOCAL_ONLY_OFFLINE,
+                         bit 7 ALSO_NOTIFY — see "Button behaviour flags" below
        routing  : 1
        labelLen : 1
        label    : labelLen bytes, UTF-8, may be empty  }
 ```
+
+Physical buttons are hardware-limited to 7 values, so `buttonId` only needs a
+nibble; `routing` stays a full byte of its own because it is open-ended (a new
+`LOCAL_*` value is always one more enumerator away, and packing it into a
+nibble alongside the id would cap it at 16 forever). The two spare bits above
+the id nibble are **behaviour flags** on the routing, not on the id.
+
+#### Button behaviour flags
+
+`ALSO_NOTIFY` and `LOCAL_ONLY_OFFLINE` modify a **local** routing
+(`LOCAL_PAGE_PREV` … `LOCAL_LIST_BACK`); both are inert on `NONE` and `REMOTE`
+— there is no local action there for them to modify, and `REMOTE` already
+notifies exactly when a peer is connected. For a local routing `X`:
+
+| flags on `X` | peer connected | peer not connected |
+| --- | --- | --- |
+| (none) | run `X` | run `X` |
+| `ALSO_NOTIFY` | run `X` **and** notify | run `X` |
+| `LOCAL_ONLY_OFFLINE` | nothing; no hint drawn | run `X` |
+| `ALSO_NOTIFY` + `LOCAL_ONLY_OFFLINE` | notify only; hint still drawn | run `X` |
+
+This is what lets an app say "this is an internal action, but notify me too"
+(`ALSO_NOTIFY` alone) or "run the internal action while I'm not connected, but
+just notify me while I am" (both together) — neither is expressible with a
+single-behaviour `routing` byte, since one entry can only name one routing.
+
+Every declaration written before these flags existed has both high bits clear
+on every entry, so parsing is byte-identical for them.
 
 `routing` is a small **closed** enum — this is the entire set of things the firmware can do by
 itself, and it stays closed on purpose:

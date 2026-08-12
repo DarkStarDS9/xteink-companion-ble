@@ -137,6 +137,15 @@ CMD:CUI             -> CT:ui peer=a1b2c3d4 buttons=4
                        CT:button id=2 routing=page_prev label=<
                        CT:ui tags=2
                        CT:tag id=0 label=Saved
+```
+
+A button entry using the byte-0 behaviour flags (see
+`docs/companion-multi-app-design.md` §7) prints them as a suffix on the same
+line, e.g. `routing=local_sleep label=Sleep +notify` or `label=Sync
++offline_only`; a button using both prints `+notify +offline_only`. `id=` is
+always the masked 0-6 button id, never the raw declaration byte.
+
+```
 CMD:CSTATE          -> CT:state screen=text connected=1 sessions=1 foreground=1 peer=a1b2c3d4 heap=47764
 CMD:CBTN 0 1200     -> CT:btn id=0 hold=1200
                        (host receives ~12 button-event notifications then a final)

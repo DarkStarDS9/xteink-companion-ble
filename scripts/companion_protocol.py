@@ -227,7 +227,27 @@ CAP_FLAG_LIST_STATE_SYNC = 0x20  # v12
 BTN_BACK, BTN_CONFIRM, BTN_LEFT, BTN_RIGHT, BTN_UP, BTN_DOWN, BTN_POWER = range(7)
 BUTTON_NAMES = {0: "BACK", 1: "CONFIRM", 2: "LEFT", 3: "RIGHT", 4: "UP", 5: "DOWN", 6: "POWER"}
 
-ROUTING_NONE, ROUTING_REMOTE, ROUTING_PAGE_PREV, ROUTING_PAGE_NEXT, ROUTING_SLEEP = range(5)
+(
+    ROUTING_NONE,
+    ROUTING_REMOTE,
+    ROUTING_PAGE_PREV,
+    ROUTING_PAGE_NEXT,
+    ROUTING_SLEEP,
+    ROUTING_LIST_MOVE_UP,
+    ROUTING_LIST_MOVE_DOWN,
+    ROUTING_LIST_SWITCH_LEFT,
+    ROUTING_LIST_SWITCH_RIGHT,
+    ROUTING_LIST_TOGGLE_CHECK,
+    ROUTING_LIST_BACK,
+) = range(11)
+
+# Button-map entry byte 0 behaviour flags -- OR'd into the `button` id passed
+# to encode_ui_declaration() (see its docstring), exactly mirroring the wire:
+# byte 0's low nibble is the button id, bits 6-7 are these flags. Modify a
+# *local* routing only; inert on ROUTING_NONE/ROUTING_REMOTE. See
+# docs/companion-multi-app-design.md §7 for the full behaviour table.
+BUTTON_FLAG_LOCAL_ONLY_OFFLINE = 0x40
+BUTTON_FLAG_ALSO_NOTIFY = 0x80
 
 TAG_HIDDEN, TAG_OUTLINE, TAG_FILLED = 0, 1, 2
 
@@ -286,6 +306,10 @@ def encode_ui_declaration(
     body = b"" if shape is None else bytes([shape])
     body += bytes([len(entries)])
     for button, routing, label in entries:
+        # `button` is the wire byte as-is: a caller ORs BUTTON_FLAG_ALSO_NOTIFY
+        # / BUTTON_FLAG_LOCAL_ONLY_OFFLINE into the low-nibble button id
+        # (e.g. `BTN_CONFIRM | BUTTON_FLAG_ALSO_NOTIFY`), which is literally
+        # what the device reads out of byte 0 -- no separate flags parameter.
         encoded = label.encode("utf-8")
         body += bytes([button, routing, len(encoded)]) + encoded
     body += bytes([len(tags)])
