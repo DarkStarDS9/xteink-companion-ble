@@ -1935,13 +1935,38 @@ void CompanionModeActivity::loop() {
   // map after it disconnects (buttons[] is only reset by the *next* peer's
   // loadUiDeclaration()), so the "don't steal a claimed button" gate keeps
   // working the same whether or not that peer is still connected.
-  handleGalleryNav();
+  //
+  // A claimed press restarts the idle clock -- but ONLY if one is already
+  // running (idleSinceMs != 0). idleSinceMs == 0 is not "the clock reads
+  // zero," it means "no idle sleep from this state at all": checkIdleTimers()
+  // returns immediately when it sees 0, and applyForegroundChange() sets it
+  // to exactly 0 the moment a peer TAKES the foreground (a live app driving
+  // the screen must never be deep-slept out from under it). The USB-power
+  // branch of checkIdleTimers() that this used to cite is not a
+  // counterexample -- it runs only after that same 0 check has already
+  // passed, so it is only ever restarting a clock that was already armed,
+  // never arming one that was deliberately disarmed. Assigning millis()
+  // unconditionally here made the same mistake in reverse: a live LIST peer
+  // foreground disarms the clock (idleSinceMs == 0), but pressing a button on
+  // Screen::List still went through handleListNav() and re-armed it, so the
+  // device would deep-sleep mid-session under a connected app 5 minutes
+  // later -- worse than the bug this is fixing. Gating on idleSinceMs != 0
+  // fixes the real case (offline browsing after a disconnect, where the
+  // clock is already running and just needs restarting so mid-browse input
+  // doesn't let it expire) without arming anything that was off. A device
+  // left untouched on one of these screens is unaffected either way: still
+  // sleeps after kWaitingIdleSleepMs when the clock was running, still never
+  // sleeps when a live peer disarmed it.
+  if (handleGalleryNav() && idleSinceMs != 0) idleSinceMs = millis();
 
   // Same reasoning as handleGalleryNav() above: the icon grid, the gallery
   // picker, and a gallery reached through it are all firmware-owned screens
   // with no foreground peer's button map to defer to, so this is tried
   // regardless of whether foregroundPeerKey is empty.
-  if (handlePickerInput()) return;
+  if (handlePickerInput()) {
+    if (idleSinceMs != 0) idleSinceMs = millis();
+    return;
+  }
 
   // Screen::List claims Up/Down/Left/Right/Confirm/Back unconditionally --
   // see handleListNav()'s own comment for why that's safe specifically for
@@ -1950,7 +1975,10 @@ void CompanionModeActivity::loop() {
   // handleGalleryNav()/handlePickerInput() above: the offline icon-grid
   // picker entry point (this feature's second commit) reaches Screen::List
   // with no foreground peer at all.
-  if (handleListNav()) return;
+  if (handleListNav()) {
+    if (idleSinceMs != 0) idleSinceMs = millis();
+    return;
+  }
 
   // Deliberately NOT gated on a live foreground session, for the same reason
   // handleGalleryNav() above isn't: a dropped link does not take the article off
