@@ -35,6 +35,7 @@ VirtualPress g_press;
 
 ScreenNameProvider g_screenNameProvider = nullptr;
 TagStateProvider g_tagStateProvider = nullptr;
+ListNavStateProvider g_listNavStateProvider = nullptr;
 
 const char* tagStateName(uint8_t state) {
   switch (static_cast<companionble::TagState>(state)) {
@@ -177,6 +178,8 @@ void setScreenNameProvider(ScreenNameProvider provider) { g_screenNameProvider =
 
 void setTagStateProvider(TagStateProvider provider) { g_tagStateProvider = provider; }
 
+void setListNavStateProvider(ListNavStateProvider provider) { g_listNavStateProvider = provider; }
+
 bool handleCommand(const String& command) {
   if (command == "CPING") {
     reply("pong v6");
@@ -273,6 +276,21 @@ bool handleCommand(const String& command) {
       }
       offset = static_cast<uint16_t>(offset + got);
     }
+    return true;
+  }
+  if (command == "CLISTNAV") {
+    // Read-only, justified the same way CLIST is above: it reports state
+    // render() already holds (companiontodo::Nav's live position) rather than
+    // making a test diff a 52 KB screenshot to prove a cursor moved.
+    ListNavReport report;
+    if (!g_listNavStateProvider || !g_listNavStateProvider(&report) || !report.onListScreen) {
+      reply("listnav none: not on Screen::List");
+      return true;
+    }
+    reply("listnav listIndex=%u listCount=%u cursor=%u windowStart=%u itemCount=%u",
+          static_cast<unsigned>(report.listIndex), static_cast<unsigned>(report.listCount),
+          static_cast<unsigned>(report.cursor), static_cast<unsigned>(report.windowStart),
+          static_cast<unsigned>(report.itemCount));
     return true;
   }
   if (command == "CUI" || command.startsWith("CUI ")) {

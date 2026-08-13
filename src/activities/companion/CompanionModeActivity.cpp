@@ -359,6 +359,9 @@ void CompanionModeActivity::onEnter() {
   companiontest::setTagStateProvider([](companiontest::TagReport* out, uint8_t maxTags) -> uint8_t {
     return g_screenNameActivity ? g_screenNameActivity->reportTags(out, maxTags) : 0;
   });
+  companiontest::setListNavStateProvider([](companiontest::ListNavReport* out) -> bool {
+    return g_screenNameActivity ? g_screenNameActivity->reportListNav(out) : false;
+  });
 #endif
 
   if (offlineBrowse) {
@@ -2341,6 +2344,17 @@ uint8_t CompanionModeActivity::reportTags(companiontest::TagReport* out, uint8_t
     snprintf(out[i].label, sizeof(out[i].label), "%s", tags[i].label);
   }
   return count;
+}
+
+bool CompanionModeActivity::reportListNav(companiontest::ListNavReport* out) const {
+  if (screen != Screen::List) return false;
+  out->onListScreen = true;
+  out->listIndex = listNav.listIndex();
+  out->listCount = listNav.listCount();
+  out->cursor = listNav.cursor();
+  out->windowStart = listNav.windowStart();
+  out->itemCount = listNav.itemCount();
+  return true;
 }
 #endif
 

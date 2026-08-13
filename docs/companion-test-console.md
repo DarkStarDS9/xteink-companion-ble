@@ -73,6 +73,7 @@ so a host can pick replies out of the log stream without parsing timestamps.
 | `CMD:CUI` | `CT:ui …`, then one `CT:button …` and one `CT:tag …` per entry | The foreground app's declared buttons and tags |
 | `CMD:CTAGS` | `CT:tags count=N`, then one `CT:tag id=… state=… label=…` | Live tag state — see below |
 | `CMD:CLIST` | `CT:list peer=… revision=… count=N`, then one `CT:listitem id=… checked=…` per entry | The foreground peer's stored ToDo List check-off diff — see below |
+| `CMD:CLISTNAV` | `CT:listnav listIndex=… listCount=… cursor=… windowStart=… itemCount=…`, or `CT:listnav none: not on Screen::List` | Live ToDo List cursor/paging position — see below |
 | `CMD:CBTN <id> [holdMs]` | `CT:btn id=… hold=…` | Inject a button press |
 | `CMD:CRESET` | `CT:reset ok` | Delete all peer state — back to never-paired |
 
@@ -115,6 +116,27 @@ reports `revision=0 count=0`, the same as one with nothing pending.
 
 The diff is cleared unconditionally whenever a new list document lands, so
 `CMD:CLIST` immediately after a `kFieldListDoc` push always reports `count=0`.
+
+### `CLISTNAV`
+
+Reports `companiontodo::Nav`'s live cursor/paging position — the same numbers
+`render()` reads — while `Screen::List` is up. Off that screen it replies
+`CT:listnav none: not on Screen::List`.
+
+This exists so a test can prove "the cursor moved" or "the list switched"
+without a `CMD:SCREENSHOT` diff. A screenshot dump is not exclusive against the
+device's own serial logging (see "One process, one serial port" below): a log
+line landing mid-dump shifts every byte after it and the harness has to detect
+and retry, which is fragile and was observed to abort a run outright on a
+`[env:test]` build (`ENABLE_SERIAL_LOG` + `LOG_LEVEL=2`). `CLISTNAV` reads the
+same state directly, at no shared-port risk at all.
+
+`listIndex`/`listCount` are which list is showing and how many lists the
+document has; `cursor` is the 0-based flat item index under the selection
+marker; `windowStart` is the first visible row (paginates once `cursor` scrolls
+past the viewport); `itemCount` is the current list's item count, ignoring
+group headers — all four are `companiontodo::Nav`'s own accessors
+(`src/CompanionTodoNav.h`), reported verbatim.
 
 ### `CRESET`
 

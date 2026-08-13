@@ -69,6 +69,24 @@ Covered:
                standalone without buttonmap), it pushes a UI declaration and
                ACQUIREs first, so a failure to get the screen fails fast with one
                clear message instead of every push timing out mysteriously.
+  list         v12 Phase A/B: FIELD_LIST_DOC accept/refuse-by-shape, malformed and
+               over-cap documents, and the LIST_STATE sync-back opcodes.
+  listback     an empty button map on a LIST peer: firmware's own Back-leaves-
+               the-screen fallback, which only applies when the peer bound
+               NOTHING at all (companionbuttons::anyBound()).
+  listbindings a LIST peer that explicitly declares all six LOCAL_LIST_* routings
+               (docs/companion-multi-app-design.md's 4fbc8f52 doc pass): cursor
+               move, list switch, check toggle and Back all via the declared map
+               rather than LIST_DECL's implicit fallback.
+  flags        the byte-0 button-map behaviour flags (0777acdf): ALSO_NOTIFY
+               relays a press to the app on top of whatever it does locally;
+               LOCAL_ONLY_OFFLINE suppresses the local action while a peer is
+               connected. A button carrying both proves the two are independent.
+  offline      offline browse (ca8aeaf7/3c0ae2da): Confirm on the icon grid
+               reboots into the gallery picker with BLE never started that boot,
+               and Back reboots back out with BLE re-armed. Deliberately last --
+               drops the live link and reboots the device twice, needs an
+               already-enrolled peer (run after [list] or with --keep-peers).
 
 --soak MINUTES runs a separate mode instead of the scenario groups above: one
 connection, held open for the whole window with light periodic activity, to catch
@@ -125,6 +143,9 @@ from companion_protocol import (
     BTN_DOWN,
     BTN_LEFT,
     BTN_RIGHT,
+    BTN_UP,
+    BUTTON_FLAG_ALSO_NOTIFY,
+    BUTTON_FLAG_LOCAL_ONLY_OFFLINE,
     CAPABILITY_CHAR_UUID,
     CAP_FLAG_LIST_STATE_SYNC,
     CAP_FLAG_SHAPE_AWARE,
@@ -145,6 +166,12 @@ from companion_protocol import (
     RENDER_REJECTED_SIZE,
     RENDER_SEQUENCE_GAP,
     RENDER_RESULTS,
+    ROUTING_LIST_BACK,
+    ROUTING_LIST_MOVE_DOWN,
+    ROUTING_LIST_MOVE_UP,
+    ROUTING_LIST_SWITCH_LEFT,
+    ROUTING_LIST_SWITCH_RIGHT,
+    ROUTING_LIST_TOGGLE_CHECK,
     ROUTING_PAGE_NEXT,
     ROUTING_PAGE_PREV,
     ROUTING_REMOTE,
@@ -215,6 +242,43 @@ NO_SHAPE_DECL = encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS, shape=None)
 # docs/companion-declared-shape-design.md is explicit that LIST permits no
 # overlay, so there is nothing for a declared tag label to attach to.
 LIST_DECL = encode_ui_declaration([], shape=SHAPE_LIST)
+
+# A LIST peer that explicitly binds all six LOCAL_LIST_* routings (the values
+# docs/companion-multi-app-design.md's 4fbc8f52 doc pass named but LIST_DECL
+# above deliberately never exercises -- see its own comment). Physical layout
+# mirrors what Screen::List's old *implicit* handling did (Up/Down cursor,
+# Left/Right switch list, Confirm toggle, Back leave), so a pixel/behaviour
+# diff against LIST_DECL's fallback path proves the declared routing does the
+# same thing on purpose, not that both paths happen to look alike by accident.
+LIST_BINDINGS_MAP = [
+    (BTN_UP, ROUTING_LIST_MOVE_UP, "Up"),
+    (BTN_DOWN, ROUTING_LIST_MOVE_DOWN, "Down"),
+    (BTN_LEFT, ROUTING_LIST_SWITCH_LEFT, "Prev"),
+    (BTN_RIGHT, ROUTING_LIST_SWITCH_RIGHT, "Next"),
+    (BTN_CONFIRM, ROUTING_LIST_TOGGLE_CHECK, "Check"),
+    (BTN_BACK, ROUTING_LIST_BACK, "Back"),
+]
+LIST_BINDINGS_DECL = encode_ui_declaration(LIST_BINDINGS_MAP, shape=SHAPE_LIST)
+
+# A TEXT peer's map exercising the byte-0 behaviour flags
+# (docs/companion-multi-app-design.md §7, src/CompanionBle.h's
+# kButtonFlagAlsoNotify/kButtonFlagLocalOnlyOffline): RIGHT carries
+# ALSO_NOTIFY alone (local page-next AND a relayed button event), UP carries
+# both flags together (LOCAL_ONLY_OFFLINE suppresses the local page-prev
+# while a peer is connected, ALSO_NOTIFY still relays the press) -- see
+# src/CompanionButtonPolicy.cpp's decide(): notify = alsoNotify && connected,
+# localRuns = !(offlineOnly && connected), so this is the one combination
+# that proves the two flags are independent rather than one being a stronger
+# version of the other. LEFT stays a plain, unflagged local page-prev as the
+# baseline every assertion below is a diff against.
+FLAGS_MAP = [
+    (BTN_LEFT, ROUTING_PAGE_PREV, "<"),
+    (BTN_RIGHT | BUTTON_FLAG_ALSO_NOTIFY, ROUTING_PAGE_NEXT, ">N"),
+    (BTN_UP | BUTTON_FLAG_ALSO_NOTIFY | BUTTON_FLAG_LOCAL_ONLY_OFFLINE, ROUTING_PAGE_PREV, "^NO"),
+    (BTN_CONFIRM, ROUTING_REMOTE, "Save"),
+    (BTN_BACK, ROUTING_REMOTE, "Back"),
+]
+FLAGS_DECL = encode_ui_declaration(FLAGS_MAP, DEFAULT_TAGS, shape=SHAPE_TEXT)
 
 # A small multi-list/multi-group/multi-item document, exercising every level
 # of the nesting the wire format describes (docs/companion-todo-list-design.md
@@ -526,6 +590,26 @@ class Console:
             time.sleep(0.3)
             state = self.list_state()
         return state
+
+    def list_nav(self) -> dict | None:
+        """companiontodo::Nav's live cursor/paging position, or None off Screen::List.
+
+        Exists so a cursor-move or list-switch assertion can read the same
+        numbers render() reads instead of diffing a 52 KB CMD:SCREENSHOT dump,
+        which is not exclusive against the device's own serial logging (see
+        docs/companion-test-console.md) and proved flaky on that account.
+        """
+        for reply in self.send("CLISTNAV", expect="listnav"):
+            if reply.startswith("listnav none"):
+                return None
+            if reply.startswith("listnav "):
+                fields = {}
+                for token in reply[len("listnav ") :].split(" "):
+                    if "=" in token:
+                        key, value = token.split("=", 1)
+                        fields[key] = int(value)
+                return fields
+        return None
 
     def press(self, button: int, hold_ms: int = 0) -> None:
         self.send(f"CBTN {button} {hold_ms}", expect="btn")
@@ -2716,6 +2800,321 @@ async def run_tests(args, console: Console, results: Results) -> None:
                     console, results, "list",
                     allowed=("shape", "0x08", "list doc", "decode", "size"),
                 )
+
+            # --- empty button map: firmware's Back-leaves-the-screen fallback - #
+            if enabled("listback"):
+                print("\n[listback] empty button map: firmware supplies Back only when nothing is bound")
+                if await ensure_declared_foreground(session_c, console, results, LIST_DECL, "listback/peer"):
+                    verdict = await session_c.push_list_doc(SAMPLE_LIST_DOC, push_id=0x81)
+                    results.check(
+                        "listback: the sample document is accepted",
+                        verdict == RENDER_DISPLAYED,
+                        f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                    )
+                    settled = console.await_screen("list")
+                    if results.check(
+                        "listback: device shows the list screen", settled == "list", f"screen is {settled!r}"
+                    ):
+                        console.press(BTN_BACK)
+                        # listReturnScreen for a live foreground LIST peer is
+                        # Screen::Text (applyForegroundChange()), but this peer
+                        # only ever pushed a list document -- no title/body --
+                        # so haveContent is false and screenName() reports
+                        # "waiting_app" for Screen::Text, per its own ternary.
+                        # "text" would actually be the WRONG report here.
+                        after = console.await_screen("waiting_app")
+                        results.check(
+                            "listback: Back left Screen::List when the peer bound nothing at all "
+                            "(companionbuttons::anyBound() false over the whole map)",
+                            after == "waiting_app",
+                            f"screen is {after!r}",
+                        )
+                    check_no_errors(console, results, "listback")
+
+            # --- declared LOCAL_LIST_* routings ---------------------------- #
+            if enabled("listbindings"):
+                print("\n[listbindings] a LIST peer explicitly declares all six LOCAL_LIST_* routings")
+                if await ensure_declared_foreground(
+                    session_c, console, results, LIST_BINDINGS_DECL, "listbindings/peer"
+                ):
+                    verdict = await session_c.push_list_doc(SAMPLE_LIST_DOC, push_id=0x82)
+                    results.check(
+                        "listbindings: the sample document is (re-)accepted",
+                        verdict == RENDER_DISPLAYED,
+                        f"result {RENDER_RESULTS.get(verdict, verdict)}",
+                    )
+                    settled = console.await_screen("list")
+                    if results.check(
+                        "listbindings: device shows the list screen", settled == "list", f"screen is {settled!r}"
+                    ):
+                        labels = console.send("CUI")
+                        results.check(
+                            "listbindings: device read back the LIST shape",
+                            any(f"shape={SHAPE_LIST}" in line for line in labels),
+                            str(labels),
+                        )
+
+                        # --- cursor move (Down = LOCAL_LIST_MOVE_DOWN) ------- #
+                        # CLISTNAV reads companiontodo::Nav's live position
+                        # directly instead of diffing a CMD:SCREENSHOT: a
+                        # screenshot dump is not exclusive against the
+                        # device's own serial logging (this build has
+                        # ENABLE_SERIAL_LOG on), and a stray log line landing
+                        # mid-dump was observed to corrupt the framebuffer
+                        # capture and abort the whole run.
+                        before = console.list_nav()
+                        console.press(BTN_DOWN)
+                        after = console.list_nav()
+                        results.check(
+                            "listbindings: Down visibly moved the cursor",
+                            bool(before) and bool(after) and after["cursor"] == before["cursor"] + 1,
+                            f"before={before} after={after}",
+                        )
+                        console.press(BTN_UP)  # back to row 0 for what follows
+
+                        # --- list switch (Right/Left = LOCAL_LIST_SWITCH_*) -- #
+                        before = console.list_nav()
+                        console.press(BTN_RIGHT)
+                        switched = console.list_nav()
+                        results.check(
+                            "listbindings: Right switched to the other list",
+                            bool(before) and bool(switched) and switched["listIndex"] != before["listIndex"],
+                            f"before={before} switched={switched}",
+                        )
+                        console.press(BTN_LEFT)
+                        back = console.list_nav()
+                        results.check(
+                            "listbindings: Left switched back",
+                            bool(back) and back["listIndex"] == before["listIndex"],
+                            f"before={before} back={back}",
+                        )
+
+                        # --- check toggle (Confirm = LOCAL_LIST_TOGGLE_CHECK) - #
+                        # Cursor is back at row 0 -- SAMPLE_LIST_STRUCTURE's
+                        # first item, id=1 "Milk", pushed unchecked. The doc
+                        # was just re-pushed above, which unconditionally
+                        # clears the stored diff (docs/companion-test-console
+                        # .md's CLIST section), so it starts empty here.
+                        before_state = console.list_state()
+                        results.check(
+                            "listbindings: diff starts empty after a fresh document push",
+                            before_state[1] == [],
+                            str(before_state),
+                        )
+                        console.press(BTN_CONFIRM)
+                        revision, entries = console.await_list_state(1)
+                        results.check(
+                            "listbindings: Confirm toggled the row under the cursor (itemId 1)",
+                            entries == [(1, 1)],
+                            f"revision={revision} entries={entries}",
+                        )
+                        console.press(BTN_CONFIRM)
+                        revision, entries = console.await_list_state(0)
+                        results.check(
+                            "listbindings: toggling back removes the diff entry",
+                            entries == [],
+                            f"revision={revision} entries={entries}",
+                        )
+
+                        # --- Back (LOCAL_LIST_BACK, explicitly declared) ----- #
+                        console.press(BTN_BACK)
+                        # Same reasoning as listback above: this peer never
+                        # pushed title/body, only a list document, so
+                        # haveContent is false and screenName() reports
+                        # "waiting_app" for the Screen::Text it landed on.
+                        after_back = console.await_screen("waiting_app")
+                        results.check(
+                            "listbindings: the declared Back routing left Screen::List",
+                            after_back == "waiting_app",
+                            f"screen is {after_back!r}",
+                        )
+                    check_no_errors(console, results, "listbindings")
+
+            # --- button-map behaviour flags: ALSO_NOTIFY / LOCAL_ONLY_OFFLINE - #
+            if enabled("flags"):
+                print("\n[flags] ALSO_NOTIFY / LOCAL_ONLY_OFFLINE button-map behaviour flags")
+                if await ensure_declared_foreground(session_a, console, results, FLAGS_DECL, "flags/peer"):
+                    # Multi-page content, so a local page turn is visible on the
+                    # panel rather than something only CSTATE would notice.
+                    body = "\n".join(f"Flags test line {i} of a body long enough to paginate." for i in range(80))
+                    push_id = 0x40
+                    render = session_a.expect_render(push_id)
+                    await session_a.push_field(FIELD_TITLE, b"Flags", push_id=push_id)
+                    await session_a.push_field(FIELD_BODY, body.encode(), final=True, push_id=push_id)
+                    try:
+                        await asyncio.wait_for(render, timeout=15.0)
+                    except asyncio.TimeoutError:
+                        results.check("flags: seed content was answered with RENDER_STATUS", False)
+                    settled = console.await_screen("text")
+                    if results.check("flags: device shows the text screen", settled == "text", f"screen is {settled!r}"):
+                        # --- RIGHT: ALSO_NOTIFY alone on a local page-next --- #
+                        before = console.screenshot()
+                        link.button_events.clear()
+                        console.press(BTN_RIGHT)
+                        await asyncio.sleep(0.5)
+                        results.check(
+                            "ALSO_NOTIFY: a button-event notification arrived",
+                            bool(link.button_events),
+                            str(link.button_events),
+                        )
+                        results.check(
+                            "ALSO_NOTIFY: the event carries the masked RIGHT id",
+                            bool(link.button_events) and link.button_events[-1].button == BTN_RIGHT,
+                            str(link.button_events),
+                        )
+                        after = console.screenshot()
+                        results.check(
+                            "ALSO_NOTIFY: the local page-turn still happened",
+                            after != before,
+                            "screenshot unchanged after a page-next press",
+                        )
+
+                        # --- UP: LOCAL_ONLY_OFFLINE + ALSO_NOTIFY, connected -- #
+                        # decide(): notify = alsoNotify && connected (true);
+                        # localRuns = !(offlineOnly && connected) (false) --
+                        # the one combination that proves the two flags are
+                        # independent rather than one a stronger form of the
+                        # other (see FLAGS_MAP's comment).
+                        before = console.screenshot()
+                        link.button_events.clear()
+                        console.press(BTN_UP)
+                        await asyncio.sleep(0.5)
+                        results.check(
+                            "LOCAL_ONLY_OFFLINE: a button-event notification still arrived while connected",
+                            bool(link.button_events),
+                            str(link.button_events),
+                        )
+                        after = console.screenshot()
+                        results.check(
+                            "LOCAL_ONLY_OFFLINE: the local action did NOT happen while connected",
+                            after == before,
+                            "screenshot changed even though LOCAL_ONLY_OFFLINE should have suppressed it",
+                        )
+
+                        # --- CUI dump: masked id plus the +notify/+offline_only suffixes --- #
+                        labels = console.send("CUI")
+                        results.check(
+                            "CUI: the ALSO_NOTIFY-only button (RIGHT) shows +notify but not +offline_only",
+                            any(
+                                f"id={BTN_RIGHT} " in line and "+notify" in line and "+offline_only" not in line
+                                for line in labels
+                            ),
+                            str(labels),
+                        )
+                        results.check(
+                            "CUI: the combined button (UP) shows both +notify and +offline_only",
+                            any(
+                                f"id={BTN_UP} " in line and "+notify" in line and "+offline_only" in line
+                                for line in labels
+                            ),
+                            str(labels),
+                        )
+                        results.check(
+                            "CUI: the unflagged button (LEFT) shows neither suffix",
+                            any(
+                                f"id={BTN_LEFT} " in line and "+notify" not in line and "+offline_only" not in line
+                                for line in labels
+                            ),
+                            str(labels),
+                        )
+                    check_no_errors(console, results, "flags")
+
+            # --- offline browse: reboot in, no advertising, reboot back out - #
+            #
+            # Deliberately last: this drops the live link on purpose and the
+            # device reboots twice, so nothing after it can assume `client`/
+            # `link` (this scope's, opened by [reconnect] above) are still
+            # usable. Needs an already-enrolled peer with gallery/list content
+            # on SD (buildPickerPeerKeys()'s eligibility test) -- i.e. session_c
+            # from [list]/[listback]/[listbindings] above, or a prior full run
+            # with --keep-peers. Standalone `--only offline` on a freshly-reset
+            # device has nothing enrolled, lands on Screen::Waiting rather than
+            # Screen::IconGrid, and fails the first assertion below honestly
+            # rather than silently no-op'ing.
+            if enabled("offline"):
+                print("\n[offline] Confirm on the icon grid reboots into offline browse; no advertising while in it")
+
+                async def wait_console_up(deadline_s: float) -> bool:
+                    """Polls CPING past a reboot -- esp_restart() is a full chip
+
+                    reset, so USB CDC drops and re-enumerates and the first
+                    couple of seconds of serial traffic can legitimately time
+                    out or throw; that is not a console failure, it is the
+                    boot gap docs/companion-test-console.md's "deep-slept
+                    device" section describes for a different reset path.
+                    """
+                    deadline = time.time() + deadline_s
+                    while time.time() < deadline:
+                        try:
+                            if console.ping():
+                                return True
+                        except Exception:
+                            pass
+                        time.sleep(0.5)
+                    return False
+
+                await client.disconnect()
+                await asyncio.sleep(1.0)
+                idle_screen = console.await_screen("icon_grid", timeout=15.0)
+                if results.check(
+                    "offline: the device settles on the icon grid once the link drops",
+                    idle_screen == "icon_grid",
+                    f"screen is {idle_screen!r} -- needs an already-enrolled peer with an icon; "
+                    "see this group's standalone-mode comment above",
+                ):
+                    console.press(BTN_CONFIRM)  # enterOfflineBrowseMode(): saves state, stops BLE, reboots
+                    booted = await wait_console_up(20.0)
+                    results.check("offline: the device comes back up after the reboot", booted)
+
+                    if booted:
+                        picker_screen = console.await_screen("gallery_picker", timeout=15.0)
+                        results.check(
+                            "offline: reboot resumes straight into the gallery picker",
+                            picker_screen == "gallery_picker",
+                            f"screen is {picker_screen!r}",
+                        )
+                        results.check(
+                            "offline: CSTATE reports no connected central",
+                            console.state().get("connected") == "0",
+                            str(console.state()),
+                        )
+
+                        print("  scanning for an advertisement while offline (expect none)...")
+                        offline_devices = await BleakScanner.discover(timeout=6.0, service_uuids=[SERVICE_UUID])
+                        results.check(
+                            "offline: no advertisement while in offline browse mode",
+                            not offline_devices,
+                            f"found {[d.address for d in offline_devices]}",
+                        )
+
+                        console.press(BTN_BACK)  # leaves offline browse: reboots, BLE re-armed
+                        booted = await wait_console_up(20.0)
+                        results.check("offline: the device comes back up after the second reboot", booted)
+
+                        if booted:
+                            back_screen = console.await_screen("icon_grid", timeout=15.0)
+                            results.check(
+                                "offline: leaving offline browse resumes on the icon grid",
+                                back_screen == "icon_grid",
+                                f"screen is {back_screen!r}",
+                            )
+                            print("  scanning to confirm the device is reconnectable...")
+                            reconnect_devices = await BleakScanner.discover(timeout=8.0, service_uuids=[SERVICE_UUID])
+                            results.check(
+                                "offline: the device advertises again after leaving offline browse",
+                                bool(reconnect_devices),
+                                "no advertisement seen",
+                            )
+                            if reconnect_devices:
+                                try:
+                                    async with BleakClient(reconnect_devices[0].address) as verify_client:
+                                        await verify_client.read_gatt_char(CAPABILITY_CHAR_UUID)
+                                    results.check("offline: a fresh connection to the device succeeds", True)
+                                except Exception as exc:
+                                    results.check(
+                                        "offline: a fresh connection to the device succeeds", False, str(exc)
+                                    )
+                check_no_errors(console, results, "offline")
 
 
 # --------------------------------------------------------------------------- #

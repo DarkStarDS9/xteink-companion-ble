@@ -361,6 +361,11 @@ class CompanionModeActivity final : public Activity {
   // write actually landed.
   uint8_t reportTags(companiontest::TagReport* out, uint8_t maxTags) const;
 
+  // Live companiontodo::Nav position for CLISTNAV. Returns false (report left
+  // default-constructed) when Screen::List isn't up -- see
+  // CompanionTestConsole.h's ListNavReport.
+  bool reportListNav(companiontest::ListNavReport* out) const;
+
  private:
 #endif
 

@@ -80,6 +80,25 @@ struct TagReport {
 using TagStateProvider = uint8_t (*)(TagReport* out, uint8_t maxTags);
 void setTagStateProvider(TagStateProvider provider);
 
+// Snapshot of companiontodo::Nav's cursor/paging state for CLISTNAV. Filled
+// only when Screen::List is up; see CompanionModeActivity::reportListNav().
+struct ListNavReport {
+  bool onListScreen = false;
+  uint16_t listIndex = 0;
+  uint16_t listCount = 0;
+  uint16_t cursor = 0;
+  uint16_t windowStart = 0;
+  uint16_t itemCount = 0;
+};
+
+// Reports companiontodo::Nav's live position. Verifying "the cursor moved" or
+// "the list switched" used to mean diffing a 52 KB screenshot -- fragile, and
+// not exclusive against the device's own serial logging (see
+// docs/companion-test-console.md's SCREENSHOT section). This exposes the same
+// numbers render() already reads, with none of that.
+using ListNavStateProvider = bool (*)(ListNavReport* out);
+void setListNavStateProvider(ListNavStateProvider provider);
+
 }  // namespace companiontest
 
 #endif  // COMPANION_TEST_CONSOLE
