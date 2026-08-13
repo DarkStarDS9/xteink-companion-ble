@@ -229,27 +229,32 @@ IMAGE_DECL = encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS, shape=SHAPE_IMAGE)
 # imitates anywhere except in the one case that asserts it is refused.
 NO_SHAPE_DECL = encode_ui_declaration(DEFAULT_MAP, DEFAULT_TAGS, shape=None)
 
-# A LIST peer's button map is deliberately empty, not DEFAULT_MAP. Every entry
-# in DEFAULT_MAP (LEFT/RIGHT page, CONFIRM/BACK remote-routed "Save"/"Back") is
-# one of exactly the buttons docs/companion-todo-list-design.md §5 says
-# Screen::List claims implicitly and locally -- Up/Down (cursor), Left/Right
-# (switch list), Confirm (toggle checked), Back (leave the screen) -- "the one
-# place a button's meaning isn't declared by the peer's ButtonRouting map ...
-# no new ButtonRouting enum value needed". Declaring any of them here would
-# claim a routing (e.g. CONFIRM -> ROUTING_REMOTE "Save") the device is never
-# going to honour, since list navigation intercepts those buttons before the
-# peer's map is ever consulted. Tags are empty too: §5 of
+# A LIST peer's button map is deliberately empty, not DEFAULT_MAP -- but not
+# because List navigation has any implicit routing of its own. It does not:
+# handleListNav() (CompanionModeActivity.cpp) resolves every nav button
+# through companionbuttons::decide(routingFor(...)) and has no default case,
+# so a button never bound to a LocalList* routing does nothing at all when
+# pressed, Confirm/toggle included. The one exception is Back, and only when
+# the WHOLE map is empty: companionbuttons::anyBound() false makes Back fall
+# back to leaving the screen (see [listback] below, which is what actually
+# exercises that fallback). An empty map here is therefore a client that
+# declared LIST but bound nothing -- Back-out is all it gets, everything else
+# is inert -- which is exactly the peer [listback] needs to prove the
+# fallback. It is NOT a stand-in for "the buttons a LIST peer would normally
+# use"; for those, see LIST_BINDINGS_DECL below, which [list]'s own toggle/
+# sync assertions use since they press Confirm/Down/Right/Back and need all
+# four to actually do something. Tags are empty too: §5 of
 # docs/companion-declared-shape-design.md is explicit that LIST permits no
 # overlay, so there is nothing for a declared tag label to attach to.
 LIST_DECL = encode_ui_declaration([], shape=SHAPE_LIST)
 
 # A LIST peer that explicitly binds all six LOCAL_LIST_* routings (the values
-# docs/companion-multi-app-design.md's 4fbc8f52 doc pass named but LIST_DECL
-# above deliberately never exercises -- see its own comment). Physical layout
-# mirrors what Screen::List's old *implicit* handling did (Up/Down cursor,
-# Left/Right switch list, Confirm toggle, Back leave), so a pixel/behaviour
-# diff against LIST_DECL's fallback path proves the declared routing does the
-# same thing on purpose, not that both paths happen to look alike by accident.
+# docs/companion-multi-app-design.md's 4fbc8f52 doc pass named, and LIST_DECL
+# above never binds -- see its own comment). This is the map every LIST peer
+# actually needs: handleListNav() has no default routing for any of these six
+# buttons, LIST_DECL's empty map included, so this is what both [list]'s
+# toggle/sync assertions and [listbindings]'s own declared-routing checks use
+# to make Up/Down/Left/Right/Confirm/Back do anything at all.
 LIST_BINDINGS_MAP = [
     (BTN_UP, ROUTING_LIST_MOVE_UP, "Up"),
     (BTN_DOWN, ROUTING_LIST_MOVE_DOWN, "Down"),
@@ -1212,10 +1217,15 @@ async def run_tests(args, console: Console, results: Results) -> None:
                 # the app moves on to the newest id, so anything still
                 # addressed to the old one is unroutable, not just redundant.
                 await asyncio.sleep(0.3)  # CSTATE settles on the next main-loop tick
+                # One live read, reused for both the comparison and the message --
+                # console.state() is a real serial round trip, so two separate
+                # calls here can straddle a transient and the message would then
+                # report a value the condition never actually saw.
+                state_after_duphello = console.state()
                 results.check(
                     "a second HELLO from the same peer does not grow the session table",
-                    console.state().get("sessions") == "1",
-                    f"sessions={console.state().get('sessions')} (first sessionId "
+                    state_after_duphello.get("sessions") == "1",
+                    f"sessions={state_after_duphello.get('sessions')} (first sessionId "
                     f"{first_session_id}, second HELLO_OK gave {reply.session_id})",
                 )
             check_no_errors(console, results, "duphello")
@@ -2114,8 +2124,18 @@ async def run_tests(args, console: Console, results: Results) -> None:
                 # declaration case ran a HELLO on it), but its declaration push
                 # there was deliberately refused, so nothing is stored -- this
                 # is the first declaration that actually lands on it.
+                #
+                # LIST_BINDINGS_DECL, not LIST_DECL: this group's own toggle/
+                # sync assertions below press Confirm (toggle), Down (cursor),
+                # Right (switch list), and Back (leave the screen), and
+                # handleListNav() has no default routing for any of the six
+                # LocalList* buttons -- an unbound button is simply inert (see
+                # LIST_DECL's own comment). LIST_DECL's genuinely-empty map is
+                # exercised on its own by [listback] below, which tests the
+                # different thing an empty map proves (the Back-only fallback
+                # when nothing at all is bound).
                 if await ensure_declared_foreground(
-                    session_c, console, results, LIST_DECL, "list/peer"
+                    session_c, console, results, LIST_BINDINGS_DECL, "list/peer"
                 ):
                     doc_id = 0x72
                     verdict = await session_c.push_list_doc(SAMPLE_LIST_DOC, push_id=doc_id)
@@ -2336,27 +2356,34 @@ async def run_tests(args, console: Console, results: Results) -> None:
                     # Milk is checked=0 in the document, so ticking it deviates.
                     console.press(BTN_CONFIRM)
                     revision, entries = console.await_list_state(1)
-                    results.check(
+                    # Gates the removal check below: "entries == []" is trivially
+                    # true of a diff nothing was ever staged into, so the only way
+                    # the next check can prove a *removal* happened is if the
+                    # entry is first confirmed to exist. Un-gated, a firmware or
+                    # harness bug that drops the first toggle on the floor (as the
+                    # missing LIST_BINDINGS_DECL routing once did here) makes the
+                    # removal check pass for the wrong reason instead of failing.
+                    if results.check(
                         "list-toggle: checking a document-unchecked item stores one deviation",
                         entries == [(1, 1)],
                         f"revision {revision}, entries {entries}",
-                    )
-
-                    # THE REMOVAL ASSERTION. Toggling back is not "store 0" --
-                    # the entry has to disappear, because the file records what
-                    # differs from the document and nothing differs any more.
-                    # Storing a redundant absolute instead would still render
-                    # correctly, which is precisely why only this check can tell
-                    # the two implementations apart: it is the difference
-                    # between a diff that stays bounded over a shopping trip and
-                    # one that grows to a full shadow copy of the document.
-                    console.press(BTN_CONFIRM)
-                    revision, entries = console.await_list_state(0)
-                    results.check(
-                        "list-toggle: toggling back deletes the entry rather than storing checked=0",
-                        entries == [],
-                        f"revision {revision}, entries {entries}",
-                    )
+                    ):
+                        # THE REMOVAL ASSERTION. Toggling back is not "store 0" --
+                        # the entry has to disappear, because the file records
+                        # what differs from the document and nothing differs any
+                        # more. Storing a redundant absolute instead would still
+                        # render correctly, which is precisely why only this check
+                        # can tell the two implementations apart: it is the
+                        # difference between a diff that stays bounded over a
+                        # shopping trip and one that grows to a full shadow copy
+                        # of the document.
+                        console.press(BTN_CONFIRM)
+                        revision, entries = console.await_list_state(0)
+                        results.check(
+                            "list-toggle: toggling back deletes the entry rather than storing checked=0",
+                            entries == [],
+                            f"revision {revision}, entries {entries}",
+                        )
 
                     # Eggs is checked=1 in the document. Un-checking it is just
                     # as much an edit as checking Milk was, and a naive
@@ -3073,10 +3100,13 @@ async def run_tests(args, console: Console, results: Results) -> None:
                             picker_screen == "gallery_picker",
                             f"screen is {picker_screen!r}",
                         )
+                        # One live read, reused for both the comparison and the
+                        # message -- see the equivalent [duphello] fix above.
+                        state_after_offline_boot = console.state()
                         results.check(
                             "offline: CSTATE reports no connected central",
-                            console.state().get("connected") == "0",
-                            str(console.state()),
+                            state_after_offline_boot.get("connected") == "0",
+                            str(state_after_offline_boot),
                         )
 
                         print("  scanning for an advertisement while offline (expect none)...")
