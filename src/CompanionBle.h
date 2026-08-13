@@ -157,9 +157,21 @@ enum class ButtonId : uint8_t {
 //
 // The LocalList* values are meaningful only on Screen::List, and only in the
 // button map of the LIST peer whose document is on screen -- see
-// docs/companion-todo-list-design.md §5. There is no default binding: a LIST
-// peer that declares none of them leaves every button dead on that screen,
-// exactly like every other peer's map for every other screen.
+// docs/companion-todo-list-design.md §5. The LocalGallery* values are
+// meaningful only on Screen::Image, and only in the button map of whichever
+// peer's gallery is on screen -- see docs/companion-multi-app-design.md §7.
+// LocalBack's name is screen-agnostic ("leave the current local browse
+// screen") on purpose, but today only Screen::List actually consults it
+// (handleListNav()'s LocalBack case) -- a browsed Screen::Image gallery's
+// Back is firmware-owned and unconditional instead, deliberately NOT routed
+// through a peer's map: Screen::Image is not shape-exclusive the way
+// Screen::List is (an image-capable peer's map is also its ordinary
+// Text-screen map), so consulting it could only ever subtract the way out
+// of a screen with no other exit but the power button. See
+// CompanionModeActivity::handlePickerInput()'s Screen::Image case. There is
+// no default binding for any of the LocalList*/LocalGallery*/LocalBack
+// values: a peer that declares none of them leaves every button dead on
+// that screen, exactly like every other peer's map for every other screen.
 enum class ButtonRouting : uint8_t {
   None = 0x00,
   Remote = 0x01,
@@ -171,13 +183,15 @@ enum class ButtonRouting : uint8_t {
   LocalListSwitchLeft = 0x07,
   LocalListSwitchRight = 0x08,
   LocalListToggleCheck = 0x09,
-  LocalListBack = 0x0A,
+  LocalBack = 0x0A,
+  LocalGalleryPrev = 0x0B,
+  LocalGalleryNext = 0x0C,
 };
 
 // Upper bound for a wire-valid ButtonRouting byte -- keep in sync with the
-// highest enumerator above. loadUiDeclaration()/loadListButtonRouting() reject
-// anything past this rather than trust an unknown byte verbatim.
-inline constexpr uint8_t kMaxButtonRouting = static_cast<uint8_t>(ButtonRouting::LocalListBack);
+// highest enumerator above. loadUiDeclaration()/loadButtonRoutingForPeer()
+// reject anything past this rather than trust an unknown byte verbatim.
+inline constexpr uint8_t kMaxButtonRouting = static_cast<uint8_t>(ButtonRouting::LocalGalleryNext);
 
 // Button-map entry byte 0 packs the (hardware-limited, 7-value) button id
 // into its low nibble and reserves the high nibble for behaviour flags --

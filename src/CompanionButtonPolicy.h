@@ -65,4 +65,21 @@ ButtonDecision decide(uint8_t flags, companionble::ButtonRouting routing, bool p
 // unrelated button is still taken at face value, absence of Back included.
 bool anyBound(const companionble::ButtonRouting* routings, size_t count);
 
+// Whether `action` (a decide() result's `.action` field) is one of the two
+// gallery-navigation routings -- LocalGalleryPrev/LocalGalleryNext.
+//
+// Unlike Screen::List (handleListNav(), which claims all six of its buttons
+// unconditionally once a LIST peer's exclusive shape makes that safe --
+// docs/companion-todo-list-design.md §5), Screen::Image does NOT claim every
+// press it sees: an unbound Up/Down (decide() resolves to None) or one routed
+// to something else entirely -- most importantly Remote, for an app like
+// Snap2Ink using Up/Down as a camera shutter -- must fall through to
+// handleMappedButton() instead of being silently eaten by gallery navigation.
+// handleGalleryNav() calls this on decide()'s result to decide whether IT is
+// the one that gets to act, rather than inlining the two-way comparison
+// itself, so the "which actions are mine" rule is covered here instead of
+// only by reading CompanionModeActivity.cpp (not host-buildable -- see this
+// header's own doc comment).
+bool isGalleryNavAction(companionble::ButtonRouting action);
+
 }  // namespace companionbuttons

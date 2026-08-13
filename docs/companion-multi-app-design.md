@@ -96,14 +96,22 @@ leaving one scratch file that the next push would silently overwrite. `Companion
 that gallery with `Button::Up`/`Down` — the side buttons, not `Left`/`Right`: on real hardware those
 are the bottom front buttons, and every button map seen so far routes them to local text paging, so
 `Up`/`Down` are the pair actually free for this (see `MappedInputManager.h`) — while `Screen::Image`
-is showing, and only on whichever of those two buttons the foreground peer's own button map has left unclaimed
-(routing `None` or `LocalPagePrev`/`LocalPageNext`, which is already a no-op outside `Screen::Text`);
-a peer that declared its own use for Up/Down (e.g. `Remote`, for something like camera control) is
-never overridden. This is deliberately **firmware-local**: no protocol opcode, no capability bit, nothing
-reported to the phone, exactly like the existing `currentPage`/`totalPages` text pagination that
-`LocalPagePrev`/`LocalPageNext` already drive with no BLE notification. Six images per peer costs
-~612 KB of SD space at the measured panel's ~102 KB/image (trivial against a multi-GB card) and no
-RAM: only one image is ever decoded into the framebuffer at a time, same as before this feature.
+is showing. Which physical button pages the gallery is, like every other screen's routing, the
+peer's own declared choice: `LOCAL_GALLERY_PREV`/`LOCAL_GALLERY_NEXT` (§7 below), consulted through
+the browsed peer's own map (`buttons`, loaded by `CompanionModeActivity::loadButtonRoutingForPeer()`
+for a picker-browsed peer, or `loadUiDeclaration()` for the live foreground case). There is no
+default: a peer that binds neither leaves the gallery unpageable by button. Unlike `Screen::List`,
+`Screen::Image` does **not** claim every press it sees — an unbound Up/Down, or one routed to
+anything else (most importantly `REMOTE`, for an app like Snap2Ink using Up/Down as a camera
+shutter), falls through to the peer's ordinary button-map dispatch instead of being eaten by gallery
+navigation; see `companionbuttons::isGalleryNavAction()` (`CompanionButtonPolicy.h`, host-tested) for
+the exact rule and `docs/companion-todo-list-design.md` §5 for why `Screen::List` gets to claim
+unconditionally and `Screen::Image` does not. This is deliberately **firmware-local**: no protocol
+opcode, no capability bit, nothing reported to the phone, exactly like the existing
+`currentPage`/`totalPages` text pagination that `LocalPagePrev`/`LocalPageNext` already drive with no
+BLE notification. Six images per peer costs ~612 KB of SD space at the measured panel's ~102
+KB/image (trivial against a multi-GB card) and no RAM: only one image is ever decoded into the
+framebuffer at a time, same as before this feature.
 
 ## 5. Pairing / enrollment
 
@@ -213,7 +221,7 @@ the id nibble are **behaviour flags** on the routing, not on the id.
 #### Button behaviour flags
 
 `ALSO_NOTIFY` and `LOCAL_ONLY_OFFLINE` modify a **local** routing
-(`LOCAL_PAGE_PREV` … `LOCAL_LIST_BACK`); both are inert on `NONE` and `REMOTE`
+(`LOCAL_PAGE_PREV` … `LOCAL_GALLERY_NEXT`); both are inert on `NONE` and `REMOTE`
 — there is no local action there for them to modify, and `REMOTE` already
 notifies exactly when a peer is connected. For a local routing `X`:
 
@@ -246,7 +254,11 @@ itself, and it stays closed on purpose:
 0x07  LOCAL_LIST_SWITCH_LEFT  Screen::List only — switch to the previous list in the document
 0x08  LOCAL_LIST_SWITCH_RIGHT Screen::List only — switch to the next list in the document
 0x09  LOCAL_LIST_TOGGLE_CHECK Screen::List only — toggle checked on the item under the cursor
-0x0A  LOCAL_LIST_BACK         Screen::List only — leave the screen, back to wherever it was entered from
+0x0A  LOCAL_BACK              Screen::List only — leave the screen, back to wherever it was entered
+                               from. NOT consulted on a browsed Screen::Image gallery: that Back is
+                               firmware-owned and unconditional (see notes below) and needs no binding
+0x0B  LOCAL_GALLERY_PREV      Screen::Image only — show the previous image in the gallery
+0x0C  LOCAL_GALLERY_NEXT      Screen::Image only — show the next image in the gallery
 ```
 
 Notes:
@@ -265,6 +277,33 @@ Notes:
   `docs/companion-declared-shape-design.md`) means its map is never consulted for anything but its
   own list — a peer can freely reuse `LOCAL_LIST_*` values without any collision risk against
   Text/Image peers' routing.
+- The `LOCAL_GALLERY_*` values are meaningful only on `Screen::Image`, and only in the map of
+  whichever peer's gallery is on screen (the live foreground peer's own gallery, or a peer browsed
+  through the offline picker — either way, `buttons`, see the note on `handleGalleryNav()` below).
+  Also no default binding: a peer that declares neither leaves Up/Down unpageable by button.
+  `Screen::Image` is **not** as exclusive as `Screen::List` — an image-capable peer's map is also its
+  ordinary Text-screen map — so, unlike `Screen::List`, `handleGalleryNav()` does not claim every
+  press it sees: an unbound Up/Down (routing `NONE`), or one the peer routed to anything else (most
+  importantly `REMOTE`, e.g. an app like Snap2Ink using Up/Down as a camera shutter), falls through
+  to the peer's ordinary button-map dispatch instead. `companionbuttons::isGalleryNavAction()`
+  (`CompanionButtonPolicy.h`, host-tested) is the exact "is this press mine" rule this hinges on.
+- `LOCAL_BACK`'s name is screen-agnostic on purpose ("leave the current local browse screen"), but
+  today only `Screen::List` actually consults it (`handleListNav()`'s `LocalBack` case, including the
+  firmware-owned empty-map escape for a peer that declared no bindings at all — §5 of
+  `docs/companion-todo-list-design.md`, `1a550ea3`). A browsed `Screen::Image` gallery's Back is
+  **firmware-owned and unconditional instead**, deliberately not routed through `buttons` at all —
+  `CompanionModeActivity::handlePickerInput()`'s `Screen::Image` case reverts straight to
+  `Screen::GalleryPicker` on every Back press, the same behaviour this screen had before any of
+  `LOCAL_GALLERY_*`/`LOCAL_BACK` existed. The reasoning is the same asymmetry as the Up/Down
+  claim-vs-fall-through split above: `buttonsAnyBound` answers "did this peer declare a scheme at
+  all", not "did this peer give me a way out of THIS screen", and those differ precisely because
+  `Screen::Image` is not shape-exclusive the way `Screen::List` is. Consulting the map here could only
+  ever *subtract* the way out — `LOCAL_PAGE_*`/`LOCAL_LIST_*` are documented no-ops off their own
+  screens, `REMOTE` collapses to `decide()`'s `None` while disconnected (and a browsed gallery is
+  always disconnected — `galleryPickerBrowsing` implies no live foreground peer), and this branch
+  never dispatched `LOCAL_SLEEP` even when bound to Back. A peer that binds Back to `LOCAL_SLEEP`
+  leaves the gallery here rather than sleeping — true before declared gallery bindings existed at
+  all, and strictly better than trapping the user with no way out but the power button.
 - **App updates are the reason this is versioned rather than push-once.** A new app build that adds
   a feature ships a new button map with a new tag; the device picks it up on the next connect
   without re-pairing, and without the app having to track whether it already pushed.

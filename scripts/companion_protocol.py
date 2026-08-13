@@ -238,8 +238,10 @@ BUTTON_NAMES = {0: "BACK", 1: "CONFIRM", 2: "LEFT", 3: "RIGHT", 4: "UP", 5: "DOW
     ROUTING_LIST_SWITCH_LEFT,
     ROUTING_LIST_SWITCH_RIGHT,
     ROUTING_LIST_TOGGLE_CHECK,
-    ROUTING_LIST_BACK,
-) = range(11)
+    ROUTING_BACK,  # screen-agnostic: Screen::List or a browsed Screen::Image
+    ROUTING_GALLERY_PREV,
+    ROUTING_GALLERY_NEXT,
+) = range(13)
 
 # Button-map entry byte 0 behaviour flags -- OR'd into the `button` id passed
 # to encode_ui_declaration() (see its docstring), exactly mirroring the wire:

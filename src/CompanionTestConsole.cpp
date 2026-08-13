@@ -80,8 +80,12 @@ const char* routingName(companionble::ButtonRouting routing) {
       return "list_switch_right";
     case companionble::ButtonRouting::LocalListToggleCheck:
       return "list_toggle_check";
-    case companionble::ButtonRouting::LocalListBack:
-      return "list_back";
+    case companionble::ButtonRouting::LocalBack:
+      return "back";
+    case companionble::ButtonRouting::LocalGalleryPrev:
+      return "gallery_prev";
+    case companionble::ButtonRouting::LocalGalleryNext:
+      return "gallery_next";
   }
   return "?";
 }

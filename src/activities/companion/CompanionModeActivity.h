@@ -94,8 +94,9 @@ class CompanionModeActivity final : public Activity {
   // owner did not declare.
   //
   // One array for both the foreground app (loaded by loadUiDeclaration() on
-  // every foreground handover) and a browsed peer's Screen::List map (loaded
-  // by loadListButtonRouting() from enterListDocument()) -- there used to be
+  // every foreground handover) and a browsed peer's Screen::List/Screen::Image
+  // map (loaded by loadButtonRoutingForPeer() from enterListDocument() or a
+  // gallery-picker entry point) -- there used to be
   // two (`buttons` and `listButtons`), from when a live foreground peer
   // could coexist with a grid-entered ToDo list browsed from a DIFFERENT
   // peer. As of the offline-browse-mode feature (2026-08-12), that is no
@@ -106,13 +107,13 @@ class CompanionModeActivity final : public Activity {
   // was pure duplication risk with no live use case left.
   //
   // Collapsing to one array means whoever last loaded it (loadUiDeclaration()
-  // or loadListButtonRouting()) owns it until the NEXT load -- see that
+  // or loadButtonRoutingForPeer()) owns it until the NEXT load -- see that
   // invariant's existing statement in loop()'s comment above the foreground
   // button-map dispatch. The one new obligation this creates: a browsed
   // peer's map must not silently outlive the browse and be misattributed to
   // whatever the picker shows next (e.g. handleGalleryNav()'s routingFor()
   // check, which must read None for an offline picker browse with no live
-  // foreground governing it). See handleListNav()'s LocalListBack case and
+  // foreground governing it). See handleListNav()'s LocalBack case and
   // onEnter()'s offline-resume restore-failed fallback, the two places this
   // is cleared on the way out of a browsed Screen::List.
   struct ButtonSpec {
@@ -129,7 +130,7 @@ class CompanionModeActivity final : public Activity {
   // Whether `buttons` above currently has ANY entry bound to something other
   // than ButtonRouting::None -- recomputed via companionbuttons::anyBound()
   // (CompanionButtonPolicy.h, host-tested) every time `buttons` is loaded
-  // (loadUiDeclaration(), loadListButtonRouting()) or cleared
+  // (loadUiDeclaration(), loadButtonRoutingForPeer()) or cleared
   // (clearUiDeclaration()). Whole-map, not just the six List buttons: a peer
   // that bound exactly one unrelated button must not get the fallback below.
   //
@@ -139,7 +140,11 @@ class CompanionModeActivity final : public Activity {
   // offline browse) no BLE for a phone to push a corrected map. Firmware may
   // supply its own Back-leaves-the-screen fallback ONLY when this is false --
   // i.e. the peer declared no bindings at all. A peer that bound anything,
-  // Back included or not, is taken at face value.
+  // Back included or not, is taken at face value. NOT consulted by a browsed
+  // gallery's Back (handlePickerInput()'s Screen::Image case): that leave is
+  // firmware-owned and unconditional, deliberately not routed through this --
+  // see that case's own comment for why Screen::Image's lack of List's
+  // shape-exclusivity makes the map-consulted model wrong there specifically.
   bool buttonsAnyBound = false;
 
   bool connected = false;
@@ -375,25 +380,31 @@ class CompanionModeActivity final : public Activity {
   // Parses the button-map section of a UI declaration body (offset already
   // past the 2-byte header) into `out`, advancing `offset` past it so a
   // caller that also wants the trailing tag section can continue from there.
-  // Shared by loadUiDeclaration() (foreground peer) and loadListButtonRouting()
-  // (a browsed LIST peer), since the wire layout and validation are
-  // identical -- only which peer differs; both write into `buttons`.
+  // Shared by loadUiDeclaration() (foreground peer) and
+  // loadButtonRoutingForPeer() (a browsed LIST or gallery peer), since the
+  // wire layout and validation are identical -- only which peer differs;
+  // both write into `buttons`.
   void parseButtonEntries(const uint8_t* raw, size_t len, size_t& offset, uint8_t buttonEntries,
                           ButtonSpec (&out)[kButtonCount]);
   // Recomputes buttonsAnyBound (see its doc comment) from the current
   // `buttons` contents via companionbuttons::anyBound(). Called after every
-  // load (loadUiDeclaration(), loadListButtonRouting()); clearUiDeclaration()
+  // load (loadUiDeclaration(), loadButtonRoutingForPeer()); clearUiDeclaration()
   // sets it directly instead, since a just-cleared map is trivially unbound.
   void recomputeButtonsAnyBound();
   // Reads `peerKey`'s persisted UI declaration and fills `buttons` with its
-  // button map -- no default, so a peer that declares none of the LocalList*
-  // routings leaves Screen::List's buttons dead. Called by enterListDocument()
-  // for whichever peer's document is being opened, live or via the offline
-  // picker. Callers that leave Screen::List for the offline picker (rather
-  // than back to a live foreground peer's Screen::Text) must clear `buttons`
-  // afterward so this browsed peer's map cannot outlive the browse -- see
-  // `buttons`' doc comment.
-  void loadListButtonRouting(const std::string& peerKey);
+  // button map -- no default, so a peer that declares none of the LocalList*/
+  // LocalGallery*/LocalBack routings leaves that screen's buttons dead.
+  // Called by enterListDocument() for whichever peer's document is being
+  // opened (Screen::List), and by selectGalleryPickerPeer()/onEnter()'s
+  // offline-resume branch for whichever peer's gallery is being opened
+  // (Screen::Image) -- live or via the offline picker either way. Not
+  // list-specific despite the name it replaces (loadListButtonRouting()):
+  // Screen::List and a browsed Screen::Image gallery share this exact
+  // load/no-default/clear-on-the-way-out model. Callers that leave the screen
+  // for the offline picker (rather than back to a live foreground peer's
+  // Screen::Text) must clear `buttons` afterward so this browsed peer's map
+  // cannot outlive the browse -- see `buttons`' doc comment.
+  void loadButtonRoutingForPeer(const std::string& peerKey);
   void applyTagState(const uint8_t* data, size_t len);
   void setTagState(uint8_t tagId, uint8_t state);
   void measureTagRow();
@@ -407,6 +418,16 @@ class CompanionModeActivity final : public Activity {
                           size_t contentIdLen, uint8_t pushId);
   void refreshGalleryForForeground();
   void loadGalleryForPeer(const std::string& peerKey);
+  // Up/Down on Screen::Image, dispatched through the browsed peer's own
+  // button map (routingFor()/decide()), same declared-not-fixed model as
+  // handleListNav() -- but, UNLIKE handleListNav(), does NOT claim every
+  // press it sees: only a press decide() resolves to LocalGalleryPrev/
+  // LocalGalleryNext (companionbuttons::isGalleryNavAction(), host-tested)
+  // is claimed. An unbound button, or one routed to something else entirely
+  // (e.g. Remote, for an app like Snap2Ink using Up/Down as a camera
+  // shutter), returns false so loop()'s handleMappedButton() dispatch still
+  // gets it. See this function's .cpp comment for why List gets to claim
+  // unconditionally and this does not.
   bool handleGalleryNav();
   void showGalleryImage(size_t index);
   void showTransientMessage(const std::string& text, Screen returnTo, unsigned long durationMs = 3000);
@@ -488,7 +509,7 @@ class CompanionModeActivity final : public Activity {
   // function too: the row-window walk depends on the on-device renderer's
   // string/text handling and isn't cheaply host-testable.
   void reloadListView(bool recountTotals = true);
-  // Leaves Screen::List for listReturnScreen -- the LocalListBack action, and
+  // Leaves Screen::List for listReturnScreen -- the LocalBack action, and
   // the firmware-owned Back fallback for a peer that bound nothing at all
   // (see buttonsAnyBound's doc comment). Frees listDocBuf/listDiff, and, only
   // when returning to Screen::GalleryPicker (the offline-picker case -- a

@@ -27,7 +27,9 @@ ButtonDecision decide(uint8_t flags, companionble::ButtonRouting routing, bool p
     case ButtonRouting::LocalListSwitchLeft:
     case ButtonRouting::LocalListSwitchRight:
     case ButtonRouting::LocalListToggleCheck:
-    case ButtonRouting::LocalListBack: {
+    case ButtonRouting::LocalBack:
+    case ButtonRouting::LocalGalleryPrev:
+    case ButtonRouting::LocalGalleryNext: {
       const bool alsoNotify = flags & companionble::kButtonFlagAlsoNotify;
       const bool offlineOnly = flags & companionble::kButtonFlagLocalOnlyOffline;
       const bool localRuns = !(offlineOnly && peerConnected);
@@ -48,6 +50,11 @@ bool anyBound(const companionble::ButtonRouting* routings, size_t count) {
     if (routings[i] != companionble::ButtonRouting::None) return true;
   }
   return false;
+}
+
+bool isGalleryNavAction(companionble::ButtonRouting action) {
+  return action == companionble::ButtonRouting::LocalGalleryPrev ||
+         action == companionble::ButtonRouting::LocalGalleryNext;
 }
 
 }  // namespace companionbuttons

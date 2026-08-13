@@ -411,7 +411,7 @@ void CompanionModeActivity::onEnter() {
         freeListDocBuf();
         listPeerKey.clear();
         // enterListDocument() already loaded savedPos.peerKey's map into
-        // `buttons` (via loadListButtonRouting()) before the document read
+        // `buttons` (via loadButtonRoutingForPeer()) before the document read
         // failed -- clear it now that this is falling back to the picker
         // rather than staying on Screen::List, same as leaveListScreen()
         // does for the equivalent live edge (an offline picker return must
@@ -423,6 +423,12 @@ void CompanionModeActivity::onEnter() {
     } else if (peerStillEligible && savedPos.screen == CrossPointState::OfflineBrowseScreen::Image) {
       loadGalleryForPeer(savedPos.peerKey);
       if (!galleryImages.empty()) {
+        // Same fix as selectGalleryPickerPeer()'s image branch: `buttons` was
+        // reset to all-None by clearUiDeclaration() earlier in onEnter(), so
+        // without this, savedPos.peerKey's declared LocalGalleryPrev/Next/
+        // LocalBack routing would be silently dead for the whole resumed
+        // session -- see loadButtonRoutingForPeer()'s doc comment.
+        loadButtonRoutingForPeer(savedPos.peerKey);
         browsingPeerKey = savedPos.peerKey;
         galleryPickerBrowsing = true;
         // loadGalleryForPeer() already points at the most recent image;
@@ -560,7 +566,7 @@ void CompanionModeActivity::clearUiDeclaration() {
 // already past the 2-byte header and is left just past the last button entry,
 // so a caller that also wants the trailing tag section (loadUiDeclaration())
 // can continue from there. `out` is not cleared first; callers do that (see
-// clearUiDeclaration() and loadListButtonRouting()) so this stays a pure
+// clearUiDeclaration() and loadButtonRoutingForPeer()) so this stays a pure
 // parse.
 void CompanionModeActivity::parseButtonEntries(const uint8_t* raw, size_t len, size_t& offset, uint8_t buttonEntries,
                                                ButtonSpec (&out)[kButtonCount]) {
@@ -590,17 +596,20 @@ void CompanionModeActivity::parseButtonEntries(const uint8_t* raw, size_t len, s
 }
 
 // Reads `peerKey`'s persisted UI declaration and fills `buttons` with its
-// button map, for Screen::List. No default: a peer that never declared a
-// LocalList* routing for a button leaves it in `None`, same as
+// button map, for Screen::List or a browsed Screen::Image gallery -- not
+// list-specific despite the name this replaced (loadListButtonRouting()); the
+// two screens share the exact same declared-map/no-default/clear-on-the-way-
+// out model. No default: a peer that never declared a LocalList*/
+// LocalGallery*/LocalBack routing for a button leaves it in `None`, same as
 // clearUiDeclaration() leaves every other peer's map before a declaration is
-// read. Deliberately ignores the tag section -- Screen::List has no tag row.
+// read. Deliberately ignores the tag section -- neither screen has a tag row.
 //
-// Does NOT itself clear `buttons` on the way OUT (a caller leaving
-// Screen::List for the offline picker must do that once it knows where it's
-// going -- see `buttons`' doc comment and leaveListScreen()); it only resets
-// the map fresh on the way IN, same as loadUiDeclaration() does before it
+// Does NOT itself clear `buttons` on the way OUT (a caller leaving the
+// screen for the offline picker must do that once it knows where it's going
+// -- see `buttons`' doc comment and leaveListScreen()); it only resets the
+// map fresh on the way IN, same as loadUiDeclaration() does before it
 // parses.
-void CompanionModeActivity::loadListButtonRouting(const std::string& peerKey) {
+void CompanionModeActivity::loadButtonRoutingForPeer(const std::string& peerKey) {
   for (auto& spec : buttons) {
     spec.routing = companionble::ButtonRouting::None;
     spec.flags = 0;
@@ -1206,41 +1215,84 @@ void CompanionModeActivity::showGalleryImage(size_t index) {
   requestUpdate();
 }
 
-// Button::Up/Down gallery prev/next, active only in Screen::Image and only
-// for a button the foreground peer's own map hasn't claimed for something
-// that actually applies on this screen. Remote and LocalSleep always defer to
-// the app — those are meaningful regardless of what's on screen.
+// Button::Up/Down gallery prev/next, active only in Screen::Image, dispatched
+// through whichever peer's gallery is on screen -- `buttons`, loaded by
+// loadButtonRoutingForPeer() (a live foreground peer's own gallery, or a
+// browsed peer reached through the offline picker; see that function's doc
+// comment) or by loadUiDeclaration() for the ordinary live foreground case.
+// Same declared-not-fixed model as handleListNav(), through the same
+// companionbuttons::decide() (flags/connection state included) -- but UNLIKE
+// handleListNav(), Screen::Image does NOT claim every button it sees.
+//
+// A LIST peer's declared shape makes it safe for Screen::List to claim all
+// six of its buttons unconditionally (docs/companion-todo-list-design.md §5):
+// a LIST peer's map is known to be exclusively for its own list before the
+// screen is ever reached. Screen::Image has no equivalent guarantee -- an
+// image-capable peer's map is also its ordinary Text-screen map, so Up/Down
+// left unbound (None) or routed to something else entirely (most importantly
+// Remote, for an app like Snap2Ink using Up/Down as a camera shutter) must
+// fall through to handleMappedButton() instead of being silently eaten here.
+// companionbuttons::isGalleryNavAction() (CompanionButtonPolicy.h,
+// host-tested) is the one-line rule this hinges on: only a press that
+// resolves to LocalGalleryPrev/LocalGalleryNext is ours.
 //
 // This deliberately does NOT use Left/Right: on real hardware those are the
 // bottom front buttons, and every app map seen so far (including scripts/
-// push_companion_content.py's default) routes them to LOCAL_PAGE_PREV/NEXT for
-// paging buffered text — i.e. what users call "the page-turn buttons".
+// push_companion_content.py's default) routes them to LOCAL_PAGE_PREV/NEXT
+// for paging buffered text — i.e. what users call "the page-turn buttons".
 // Up/Down are the side buttons, physically the pair toward the top of the
-// device, and are otherwise unclaimed by a typical text/image app's button
-// map, which is exactly why they're free for this. (An app that legitimately
-// wants Up/Down for its own purpose, e.g. a camera-control app, still keeps
-// them — the None-only guard below never overrides a declared routing.)
-// LocalPagePrev/LocalPageNext are still accepted here too: handleMappedButton()
-// already scopes them to Screen::Text and no-ops elsewhere, so claiming them
-// on Image costs nothing if some future app reuses those routings on Up/Down.
+// device.
 namespace {
-bool isGalleryClaimable(companionble::ButtonRouting routing) {
-  return routing == companionble::ButtonRouting::None || routing == companionble::ButtonRouting::LocalPagePrev ||
-         routing == companionble::ButtonRouting::LocalPageNext;
-}
+struct GalleryNavButton {
+  MappedInputManager::Button role;
+  companionble::ButtonId id;
+};
+constexpr GalleryNavButton kGalleryNavButtons[] = {
+    {MappedInputManager::Button::Up, companionble::ButtonId::Up},
+    {MappedInputManager::Button::Down, companionble::ButtonId::Down},
+};
 }  // namespace
 
 bool CompanionModeActivity::handleGalleryNav() {
   if (screen != Screen::Image || galleryImages.size() < 2) return false;
 
-  if (isGalleryClaimable(routingFor(companionble::ButtonId::Up)) &&
-      buttonWasPressed(MappedInputManager::Button::Up, companionble::ButtonId::Up)) {
-    showGalleryImage(galleryIndex == 0 ? galleryImages.size() - 1 : galleryIndex - 1);
-    return true;
-  }
-  if (isGalleryClaimable(routingFor(companionble::ButtonId::Down)) &&
-      buttonWasPressed(MappedInputManager::Button::Down, companionble::ButtonId::Down)) {
-    showGalleryImage(galleryIndex + 1 >= galleryImages.size() ? 0 : galleryIndex + 1);
+  // !foregroundPeerKey.empty(), not the `connected` member -- see
+  // CompanionButtonPolicy.h's doc comment on why decide() takes this exact
+  // test as its peerConnected argument.
+  const bool peerConnected = !foregroundPeerKey.empty();
+
+  for (const auto& nav : kGalleryNavButtons) {
+    // Routing decided BEFORE buttonWasPressed() is even called, deliberately
+    // -- buttonWasPressed() is not side-effect-free on both builds it runs
+    // on. Real hardware: a const query over InputManager's once-per-loop
+    // edge state (non-consuming, may be asked twice). Under
+    // COMPANION_TEST_CONSOLE: companiontest::wasPressed() (CompanionTest
+    // Console.cpp:151-161) sets pressDelivered and returns false on every
+    // later call for the same injected press -- CONSUMING. If this loop
+    // called buttonWasPressed() first the way the old isGalleryClaimable()
+    // callers did NOT (it tested the routing first for exactly this
+    // reason), an Up/Down this peer routed to Remote would already have
+    // been consumed by the time isGalleryNavAction() said "not mine",
+    // making handleMappedButton() never see it -- reintroducing trap #1
+    // under the test console specifically, even though real hardware would
+    // look fine (non-consuming query tolerates being asked twice). Resolve
+    // first, consume only once known to be ours.
+    const auto decision = companionbuttons::decide(flagsFor(nav.id), routingFor(nav.id), peerConnected);
+    if (!companionbuttons::isGalleryNavAction(decision.action)) continue;  // not ours -- try the other button
+    if (!buttonWasPressed(nav.role, nav.id)) continue;
+
+    // ALSO_NOTIFY means a local action's press is *also* relayed to the app,
+    // on top of the local move below -- see decide()'s doc comment. Safe to
+    // fire only now that buttonWasPressed() has actually confirmed a press
+    // -- decide() alone says nothing about whether this button was pressed
+    // this loop.
+    if (decision.notify) notifyHeldButton(nav.id);
+
+    if (decision.action == companionble::ButtonRouting::LocalGalleryPrev) {
+      showGalleryImage(galleryIndex == 0 ? galleryImages.size() - 1 : galleryIndex - 1);
+    } else {
+      showGalleryImage(galleryIndex + 1 >= galleryImages.size() ? 0 : galleryIndex + 1);
+    }
     return true;
   }
   return false;
@@ -1266,7 +1318,7 @@ bool CompanionModeActivity::enterListDocument(const std::string& peerKey, Screen
   // reload pass below so setListCount()/setCurrentList() (inside
   // reloadListView()) clamp it against whatever the document actually has.
   if (restore) listNav.restorePosition(restore->listIndex, restore->cursor, restore->windowStart);
-  loadListButtonRouting(peerKey);
+  loadButtonRoutingForPeer(peerKey);
   loadListDocBuf();
   reloadListView();
   screen = Screen::List;
@@ -1485,7 +1537,7 @@ bool CompanionModeActivity::handleListNav() {
     if (decision.notify) notifyHeldButton(nav.id);
 
     switch (decision.action) {
-      case companionble::ButtonRouting::LocalListBack: {
+      case companionble::ButtonRouting::LocalBack: {
         RenderLock lock;
         leaveListScreen();
         return true;
@@ -1741,6 +1793,15 @@ void CompanionModeActivity::selectGalleryPickerPeer() {
     showTransientMessage(tr(STR_COMPANION_GALLERY_EMPTY), Screen::GalleryPicker);
     return;
   }
+  // Fills `buttons` with this peer's declared map -- `buttons` is cleared to
+  // all-None in offline mode (clearUiDeclaration(), no live foreground peer
+  // to have loaded it), so without this call handleGalleryNav()'s
+  // routingFor(Up)/routingFor(Down) and the Back handling below would always
+  // read None for a peer entered straight from the picker, leaving its
+  // declared LocalGalleryPrev/Next/LocalBack routing permanently dead. See
+  // loadButtonRoutingForPeer()'s doc comment; mirrors the LIST branch above,
+  // which gets this for free through enterListDocument().
+  loadButtonRoutingForPeer(peerKey);
 
   RenderLock lock;
   browsingPeerKey = peerKey;
@@ -1752,9 +1813,13 @@ void CompanionModeActivity::selectGalleryPickerPeer() {
 
 // Input for the picker itself and for leaving a gallery reached through it.
 // Tried before the foreground-button dispatch in loop(), same as
-// handleGalleryNav() — these are firmware-owned screens/modes with no
-// foreground peer's button map to defer to (most peers in the picker have no
-// live session at all).
+// handleGalleryNav(). IconGrid/GalleryPicker navigation (Up/Down/Confirm) is
+// firmware-owned with no button map involved at all -- those are picker
+// chrome, not a peer's own screen. The one exception is the browsed gallery's
+// Back below, which -- like Up/Down inside it (handleGalleryNav()) -- now
+// consults `buttons`, the browsed peer's own declared map (most peers in the
+// picker have no live session at all, hence loadButtonRoutingForPeer()
+// rather than a live foreground load).
 bool CompanionModeActivity::handlePickerInput() {
   if (screen == Screen::IconGrid) {
     if (buttonWasPressed(MappedInputManager::Button::Confirm, companionble::ButtonId::Confirm)) {
@@ -1810,6 +1875,25 @@ bool CompanionModeActivity::handlePickerInput() {
 
   if (screen == Screen::Image && galleryPickerBrowsing) {
     if (buttonWasPressed(MappedInputManager::Button::Back, companionble::ButtonId::Back)) {
+      // Firmware-owned, unconditional -- deliberately NOT routed through
+      // `buttons`/decide(), unlike handleListNav()'s LocalBack case.
+      // buttonsAnyBound answers "did this peer declare a scheme at all", not
+      // "did this peer give me a way out of THIS screen", and those differ
+      // precisely because Screen::Image is not shape-exclusive the way
+      // Screen::List is -- the same asymmetry that makes handleGalleryNav()
+      // above refuse to claim-all. galleryPickerBrowsing implies no live
+      // peer here (foregroundPeerKey is always empty by the time this runs
+      // -- see the disconnect-fallback branch in loop() and the
+      // offline-browse-only entry points below), so consulting the map
+      // could only ever subtract the way out: LocalPagePrev/Next and
+      // LocalList* are documented no-ops off their own screens, Remote
+      // collapses to decide()'s None when disconnected (its notify is
+      // always false offline, so it was never reachable here either), and
+      // this branch never dispatched LocalSleep even when bound. A peer
+      // that binds Back to LocalSleep leaves the gallery here rather than
+      // sleeping -- true before this screen had declared bindings at all,
+      // and strictly better than trapping the user with no way out but the
+      // power button.
       RenderLock lock;
       screen = Screen::GalleryPicker;
       galleryPickerBrowsing = false;
@@ -2446,8 +2530,17 @@ bool CompanionModeActivity::handleMappedButton(MappedInputManager::Button role, 
     case companionble::ButtonRouting::LocalListSwitchLeft:
     case companionble::ButtonRouting::LocalListSwitchRight:
     case companionble::ButtonRouting::LocalListToggleCheck:
-    case companionble::ButtonRouting::LocalListBack:
-      // Handled only by handleListNav() -- see that member's doc comment.
+    case companionble::ButtonRouting::LocalBack:
+      // Handled only by handleListNav() -- see that member's doc comment. A
+      // browsed gallery's Back (handlePickerInput()'s Screen::Image case) is
+      // firmware-owned and unconditional, not routed through `buttons` at
+      // all, so LocalBack bound to that screen's Back button is never even
+      // looked at there.
+      return false;
+
+    case companionble::ButtonRouting::LocalGalleryPrev:
+    case companionble::ButtonRouting::LocalGalleryNext:
+      // Handled only by handleGalleryNav() -- see that member's doc comment.
       return false;
   }
   return false;

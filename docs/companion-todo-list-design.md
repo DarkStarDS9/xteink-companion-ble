@@ -296,15 +296,18 @@ the 23-byte layout unchanged.
 
 - `Screen::List` added to `src/activities/companion/CompanionModeActivity.h:26-35`.
 - Navigation, entirely local, no protocol surface — same "screen-local, no BLE notification" class as
-  the existing gallery Up/Down paging (`src/activities/companion/CompanionModeActivity.cpp:792`
-  onward) and local text pagination. Which physical button performs which of these is the browsed
-  peer's own choice, declared via `LOCAL_LIST_*` `ButtonRouting` values (§7 of the multi-app design)
-  in its own button map — there is no fixed or default physical binding, so a `LIST` peer that
-  declares none of them leaves every button dead on this screen. The available actions:
+  the gallery's Up/Down paging (`src/activities/companion/CompanionModeActivity.cpp`,
+  `handleGalleryNav()`) and local text pagination. Which physical button performs which of these is
+  the browsed peer's own choice, declared via `LOCAL_LIST_*`/`LOCAL_BACK` `ButtonRouting` values (§7
+  of the multi-app design) in its own button map — there is no fixed or default physical binding, so
+  a `LIST` peer that declares none of them leaves every button dead on this screen. The available
+  actions:
   - Move cursor up / down: move the item cursor, paging the visible window when it runs off-screen.
   - Switch list left / right: switch between lists within the document.
   - Toggle check: toggle checked on the item under cursor.
-  - Back: leave `Screen::List`, back to wherever it was entered from.
+  - Back (`LOCAL_BACK`): leave `Screen::List`, back to wherever it was entered from. `LOCAL_BACK`'s
+    name is screen-agnostic on purpose, but `Screen::List` is the only screen that actually consults
+    it today — a browsed gallery's Back is firmware-owned instead (see below).
 - A toggle writes through to `list_state.bin` immediately (small, infrequent writes — nothing like
   the per-CHUNK write rate of an image push), via the same temp-file-then-rename discipline
   `lists.bin` uses, so a mid-write failure cannot clobber previously-good edits. It records a
@@ -324,25 +327,50 @@ the 23-byte layout unchanged.
 - What `Screen::List` draws is the document's `checked` **overridden by the diff**; the two agree by
   construction immediately after a push, since storing a document clears the diff.
 - A button's meaning here **is** declared by the peer's `ButtonRouting` map, the same as every other
-  screen — six `LOCAL_LIST_*` enum values (§7 of the multi-app design) cover move-cursor-up/down,
-  switch-list-left/right, toggle-check, and back. Unlike the gallery's Up/Down or text pagination,
-  which are implicit in their screens, a user found the previous hardcoded physical bindings
-  backwards on their reader and asked for them to be configurable per app, the same way every other
-  screen's routing already is.
-- **What makes that safe is the declared shape**, not the screen state. The gallery gets away with
-  claiming Up/Down only because it takes them when the peer's own map left them unclaimed
-  (`docs/companion-multi-app-design.md:96-106`); List instead claims all six of its buttons
-  unconditionally once pressed (`handleListNav()`), consulting the browsed peer's own map to decide
-  what — if anything — each one does. Because a `LIST` peer declared itself as one before it ever
-  reached the screen, its button map is known to be exclusively for its own list, so it is free to
-  use `LOCAL_LIST_*` values without any collision risk against a Text/Image peer's routing.
+  screen — six `LOCAL_LIST_*`/`LOCAL_BACK` enum values (§7 of the multi-app design) cover
+  move-cursor-up/down, switch-list-left/right, toggle-check, and back. Unlike text pagination, which
+  is implicit in its screen, a user found the previous hardcoded physical bindings backwards on
+  their reader and asked for them to be configurable per app, the same way every other screen's
+  routing already is. The gallery's own Up/Down/Back navigation was made declared the same way
+  shortly after (§7 of the multi-app design) for the same reason.
+- **What makes claiming every button safe here is the declared shape**, not the screen state. A
+  `LIST` peer declared itself as one before it ever reached the screen, so its button map is known
+  to be exclusively for its own list — `handleListNav()` claims all six of `Screen::List`'s buttons
+  unconditionally once pressed, consulting the browsed peer's own map to decide what — if anything —
+  each one does, free to use `LOCAL_LIST_*` values without any collision risk against a Text/Image
+  peer's routing. `Screen::Image` has no equivalent guarantee (an image-capable peer's map is also
+  its ordinary Text-screen map), so `handleGalleryNav()` does **not** claim every press it sees:
+  only a press that resolves to `LOCAL_GALLERY_PREV`/`LOCAL_GALLERY_NEXT`
+  (`companionbuttons::isGalleryNavAction()`, host-tested) is claimed — an unbound Up/Down, or one
+  routed to anything else (most importantly `REMOTE`, e.g. an app like Snap2Ink using Up/Down as a
+  camera shutter), falls through to the peer's ordinary button-map dispatch instead. Back is the one
+  exception on the gallery side, and it goes the other way: a browsed gallery's Back is
+  **firmware-owned and unconditional**, not routed through the peer's map at all
+  (`CompanionModeActivity::handlePickerInput()`'s `Screen::Image` case reverts straight to
+  `Screen::GalleryPicker`) -- `LOCAL_BACK` is not consulted there, only on `Screen::List`.
+  `buttonsAnyBound` (the escape `Screen::List`'s Back falls back to) answers "did this peer declare a
+  scheme at all", not "did this peer give me a way out of THIS screen", and those differ precisely
+  because `Screen::Image` is not shape-exclusive: consulting the map for a browsed gallery's Back
+  could only ever *subtract* the way out, since none of the other routings a peer might have bound
+  Back to mean anything on this screen (`LOCAL_PAGE_*`/`LOCAL_LIST_*` are no-ops off their own
+  screens, `REMOTE` collapses to `decide()`'s `None` while disconnected -- and a browsed gallery is
+  always disconnected, `galleryPickerBrowsing` implies no live foreground peer -- and this branch
+  never dispatched `LOCAL_SLEEP` even when bound). A peer that binds Back to `LOCAL_SLEEP` leaves the
+  gallery here rather than sleeping, same as before declared gallery bindings existed at all.
 - The map consulted is **the browsed peer's**, not necessarily the live foreground peer's: the
-  offline icon-grid picker can open a `LIST` peer's document with no session at all, so
-  `enterListDocument()` loads that peer's button map fresh off SD
-  (`CompanionModeActivity::loadListButtonRouting()`) into a `listButtons` array kept separate from
-  `buttons` (the foreground peer's own map, used by every other screen). For a live foreground `LIST`
-  peer the two happen to name the same peer, but the lookup is still through `listButtons` — there is
-  no special-casing between the two entry points.
+  offline icon-grid picker can open a `LIST` peer's document, or a gallery, with no session at all,
+  so `enterListDocument()`/`selectGalleryPickerPeer()` load that peer's button map fresh off SD into
+  `buttons` (`CompanionModeActivity::loadButtonRoutingForPeer()`) — the one array used by every
+  screen, live foreground or browsed (there used to be a separate `listButtons` array; collapsed in
+  `1a550ea3` once a live foreground peer and a browsed document could no longer coexist). For a live
+  foreground `LIST`/image-capable peer, the browsed peer and the foreground peer happen to be the
+  same, but the lookup is still through `buttons` — there is no special-casing between the two entry
+  points. `loadButtonRoutingForPeer()` must be called explicitly by each entry point that opens a
+  browsed screen (`enterListDocument()` for `Screen::List`; `selectGalleryPickerPeer()` and
+  `onEnter()`'s offline-resume branch for a browsed `Screen::Image`) — a caller that forgets leaves
+  `buttons` at whatever `clearUiDeclaration()` set it to (all-`None`, since offline mode has no live
+  foreground peer to have loaded it), silently dropping that peer's declared gallery routing for the
+  entire browse.
 
 ## 6. Sync model
 

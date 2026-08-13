@@ -166,7 +166,7 @@ from companion_protocol import (
     RENDER_REJECTED_SIZE,
     RENDER_SEQUENCE_GAP,
     RENDER_RESULTS,
-    ROUTING_LIST_BACK,
+    ROUTING_BACK,
     ROUTING_LIST_MOVE_DOWN,
     ROUTING_LIST_MOVE_UP,
     ROUTING_LIST_SWITCH_LEFT,
@@ -256,7 +256,7 @@ LIST_BINDINGS_MAP = [
     (BTN_LEFT, ROUTING_LIST_SWITCH_LEFT, "Prev"),
     (BTN_RIGHT, ROUTING_LIST_SWITCH_RIGHT, "Next"),
     (BTN_CONFIRM, ROUTING_LIST_TOGGLE_CHECK, "Check"),
-    (BTN_BACK, ROUTING_LIST_BACK, "Back"),
+    (BTN_BACK, ROUTING_BACK, "Back"),
 ]
 LIST_BINDINGS_DECL = encode_ui_declaration(LIST_BINDINGS_MAP, shape=SHAPE_LIST)
 
@@ -2916,7 +2916,7 @@ async def run_tests(args, console: Console, results: Results) -> None:
                             f"revision={revision} entries={entries}",
                         )
 
-                        # --- Back (LOCAL_LIST_BACK, explicitly declared) ----- #
+                        # --- Back (LOCAL_BACK, explicitly declared) ----------- #
                         console.press(BTN_BACK)
                         # Same reasoning as listback above: this peer never
                         # pushed title/body, only a list document, so

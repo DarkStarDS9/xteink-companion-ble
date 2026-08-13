@@ -1524,7 +1524,11 @@ can do by itself, closed on purpose:
 0x07  LOCAL_LIST_SWITCH_LEFT  Screen::List only — switch to the previous list in the document
 0x08  LOCAL_LIST_SWITCH_RIGHT Screen::List only — switch to the next list in the document
 0x09  LOCAL_LIST_TOGGLE_CHECK Screen::List only — toggle checked on the item under the cursor
-0x0A  LOCAL_LIST_BACK         Screen::List only — leave the screen, back to wherever it was entered from
+0x0A  LOCAL_BACK              Screen::List only — leave the screen, back to wherever it was entered
+                               from. NOT consulted on a browsed Screen::Image gallery: that Back is
+                               firmware-owned and unconditional and needs no binding (see below)
+0x0B  LOCAL_GALLERY_PREV      Screen::Image only — show the previous image in the gallery
+0x0C  LOCAL_GALLERY_NEXT      Screen::Image only — show the next image in the gallery
 ```
 
 #### Button behaviour flags (byte 0, bits 7-6)
@@ -1534,7 +1538,7 @@ needs a nibble; the routing enum above, by contrast, is open-ended (a new
 `LOCAL_*` action is always one more enumerator away), so `routing` keeps its
 own full byte rather than sharing one with the id. The two spare bits in
 `buttonId`'s byte carry flags that modify a **local** routing (`LOCAL_PAGE_PREV`
-… `LOCAL_LIST_BACK`) without needing a second routing enum per combination:
+… `LOCAL_GALLERY_NEXT`) without needing a second routing enum per combination:
 
 ```
 bit 7  ALSO_NOTIFY          also send a button event to the connected peer,
@@ -1589,20 +1593,30 @@ Notes:
   disconnected.
 - Ship a new tag when an app update changes the scheme; the device picks it up
   on the next connect without re-pairing.
-- **`UP`/`DOWN` left as `NONE` (or `LOCAL_PAGE_PREV`/`LOCAL_PAGE_NEXT`) are used
-  by the device for image gallery navigation** while a pushed photo (field
-  `0x04`) is on screen: the device keeps the last several images an app has
-  pushed (see "Image field" above) and lets the user page back and forth
-  through them locally with the side buttons. `LEFT`/`RIGHT` were deliberately
-  not used for this: they're the buttons most apps already route to
-  `LOCAL_PAGE_PREV`/`LOCAL_PAGE_NEXT` for paging text, so `UP`/`DOWN` are the
-  pair actually free in practice. This is not a wire behaviour — no
-  notification is sent, no capability bit exists for it — so it costs an app
-  nothing to be unaware of it. An app that declares its own routing for
-  `UP`/`DOWN` (e.g. `REMOTE`, for something like camera control) is never
-  overridden; the gallery only engages on whichever of those two buttons the
-  app's own map leaves unclaimed (or routes to local paging, which is already
-  a no-op outside text content).
+- **`LOCAL_GALLERY_PREV`/`LOCAL_GALLERY_NEXT` page the on-device image
+  gallery** while a pushed photo (field `0x04`) is on screen: the device
+  keeps the last several images an app has pushed (see "Image field" above)
+  and lets the user page back and forth through them locally. There is no
+  default binding — an app declares which physical button, if any, does
+  this, the same as every other routing. `UP`/`DOWN` (the side buttons) are
+  the conventional choice: `LEFT`/`RIGHT` are the buttons most apps already
+  route to `LOCAL_PAGE_PREV`/`LOCAL_PAGE_NEXT` for paging text. This is not a
+  wire behaviour — no notification is sent, no capability bit exists for it
+  — so it costs an app nothing to be unaware of it. Unlike `Screen::List`
+  (which claims all six of its buttons unconditionally, since a `LIST`
+  peer's declared shape guarantees its map is exclusively for its own list),
+  the gallery does **not** claim a press that isn't explicitly
+  `LOCAL_GALLERY_PREV`/`LOCAL_GALLERY_NEXT`: an app that declares its own
+  routing for a button (e.g. `REMOTE`, for something like camera control),
+  or leaves it as `NONE`, is never overridden by gallery navigation.
+  **Back is the one exception**, and it goes the other way: a browsed
+  gallery's Back always leaves, unconditionally, without consulting the
+  peer's map at all — `LOCAL_BACK` is not meaningful here (only on
+  `Screen::List`; see its row in the table above). Consulting the map for
+  Back specifically would only ever be able to *remove* the way out of a
+  screen with no other exit but the power button, since `Screen::Image`
+  lacks the shape-exclusivity that lets `Screen::List` safely claim its six
+  buttons unconditionally through a declared map.
 
 #### Tags
 
