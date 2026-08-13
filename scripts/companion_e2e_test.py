@@ -490,6 +490,25 @@ class Console:
             time.sleep(0.3)
         return last
 
+    def await_state_key(self, key: str, timeout: float = 8.0) -> dict:
+        """Polls CSTATE until it actually answers with `key`, then returns it.
+
+        state() returns {} when the console did not reply in time -- the main
+        loop can be held by an in-flight e-ink refresh -- so an assertion that
+        reads it once is liable to score the device on silence rather than on
+        its state. This waits for a real answer; it deliberately does not wait
+        for a *particular* value, so a field that transiently holds the wrong
+        one still fails the caller's check instead of being polled away.
+        """
+        deadline = time.time() + timeout
+        last: dict = {}
+        while time.time() < deadline:
+            last = self.state()
+            if key in last:
+                return last
+            time.sleep(0.3)
+        return last
+
     def state(self) -> dict:
         for reply in self.send("CSTATE", expect="state"):
             if reply.startswith("state "):
@@ -1218,12 +1237,22 @@ async def run_tests(args, console: Console, results: Results) -> None:
                 # the client-side behaviour that makes a stale slot dangerous:
                 # the app moves on to the newest id, so anything still
                 # addressed to the old one is unroutable, not just redundant.
-                await asyncio.sleep(0.3)  # CSTATE settles on the next main-loop tick
                 # One live read, reused for both the comparison and the message --
                 # console.state() is a real serial round trip, so two separate
                 # calls here can straddle a transient and the message would then
                 # report a value the condition never actually saw.
-                state_after_duphello = console.state()
+                #
+                # Polled rather than read once after a fixed sleep, for the same
+                # reason await_screen() polls: the console answers on the main
+                # loop, and a second HELLO triggers a render whose RenderLock can
+                # hold that loop for the best part of a second. state() returns
+                # {} when nothing answered in time, so a single early read scored
+                # this check on silence -- it reported sessions=None, which is
+                # "the device did not reply", not "the session table is wrong".
+                # This waits for an actual answer and then judges it once; it
+                # does NOT retry until the value is the one we want, which would
+                # hide a table that transiently grows before settling.
+                state_after_duphello = console.await_state_key("sessions")
                 results.check(
                     "a second HELLO from the same peer does not grow the session table",
                     state_after_duphello.get("sessions") == "1",
