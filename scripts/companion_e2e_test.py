@@ -152,6 +152,7 @@ from companion_protocol import (
     DENIED_REASONS,
     FIELD_BODY,
     FIELD_CONTENT_ID,
+    FIELD_ICON,
     FIELD_IMAGE,
     FIELD_LIST_DOC,
     FIELD_TAG_STATE,
@@ -186,6 +187,7 @@ from companion_protocol import (
     SHAPE_TEXT,
     Link,
     Session,
+    encode_icon_bits,
     encode_list_doc,
     encode_tag_state,
     encode_ui_declaration,
@@ -3051,13 +3053,18 @@ async def run_tests(args, console: Console, results: Results) -> None:
             # Deliberately last: this drops the live link on purpose and the
             # device reboots twice, so nothing after it can assume `client`/
             # `link` (this scope's, opened by [reconnect] above) are still
-            # usable. Needs an already-enrolled peer with gallery/list content
-            # on SD (buildPickerPeerKeys()'s eligibility test) -- i.e. session_c
-            # from [list]/[listback]/[listbindings] above, or a prior full run
-            # with --keep-peers. Standalone `--only offline` on a freshly-reset
-            # device has nothing enrolled, lands on Screen::Waiting rather than
-            # Screen::IconGrid, and fails the first assertion below honestly
-            # rather than silently no-op'ing.
+            # usable. Needs session_c already HELLO'd and LIST-declared (from
+            # [shape]/[list] above, or a prior full run with --keep-peers) so
+            # buildPickerPeerKeys()'s eligibility test (isImageCapable() OR
+            # declared shape == LIST) has something to admit -- this group
+            # pushes that peer a real icon too, below, but the icon itself is
+            # not what eligibility turns on: no group in this harness ever
+            # sets the UI declaration's `capabilities` byte, so isImageCapable()
+            # is false for every peer here and session_c's LIST shape is the
+            # only thing that makes the picker non-empty. Standalone
+            # `--only offline` on a freshly-reset device has nothing enrolled,
+            # lands on Screen::Waiting rather than Screen::IconGrid, and fails
+            # the first assertion below honestly rather than silently no-op'ing.
             if enabled("offline"):
                 print("\n[offline] Confirm on the icon grid reboots into offline browse; no advertising while in it")
 
@@ -3080,14 +3087,81 @@ async def run_tests(args, console: Console, results: Results) -> None:
                         time.sleep(0.5)
                     return False
 
+                # --- give the LIST peer a real icon --------------------------- #
+                #
+                # Not required for buildPickerPeerKeys() eligibility (see the
+                # group comment above), but 0x06 has never been exercised by
+                # this harness -- every enrolled peer has shown CPEERS
+                # icon=00000000 up to this point -- and the icon grid's own
+                # tiles read icon.bin, so proving the push actually lands is
+                # worth one asset push. Sized from the device's own advertised
+                # icon dimensions (CCAP / the HELLO capability block), not a
+                # hardcoded 64x64 -- "the advertised icon width is always a
+                # multiple of 8" (docs/companion-display-protocol.md, Icon
+                # field), so this division is exact.
+                icon_bits = bytes(
+                    (i * 0x9D + 0x33) & 0xFF for i in range(caps["icon_w"] * caps["icon_h"] // 8)
+                )
+                icon_result, _icon_tag = await session_c.push_asset(FIELD_ICON, encode_icon_bits(icon_bits))
+                results.check(
+                    "offline: a pushed icon is stored for the LIST peer",
+                    icon_result == ASSET_STORED,
+                    f"ASSET_ACK {ASSET_RESULTS.get(icon_result, icon_result)}",
+                )
+                peers_after_icon = console.peers()
+                results.check(
+                    "offline: CPEERS reports a non-empty icon tag for at least one peer",
+                    any(p.get("icon") not in (None, "00000000") for p in peers_after_icon),
+                    str(peers_after_icon),
+                )
+
+                # --- reach the icon grid without the 5-minute idle wait ------ #
+                #
+                # [flags] above left session_a foreground with real content on
+                # screen (screen=="text"). CompanionModeActivity does NOT snap
+                # back to the icon grid on a bare disconnect -- content is
+                # deliberately held until the idle timeout
+                # (kWaitingIdleSleepMs, 5 real *minutes*: CompanionModeActivity.h)
+                # takes over; see docs/companion-display-protocol.md's
+                # "On-screen behaviour". Waiting that out here would tax every
+                # run of this group by 5 minutes for no reason -- there is a
+                # faster, equally real path: applyForegroundChange() clears
+                # `haveContent` whenever a *different* session takes the
+                # foreground (CompanionModeActivity.cpp ~1062), and RELEASE
+                # from a foreground session with haveContent==false goes
+                # straight to chooseIdleScreen() with no wait at all (~1072).
+                # So: bounce the foreground to session_c and back to session_a
+                # (the second ACQUIRE of session_a is a real foreground change,
+                # not a same-session no-op -- setForeground() early-returns
+                # only when already foreground), push nothing, then RELEASE.
+                # Still fully connected throughout -- this exercises the real
+                # ACQUIRE/RELEASE state machine, not a console shortcut.
+                bounce = await session_c.acquire()
+                results.check(
+                    "offline: bounced the foreground to the LIST peer", bounce[0] == "foreground", str(bounce)
+                )
+                retake = await session_a.acquire()
+                results.check(
+                    "offline: retook the foreground with nothing pushed this time",
+                    retake[0] == "foreground",
+                    str(retake),
+                )
+                await session_a.release()
+                idle_screen_connected = console.await_screen("icon_grid", timeout=8.0)
+                results.check(
+                    "offline: releasing a contentless foreground session reaches the icon grid "
+                    "immediately, without the 5-minute idle wait",
+                    idle_screen_connected == "icon_grid",
+                    f"screen is {idle_screen_connected!r}",
+                )
+
                 await client.disconnect()
                 await asyncio.sleep(1.0)
                 idle_screen = console.await_screen("icon_grid", timeout=15.0)
                 if results.check(
                     "offline: the device settles on the icon grid once the link drops",
                     idle_screen == "icon_grid",
-                    f"screen is {idle_screen!r} -- needs an already-enrolled peer with an icon; "
-                    "see this group's standalone-mode comment above",
+                    f"screen is {idle_screen!r}",
                 ):
                     console.press(BTN_CONFIRM)  # enterOfflineBrowseMode(): saves state, stops BLE, reboots
                     booted = await wait_console_up(20.0)
