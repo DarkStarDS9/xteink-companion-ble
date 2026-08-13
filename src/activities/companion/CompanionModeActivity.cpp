@@ -13,6 +13,7 @@
 
 #include "CompanionBatchModel.h"
 #include "CompanionBle.h"
+#include "CompanionButtonPolicy.h"
 #include "CompanionPeerStore.h"
 #include "CompanionTestConsole.h"
 #include "CompanionTodoDocument.h"
@@ -439,7 +440,7 @@ void CompanionModeActivity::clearUiDeclaration() {
 // clearUiDeclaration() and loadListButtonRouting()) so this stays a pure
 // parse.
 void CompanionModeActivity::parseButtonEntries(const uint8_t* raw, size_t len, size_t& offset, uint8_t buttonEntries,
-                                                ButtonSpec (&out)[kButtonCount]) {
+                                               ButtonSpec (&out)[kButtonCount]) {
   for (uint8_t i = 0; i < buttonEntries && offset + 3 <= len; ++i) {
     const uint8_t buttonId = raw[offset];
     const uint8_t routing = raw[offset + 1];
@@ -473,7 +474,8 @@ void CompanionModeActivity::loadListButtonRouting(const std::string& peerKey) {
   if (peerKey.empty()) return;
 
   uint8_t raw[companionpeer::kMaxUiDeclarationLen];
-  const size_t len = companionpeer::readAssetBody(peerKey.c_str(), companionpeer::kAssetUiDeclaration, raw, sizeof(raw));
+  const size_t len =
+      companionpeer::readAssetBody(peerKey.c_str(), companionpeer::kAssetUiDeclaration, raw, sizeof(raw));
   companionui::DeclarationInfo info;
   if (companionui::parseBody(raw, len, &info) != companionui::ParseResult::Ok) return;
 
@@ -628,8 +630,11 @@ const char* CompanionModeActivity::labelFor(companionble::ButtonId button) const
   const size_t index = static_cast<size_t>(button);
   if (index >= kButtonCount) return "";
   // An empty label hides the hint entirely — the convention drawButtonHints()
-  // itself checks.
-  return buttons[index].routing == companionble::ButtonRouting::None ? "" : buttons[index].label.c_str();
+  // itself checks. Goes through companionbuttons::decide() rather than just
+  // testing routing != None so a Remote-routed button's hint disappears once
+  // the peer disconnects, not only when the routing itself is None.
+  const bool peerConnected = !foregroundPeerKey.empty();
+  return companionbuttons::decide(buttons[index].routing, peerConnected).showHint ? buttons[index].label.c_str() : "";
 }
 
 // listButtons' counterpart to routingFor() -- see that member's doc comment
@@ -643,7 +648,9 @@ companionble::ButtonRouting CompanionModeActivity::listRoutingFor(companionble::
 const char* CompanionModeActivity::listLabelFor(companionble::ButtonId button) const {
   const size_t index = static_cast<size_t>(button);
   if (index >= kButtonCount) return "";
-  return listButtons[index].routing == companionble::ButtonRouting::None ? "" : listButtons[index].label.c_str();
+  const bool peerConnected = !foregroundPeerKey.empty();
+  return companionbuttons::decide(listButtons[index].routing, peerConnected).showHint ? listButtons[index].label.c_str()
+                                                                                      : "";
 }
 
 // ---------------------------------------------------------------------------
@@ -2044,18 +2051,30 @@ const char* CompanionModeActivity::screenName() const {
 bool CompanionModeActivity::handleMappedButton(MappedInputManager::Button role, companionble::ButtonId id) {
   if (!buttonWasPressed(role, id)) return false;
 
-  switch (routingFor(id)) {
-    case companionble::ButtonRouting::None:
-      return false;
+  // !foregroundPeerKey.empty(), not the `connected` member -- see
+  // CompanionButtonPolicy.h's doc comment on why decide() takes this exact
+  // test as its peerConnected argument.
+  const bool peerConnected = !foregroundPeerKey.empty();
+  const auto decision = companionbuttons::decide(routingFor(id), peerConnected);
 
-    case companionble::ButtonRouting::Remote:
-      // Nothing to deliver the press to once the link is gone.
-      // notifyButtonEvent() already no-ops when disconnected, but going through
-      // notifyHeldButton() anyway would start hold-tracking for a press no app
-      // will ever hear, leaving holdActive set until the button is released.
-      if (foregroundPeerKey.empty()) return false;
+  switch (decision.action) {
+    case companionble::ButtonRouting::None:
+      // Either genuinely unrouted, or Remote-routed with nothing to deliver
+      // the press to (decide() collapses Remote's local action to None
+      // either way). decision.notify tells the two apart: notifyHeldButton()
+      // only when Remote actually has a live peer to hear it.
+      // notifyButtonEvent() already no-ops when disconnected, but going
+      // through notifyHeldButton() anyway would start hold-tracking for a
+      // press no app will ever hear, leaving holdActive set until the
+      // button is released.
+      if (!decision.notify) return false;
       notifyHeldButton(id);
       return true;
+
+    case companionble::ButtonRouting::Remote:
+      // decide() never returns Remote as the local action -- see the None
+      // case above.
+      return false;
 
     case companionble::ButtonRouting::LocalPagePrev:
       if (screen == Screen::Text && currentPage > 0) {
@@ -2081,6 +2100,15 @@ bool CompanionModeActivity::handleMappedButton(MappedInputManager::Button role, 
       }
       powerManager.startDeepSleep(gpio);  // [[noreturn]]
       return true;
+
+    case companionble::ButtonRouting::LocalListMoveUp:
+    case companionble::ButtonRouting::LocalListMoveDown:
+    case companionble::ButtonRouting::LocalListSwitchLeft:
+    case companionble::ButtonRouting::LocalListSwitchRight:
+    case companionble::ButtonRouting::LocalListToggleCheck:
+    case companionble::ButtonRouting::LocalListBack:
+      // Handled only by handleListNav() -- see that member's doc comment.
+      return false;
   }
   return false;
 }

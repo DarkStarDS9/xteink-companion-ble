@@ -321,7 +321,7 @@ class CompanionModeActivity final : public Activity {
   // wire layout and validation are identical -- only which peer and which
   // array differ.
   void parseButtonEntries(const uint8_t* raw, size_t len, size_t& offset, uint8_t buttonEntries,
-                           ButtonSpec (&out)[kButtonCount]);
+                          ButtonSpec (&out)[kButtonCount]);
   // Reads `peerKey`'s persisted UI declaration and fills `listButtons` with
   // its button map -- no default, so a peer that declares none of the
   // LocalList* routings leaves Screen::List's buttons dead. Called by
