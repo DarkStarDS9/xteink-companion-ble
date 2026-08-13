@@ -1558,10 +1558,11 @@ bool CompanionModeActivity::handleListNav() {
         // so it never leaks out to some other handler from this screen.
         if (!listDiff || target == nullptr) return true;
 
-        // The resulting on-screen value is not captured: the redraw below rebuilds
-        // every row through effectiveChecked() anyway, and a second copy of the
-        // same truth is a second thing that can disagree with the diff.
-        if (!listDiff->applyToggle(target->itemId, target->documentChecked, nullptr)) {
+        // Captured only to decide whether to auto-advance below; the redraw
+        // still rebuilds every row through effectiveChecked() rather than
+        // trusting this copy.
+        bool newChecked = false;
+        if (!listDiff->applyToggle(target->itemId, target->documentChecked, &newChecked)) {
           // The table is full and applyToggle() mutated nothing. Saying so out loud
           // is the point: an edit the user made and the device dropped in silence
           // is the one failure mode this feature cannot have. Note this is reached
@@ -1591,11 +1592,18 @@ bool CompanionModeActivity::handleListNav() {
         // next HELLO.
         companionble::notifyListStateAvail(listPeerKey.c_str());
 
+        // Checking an item off moves the cursor to the next one, so working
+        // down a list is a single button held rather than a check-then-move
+        // pair; there's no move on an uncheck (no use case for it yet -- YAGNI)
+        // and none at the last item, where there's nothing to advance to.
+        const bool advanced = newChecked && listNav.moveDown();
+
         RenderLock lock;
         // Full re-walk rather than poking the one row: the row vector is rebuilt
         // from the document on every other view change too, and one in-RAM parse
         // is cheaper than a second code path that has to stay consistent with it.
         reloadListView(/*recountTotals=*/false);
+        if (advanced) syncOfflineBrowsePosition();
         requestUpdate();
         return true;
       }
