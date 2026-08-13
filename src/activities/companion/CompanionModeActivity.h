@@ -532,7 +532,10 @@ class CompanionModeActivity final : public Activity {
   // the grid (or below the waiting text, for renderWaiting()). Used both for
   // the plain idle screen (inverted=false, label=nullptr) and for the
   // sleep/boot variants — see renderPreSleepScreen() and onEnter().
-  void renderWaiting(bool inverted = false, const char* label = nullptr);
+  // showOfflineHint draws the Confirm-enters-offline-browse button hint;
+  // only renderIconGrid() passes true, since renderWaiting() is shared with
+  // Screen::Waiting/Screen::Text, where Confirm does not do that.
+  void renderWaiting(bool inverted = false, const char* label = nullptr, bool showOfflineHint = false);
   void renderIconGrid(bool inverted = false, const char* label = nullptr);
   void renderGalleryPicker();
   void renderTransientMessage();

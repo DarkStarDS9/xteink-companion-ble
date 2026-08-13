@@ -2620,7 +2620,7 @@ void CompanionModeActivity::render(RenderLock&&) {
   }
 }
 
-void CompanionModeActivity::renderWaiting(bool inverted, const char* label) {
+void CompanionModeActivity::renderWaiting(bool inverted, const char* label, bool showOfflineHint) {
   // "Waiting for <app>" once an app holds the screen but has pushed nothing;
   // the generic "Waiting for phone..." before that.
   const int centerY = renderer.getScreenHeight() / 2;
@@ -2633,6 +2633,12 @@ void CompanionModeActivity::renderWaiting(bool inverted, const char* label) {
   }
   if (label && *label) {
     renderer.drawCenteredText(SMALL_FONT_ID, centerY + renderer.getLineHeight(kCompanionFontId) * 2, label, true);
+  }
+  if (showOfflineHint && !mappedInput.hasTouch()) {
+    // Only Confirm does anything on Screen::IconGrid (handlePickerInput()) --
+    // it reboots into offline browse -- so this is the only slot filled.
+    const auto labels = mappedInput.mapLabels("", tr(STR_BROWSE_OFFLINE), "", "");
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   }
   if (inverted) renderer.invertScreen();
   renderer.displayBuffer();
@@ -2665,7 +2671,7 @@ void CompanionModeActivity::renderIconGrid(bool inverted, const char* label) {
   char keys[companionpeer::kMaxIconTiles][companionpeer::kPeerKeyLen];
   const size_t count = companionpeer::listIconTiles(keys, companionpeer::kMaxIconTiles);
   if (count == 0) {
-    renderWaiting(inverted, label);
+    renderWaiting(inverted, label, /*showOfflineHint=*/true);
     return;
   }
 
@@ -2705,6 +2711,13 @@ void CompanionModeActivity::renderIconGrid(bool inverted, const char* label) {
 
   if (label && *label) {
     renderer.drawCenteredText(SMALL_FONT_ID, originY + gridHeight + kIconGridGap, label, true);
+  }
+
+  if (!mappedInput.hasTouch()) {
+    // Only Confirm does anything on Screen::IconGrid (handlePickerInput()) --
+    // it reboots into offline browse -- so this is the only slot filled.
+    const auto labels = mappedInput.mapLabels("", tr(STR_BROWSE_OFFLINE), "", "");
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   }
 
   if (inverted) renderer.invertScreen();
@@ -2780,6 +2793,15 @@ void CompanionModeActivity::renderGalleryPicker() {
       }
       renderer.drawText(SMALL_FONT_ID, x0, y0 + tile + 10, label.c_str(), true);
     }
+  }
+
+  if (!mappedInput.hasTouch()) {
+    // handlePickerInput()'s GalleryPicker branch only ever reads Up/Down
+    // (cursor through the flat tile list) plus Confirm/Back -- no Left/Right,
+    // despite the grid layout -- so this is the same 4-slot back/confirm/prev/next
+    // idiom every other local activity uses, e.g. FileBrowserActivity.cpp.
+    const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_OPEN), "<", ">");
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   }
 
   renderer.displayBuffer();
@@ -3100,6 +3122,20 @@ void CompanionModeActivity::renderList() {
   constexpr int kCheckboxSize = 14;
   constexpr int kCheckboxGap = 8;
   const int itemIndent = kCheckboxSize + kCheckboxGap;
+  // Selection outline padding: clears the checkbox on the left and gives
+  // descenders (e.g. "g") room below the baseline, instead of hugging the
+  // row's raw text extent the way a 0-padding rect did.
+  //
+  // drawRoundedRect's stroke is inset from its bounding box (ink occupies
+  // columns x..x+lineWidth-1), unlike the checkbox's plain drawRect, whose
+  // 1px stroke sits exactly on the boundary column. So matching the visible
+  // ink-to-ink gap to kCheckboxGap means padding out by the stroke width too
+  // -- padding = kCheckboxGap alone would read as kCheckboxGap - lineWidth.
+  constexpr int kListSelectionBorderThickness = 2;
+  constexpr int kListSelectionPaddingX = kCheckboxGap + kListSelectionBorderThickness;
+  constexpr int kListSelectionPaddingTop = 3;
+  constexpr int kListSelectionPaddingBottom = 4;
+  constexpr int kListSelectionCornerRadius = 4;
   const int bottomLimit = renderer.getScreenHeight() - cachedOrientedMarginBottom;
   const int rowHeight = listRowHeight > 0 ? listRowHeight : renderer.getLineHeight(cachedFontId);
 
@@ -3122,9 +3158,13 @@ void CompanionModeActivity::renderList() {
 
     const bool isCursor = row.itemFlatIndex == static_cast<int>(listNav.cursor());
     if (isCursor) {
-      // Thick outline around the whole row -- same cursor idiom as
-      // renderGalleryPicker()'s tile-selection marker.
-      renderer.drawRect(cachedOrientedMarginLeft - 3, y - 2, viewportWidth + 6, rowHeight, 2, true);
+      // Rounded outline around the whole row, padded clear of the checkbox
+      // and the row's descenders -- same cursor idiom as renderGalleryPicker()'s
+      // tile-selection marker, but no longer flush with the row's raw extent.
+      renderer.drawRoundedRect(cachedOrientedMarginLeft - kListSelectionPaddingX, y - kListSelectionPaddingTop,
+                               viewportWidth + kListSelectionPaddingX * 2,
+                               rowHeight + kListSelectionPaddingTop + kListSelectionPaddingBottom,
+                               kListSelectionBorderThickness, kListSelectionCornerRadius, true);
     }
 
     const int boxY = y + (rowHeight - kCheckboxSize) / 2;
@@ -3133,6 +3173,14 @@ void CompanionModeActivity::renderList() {
       renderer.fillRect(cachedOrientedMarginLeft + 3, boxY + 3, kCheckboxSize - 6, kCheckboxSize - 6, true);
     }
     renderer.drawText(cachedFontId, cachedOrientedMarginLeft + itemIndent, y, row.text.c_str(), true);
+    if (row.checked) {
+      // Strike-through: a thin rule through the text's vertical middle,
+      // same fillRect idiom BaseTheme uses for its tab-selection underline.
+      constexpr int kStrikeThroughThickness = 2;
+      const int textWidth = renderer.getTextWidth(cachedFontId, row.text.c_str());
+      const int strikeY = y + rowHeight / 2 - kStrikeThroughThickness / 2;
+      renderer.fillRect(cachedOrientedMarginLeft + itemIndent, strikeY, textWidth, kStrikeThroughThickness, true);
+    }
     y += rowHeight;
   }
 
