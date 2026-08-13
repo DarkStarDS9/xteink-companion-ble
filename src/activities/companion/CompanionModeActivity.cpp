@@ -3147,6 +3147,25 @@ void CompanionModeActivity::renderList() {
   const int bottomLimit = renderer.getScreenHeight() - cachedOrientedMarginBottom;
   const int rowHeight = listRowHeight > 0 ? listRowHeight : renderer.getLineHeight(cachedFontId);
 
+  // The scroll thumb (drawn after the row loop, below) sits INSIDE
+  // viewportWidth -- kScrollBarRightOffset(5) + kScrollBarWidth(4) in from
+  // the right edge, not past it -- so the cursor outline's normal right-side
+  // overshoot (kListSelectionPaddingX past viewportWidth) doesn't clear it;
+  // confirmed on a hardware screenshot (scripts/debug_scrollbar_shot.py) that
+  // the outline's border lands squarely on the thumb's column. When the
+  // thumb is visible, pull the outline's right edge in to end short of the
+  // thumb (with kScrollBarClearance to spare) instead of merely dropping the
+  // overshoot -- it has to give up viewport width the thumb is using, not
+  // just the padding past it.
+  constexpr int kScrollBarWidth = 4;
+  constexpr int kScrollBarRightOffset = 5;
+  constexpr int kScrollBarClearance = 4;
+  const bool scrollBarVisible = static_cast<int>(listNav.itemCount()) > static_cast<int>(listNav.visibleCapacity());
+  const int selectionRightOvershoot =
+      scrollBarVisible
+          ? -(kScrollBarWidth + kScrollBarRightOffset + kScrollBarClearance)
+          : kListSelectionPaddingX;
+
   int y = titleY + titleLineHeight + kListTitleBottomSpacing;
 
   if (listVisibleRows.empty()) {
@@ -3170,7 +3189,7 @@ void CompanionModeActivity::renderList() {
       // and the row's descenders -- same cursor idiom as renderGalleryPicker()'s
       // tile-selection marker, but no longer flush with the row's raw extent.
       renderer.drawRoundedRect(cachedOrientedMarginLeft - kListSelectionPaddingX, y - kListSelectionPaddingTop,
-                               viewportWidth + kListSelectionPaddingX * 2,
+                               viewportWidth + kListSelectionPaddingX + selectionRightOvershoot,
                                rowHeight + kListSelectionPaddingTop + kListSelectionPaddingBottom,
                                kListSelectionBorderThickness, kListSelectionCornerRadius, true);
     }
@@ -3190,6 +3209,26 @@ void CompanionModeActivity::renderList() {
       renderer.fillRect(cachedOrientedMarginLeft + itemIndent, strikeY, textWidth, kStrikeThroughThickness, true);
     }
     y += rowHeight;
+  }
+
+  // Scroll position thumb: renderList() hand-draws its own rows instead of
+  // going through GUI.drawList() (see the class comment above), so it can't
+  // reach RoundedRaffTheme::drawScrollBar()/LyraTheme::drawList()'s inline
+  // scrollbar either -- both are private to their theme's .cpp. Same
+  // itemCount/pageStartIndex/pageItems math as those, fed straight from
+  // listNav, the source those themes' callers would have used anyway.
+  if (scrollBarVisible) {
+    const int itemCount = static_cast<int>(listNav.itemCount());
+    const int pageItems = static_cast<int>(listNav.visibleCapacity());
+    const int barX = cachedOrientedMarginLeft + viewportWidth - kScrollBarRightOffset - kScrollBarWidth;
+    const int barY = titleY + titleLineHeight + kListTitleBottomSpacing;
+    const int barH = bottomLimit - barY;
+    const int thumbH = std::max(10, (barH * pageItems) / itemCount);
+    const int maxStart = std::max(1, itemCount - pageItems);
+    const int maxTravel = std::max(1, barH - thumbH);
+    const int clampedStart = std::clamp(static_cast<int>(listNav.windowStart()), 0, maxStart);
+    const int thumbY = barY + (clampedStart * maxTravel) / maxStart;
+    renderer.fillRect(barX, thumbY, kScrollBarWidth, thumbH, true);
   }
 
   if (!mappedInput.hasTouch()) {
