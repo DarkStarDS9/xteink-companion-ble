@@ -1479,19 +1479,29 @@ async def run_tests(args, console: Console, results: Results) -> None:
             # the tag must survive, because when it clears is app meaning.
             await session_a.set_tag(0, 2)
             await asyncio.sleep(1.5)
+            # The Status write is write-without-response, so BLE cannot confirm
+            # it landed. Serial can — this is the assertion the harness exists
+            # for. Read it back *before* the body push below, so the next
+            # check has a pre-push baseline to compare against instead of
+            # re-testing this same read.
+            tags_after_write = console.tags()
+            results.check("the tag write actually landed on the device",
+                          tags_after_write.get(0) == "filled", str(tags_after_write))
+
             await session_a.push_field(FIELD_BODY, b"A second body push.", final=True)
             await asyncio.sleep(2.0)
             results.check("device still on text after a tag write plus a push",
                           console.state().get("screen") == "text")
-            # The Status write is write-without-response, so BLE cannot confirm
-            # it landed. Serial can — this is the assertion the harness exists
-            # for.
-            tags_seen = console.tags()
-            results.check("the tag write actually landed on the device",
-                          tags_seen.get(0) == "filled", str(tags_seen))
-            results.check("a content push did not clear it",
-                          tags_seen.get(0) == "filled",
-                          "tags must not auto-clear on a body push")
+            # CompanionBatchModel only resolves hasTagState when field 0x07
+            # rode the batch (src/CompanionBatchModel.cpp:105-119); a
+            # body-only batch leaves stored tag state untouched. This read
+            # happens strictly after the push above, so a real regression —
+            # the device clearing tags on any content commit — would show up
+            # here as a fresh disagreement with tags_after_write, not as a
+            # second look at the same dict.
+            tags_after_push = console.tags()
+            results.check("a content push did not clear it — tags must not auto-clear on a body push",
+                          tags_after_push.get(0) == "filled", str(tags_after_push))
 
             # An undeclared id must be ignored rather than create a tag.
             await session_a.set_tag(99, 2)
