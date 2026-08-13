@@ -206,11 +206,17 @@ N × {  buttonId : 1
 itself, and it stays closed on purpose:
 
 ```
-0x00  NONE               no hint drawn, no notification — button is dead in this app
-0x01  REMOTE             notify the phone (raw button id + hold duration, exactly as v5)
-0x02  LOCAL_PAGE_PREV    page the locally-buffered body backward
-0x03  LOCAL_PAGE_NEXT    page the locally-buffered body forward
-0x04  LOCAL_SLEEP        sleep the device
+0x00  NONE                    no hint drawn, no notification — button is dead in this app
+0x01  REMOTE                  notify the phone (raw button id + hold duration, exactly as v5)
+0x02  LOCAL_PAGE_PREV         page the locally-buffered body backward
+0x03  LOCAL_PAGE_NEXT         page the locally-buffered body forward
+0x04  LOCAL_SLEEP             sleep the device
+0x05  LOCAL_LIST_MOVE_UP      Screen::List only — move the item cursor up
+0x06  LOCAL_LIST_MOVE_DOWN    Screen::List only — move the item cursor down
+0x07  LOCAL_LIST_SWITCH_LEFT  Screen::List only — switch to the previous list in the document
+0x08  LOCAL_LIST_SWITCH_RIGHT Screen::List only — switch to the next list in the document
+0x09  LOCAL_LIST_TOGGLE_CHECK Screen::List only — toggle checked on the item under the cursor
+0x0A  LOCAL_LIST_BACK         Screen::List only — leave the screen, back to wherever it was entered from
 ```
 
 Notes:
@@ -222,6 +228,13 @@ Notes:
   notifies) does not survive as an implicit default — an app declares its scheme or does not get the
   screen. The firmware keeps its own fixed scheme only for its own screens: pairing confirmation,
   "waiting for <app>", and the sleep grid.
+- The `LOCAL_LIST_*` values are meaningful only on `Screen::List`, and only in the map of the `LIST`
+  peer whose document is on screen — see `docs/companion-todo-list-design.md` §5. Screen::List has no
+  default binding of its own either: a `LIST` peer that declares none of them leaves every button
+  dead on that screen. A `LIST` peer's exclusive shape (§2-§3 of
+  `docs/companion-declared-shape-design.md`) means its map is never consulted for anything but its
+  own list — a peer can freely reuse `LOCAL_LIST_*` values without any collision risk against
+  Text/Image peers' routing.
 - **App updates are the reason this is versioned rather than push-once.** A new app build that adds
   a feature ships a new button map with a new tag; the device picks it up on the next connect
   without re-pairing, and without the app having to track whether it already pushed.

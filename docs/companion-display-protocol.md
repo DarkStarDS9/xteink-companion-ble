@@ -1512,11 +1512,17 @@ below). A button not listed behaves as `NONE`.
 can do by itself, closed on purpose:
 
 ```
-0x00  NONE               no hint drawn, no notification — button is dead in this app
-0x01  REMOTE             notify the phone (raw button id + hold duration)
-0x02  LOCAL_PAGE_PREV    page the locally-buffered body backward
-0x03  LOCAL_PAGE_NEXT    page the locally-buffered body forward
-0x04  LOCAL_SLEEP        sleep the device
+0x00  NONE                    no hint drawn, no notification — button is dead in this app
+0x01  REMOTE                  notify the phone (raw button id + hold duration)
+0x02  LOCAL_PAGE_PREV         page the locally-buffered body backward
+0x03  LOCAL_PAGE_NEXT         page the locally-buffered body forward
+0x04  LOCAL_SLEEP             sleep the device
+0x05  LOCAL_LIST_MOVE_UP      Screen::List only — move the item cursor up
+0x06  LOCAL_LIST_MOVE_DOWN    Screen::List only — move the item cursor down
+0x07  LOCAL_LIST_SWITCH_LEFT  Screen::List only — switch to the previous list in the document
+0x08  LOCAL_LIST_SWITCH_RIGHT Screen::List only — switch to the next list in the document
+0x09  LOCAL_LIST_TOGGLE_CHECK Screen::List only — toggle checked on the item under the cursor
+0x0A  LOCAL_LIST_BACK         Screen::List only — leave the screen, back to wherever it was entered from
 ```
 
 Notes:

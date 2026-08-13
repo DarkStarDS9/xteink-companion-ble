@@ -154,13 +154,30 @@ enum class ButtonId : uint8_t {
 // peer's button map. A closed set on purpose: this is the entire list of things
 // the firmware can do by itself, and it stays closed so "dumb firmware, smart
 // phone" cannot erode one opcode at a time.
+//
+// The LocalList* values are meaningful only on Screen::List, and only in the
+// button map of the LIST peer whose document is on screen -- see
+// docs/companion-todo-list-design.md §5. There is no default binding: a LIST
+// peer that declares none of them leaves every button dead on that screen,
+// exactly like every other peer's map for every other screen.
 enum class ButtonRouting : uint8_t {
   None = 0x00,
   Remote = 0x01,
   LocalPagePrev = 0x02,
   LocalPageNext = 0x03,
   LocalSleep = 0x04,
+  LocalListMoveUp = 0x05,
+  LocalListMoveDown = 0x06,
+  LocalListSwitchLeft = 0x07,
+  LocalListSwitchRight = 0x08,
+  LocalListToggleCheck = 0x09,
+  LocalListBack = 0x0A,
 };
+
+// Upper bound for a wire-valid ButtonRouting byte -- keep in sync with the
+// highest enumerator above. loadUiDeclaration()/loadListButtonRouting() reject
+// anything past this rather than trust an unknown byte verbatim.
+inline constexpr uint8_t kMaxButtonRouting = static_cast<uint8_t>(ButtonRouting::LocalListBack);
 
 // What kind of content a peer pushes, declared once per peer in its UI
 // declaration (kFieldUiDeclaration) rather than inferred from whichever field

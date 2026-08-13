@@ -232,10 +232,19 @@ class CompanionModeActivity final : public Activity {
   // read-only (Phase A behaviour) rather than the screen refusing to open.
   // Every read of this pointer must therefore be guarded.
   std::unique_ptr<companiontodo::Diff> listDiff;
-  // Where Back returns to -- IconGrid for the picker entry point (no live
-  // session), Text for a live LIST peer that pushed a document while
+  // Where Back returns to -- GalleryPicker for the picker entry point (no
+  // live session), Text for a live LIST peer that pushed a document while
   // foreground (applyForegroundChange() landed here directly).
   Screen listReturnScreen = Screen::IconGrid;
+
+  // What one physical button does on Screen::List, declared by listPeerKey's
+  // own button map -- loaded fresh by loadListButtonRouting() every time
+  // enterListDocument() opens a document, live or via the offline picker.
+  // Deliberately separate from `buttons` above: listPeerKey is not always
+  // foregroundPeerKey (the picker can browse a LIST peer with no live
+  // session at all), so List's routing cannot simply reuse whatever the
+  // foreground peer last declared. See handleListNav().
+  ButtonSpec listButtons[kButtonCount];
 
   std::string transientMessage;
   unsigned long transientMessageUntilMs = 0;
@@ -304,12 +313,30 @@ class CompanionModeActivity final : public Activity {
   void notifyHeldButton(companionble::ButtonId button);
   void loadUiDeclaration();
   void clearUiDeclaration();
+  // Parses the button-map section of a UI declaration body (offset already
+  // past the 2-byte header) into `out`, advancing `offset` past it so a
+  // caller that also wants the trailing tag section can continue from there.
+  // Shared by loadUiDeclaration() (foreground peer -> `buttons`) and
+  // loadListButtonRouting() (a browsed LIST peer -> `listButtons`), since the
+  // wire layout and validation are identical -- only which peer and which
+  // array differ.
+  void parseButtonEntries(const uint8_t* raw, size_t len, size_t& offset, uint8_t buttonEntries,
+                           ButtonSpec (&out)[kButtonCount]);
+  // Reads `peerKey`'s persisted UI declaration and fills `listButtons` with
+  // its button map -- no default, so a peer that declares none of the
+  // LocalList* routings leaves Screen::List's buttons dead. Called by
+  // enterListDocument() for whichever peer's document is being opened, live
+  // or via the offline picker; independent of `buttons`/foregroundPeerKey
+  // because the two can name different peers (see listButtons' doc comment).
+  void loadListButtonRouting(const std::string& peerKey);
   void applyTagState(const uint8_t* data, size_t len);
   void setTagState(uint8_t tagId, uint8_t state);
   void measureTagRow();
   bool tagIsDrawn(const TagSpec& tag) const;
   companionble::ButtonRouting routingFor(companionble::ButtonId button) const;
   const char* labelFor(companionble::ButtonId button) const;
+  companionble::ButtonRouting listRoutingFor(companionble::ButtonId button) const;
+  const char* listLabelFor(companionble::ButtonId button) const;
   bool handleMappedButton(MappedInputManager::Button role, companionble::ButtonId id);
   void applyForegroundChange();
   void handlePendingImage(const std::string& stagedPath, const std::string& peerKey, const uint8_t* contentId,

@@ -432,6 +432,55 @@ void CompanionModeActivity::clearUiDeclaration() {
   tagCount = 0;
 }
 
+// Parses the button-entry section of a UI declaration body -- `offset` is
+// already past the 2-byte header and is left just past the last button entry,
+// so a caller that also wants the trailing tag section (loadUiDeclaration())
+// can continue from there. `out` is not cleared first; callers do that (see
+// clearUiDeclaration() and loadListButtonRouting()) so this stays a pure
+// parse.
+void CompanionModeActivity::parseButtonEntries(const uint8_t* raw, size_t len, size_t& offset, uint8_t buttonEntries,
+                                                ButtonSpec (&out)[kButtonCount]) {
+  for (uint8_t i = 0; i < buttonEntries && offset + 3 <= len; ++i) {
+    const uint8_t buttonId = raw[offset];
+    const uint8_t routing = raw[offset + 1];
+    const uint8_t labelLen = raw[offset + 2];
+    offset += 3;
+    if (offset + labelLen > len) break;
+
+    // POWER is firmware-owned in every app: a wedged app must never be able to
+    // make the device un-sleepable.
+    if (buttonId < kButtonCount && buttonId != static_cast<uint8_t>(companionble::ButtonId::Power) &&
+        routing <= companionble::kMaxButtonRouting) {
+      out[buttonId].routing = static_cast<companionble::ButtonRouting>(routing);
+      out[buttonId].label.assign(reinterpret_cast<const char*>(raw + offset), labelLen);
+    }
+    offset += labelLen;
+  }
+}
+
+// Reads `peerKey`'s persisted UI declaration and fills `listButtons` with its
+// button map, for Screen::List -- see listButtons' doc comment on why this
+// cannot simply reuse `buttons`/loadUiDeclaration(). No default: a peer that
+// never declared a LocalList* routing for a button leaves it in `None`, same
+// as clearUiDeclaration() leaves every other peer's map before a declaration
+// is read. Deliberately ignores the tag section -- Screen::List has no tag
+// row.
+void CompanionModeActivity::loadListButtonRouting(const std::string& peerKey) {
+  for (auto& spec : listButtons) {
+    spec.routing = companionble::ButtonRouting::None;
+    spec.label.clear();
+  }
+  if (peerKey.empty()) return;
+
+  uint8_t raw[companionpeer::kMaxUiDeclarationLen];
+  const size_t len = companionpeer::readAssetBody(peerKey.c_str(), companionpeer::kAssetUiDeclaration, raw, sizeof(raw));
+  companionui::DeclarationInfo info;
+  if (companionui::parseBody(raw, len, &info) != companionui::ParseResult::Ok) return;
+
+  size_t offset = companionui::kBodyFirstButtonOffset;
+  parseButtonEntries(raw, len, offset, info.buttonCount, listButtons);
+}
+
 // Reads the foreground peer's declared control scheme off the SD card. Called
 // on every foreground handover and whenever that peer pushes a new map, so an
 // app update changes the buttons without a re-pair and without a firmware mode.
@@ -463,24 +512,8 @@ void CompanionModeActivity::loadUiDeclaration() {
   companionui::DeclarationInfo info;
   if (companionui::parseBody(raw, len, &info) != companionui::ParseResult::Ok) return;
 
-  const uint8_t buttonEntries = info.buttonCount;
   size_t offset = companionui::kBodyFirstButtonOffset;
-  for (uint8_t i = 0; i < buttonEntries && offset + 3 <= len; ++i) {
-    const uint8_t buttonId = raw[offset];
-    const uint8_t routing = raw[offset + 1];
-    const uint8_t labelLen = raw[offset + 2];
-    offset += 3;
-    if (offset + labelLen > len) break;
-
-    // POWER is firmware-owned in every app: a wedged app must never be able to
-    // make the device un-sleepable.
-    if (buttonId < kButtonCount && buttonId != static_cast<uint8_t>(companionble::ButtonId::Power) &&
-        routing <= static_cast<uint8_t>(companionble::ButtonRouting::LocalSleep)) {
-      buttons[buttonId].routing = static_cast<companionble::ButtonRouting>(routing);
-      buttons[buttonId].label.assign(reinterpret_cast<const char*>(raw + offset), labelLen);
-    }
-    offset += labelLen;
-  }
+  parseButtonEntries(raw, len, offset, info.buttonCount, buttons);
 
   // Tag section. Optional — an app with no tags may simply end after its
   // buttons. Every tag starts Hidden: the declaration says what exists, not
@@ -597,6 +630,20 @@ const char* CompanionModeActivity::labelFor(companionble::ButtonId button) const
   // An empty label hides the hint entirely — the convention drawButtonHints()
   // itself checks.
   return buttons[index].routing == companionble::ButtonRouting::None ? "" : buttons[index].label.c_str();
+}
+
+// listButtons' counterpart to routingFor() -- see that member's doc comment
+// on why Screen::List does not simply consult `buttons`.
+companionble::ButtonRouting CompanionModeActivity::listRoutingFor(companionble::ButtonId button) const {
+  const size_t index = static_cast<size_t>(button);
+  return index < kButtonCount ? listButtons[index].routing : companionble::ButtonRouting::None;
+}
+
+// listButtons' counterpart to labelFor().
+const char* CompanionModeActivity::listLabelFor(companionble::ButtonId button) const {
+  const size_t index = static_cast<size_t>(button);
+  if (index >= kButtonCount) return "";
+  return listButtons[index].routing == companionble::ButtonRouting::None ? "" : listButtons[index].label.c_str();
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,6 +1096,7 @@ bool CompanionModeActivity::enterListDocument(const std::string& peerKey, Screen
   listPeerKey = peerKey;
   listReturnScreen = returnTo;
   listNav.reset();
+  loadListButtonRouting(peerKey);
   loadListDocBuf();
   reloadListView();
   screen = Screen::List;
@@ -1190,119 +1238,139 @@ void CompanionModeActivity::reloadListView(bool recountTotals) {
     listDocLoaded = true;
 }
 
+// Physical buttons handleListNav() is willing to claim on Screen::List. Power
+// is firmware-owned everywhere (see parseButtonEntries()) and never reaches
+// here.
+namespace {
+struct ListNavButton {
+  MappedInputManager::Button role;
+  companionble::ButtonId id;
+};
+constexpr ListNavButton kListNavButtons[] = {
+    {MappedInputManager::Button::Back, companionble::ButtonId::Back},
+    {MappedInputManager::Button::Confirm, companionble::ButtonId::Confirm},
+    {MappedInputManager::Button::Up, companionble::ButtonId::Up},
+    {MappedInputManager::Button::Down, companionble::ButtonId::Down},
+    {MappedInputManager::Button::Left, companionble::ButtonId::Left},
+    {MappedInputManager::Button::Right, companionble::ButtonId::Right},
+};
+}  // namespace
+
 bool CompanionModeActivity::handleListNav() {
   if (screen != Screen::List) return false;
 
-  // Unlike handleGalleryNav() above (which only takes a button the
-  // foreground peer's own map left unclaimed -- see that function's comment
-  // and docs/companion-multi-app-design.md:96-106), this claims
-  // Up/Down/Left/Right/Confirm unconditionally, without consulting
-  // routingFor() at all. That is deliberately NOT the same rule, and it is
-  // safe here specifically because a LIST peer's shape is declared and
-  // enforced before this screen is ever reached
-  // (docs/companion-declared-shape-design.md §2-§3): the device already
-  // knows, at ACQUIRE time, that this peer's button map -- built for
-  // whichever shape it *isn't* -- must not be consulted for navigation on
-  // its own list. The gallery's "only take what's unclaimed" trick exists
-  // precisely because Image has no such declared exclusivity; List doesn't
-  // need that trick because the exclusivity is already structural. The
-  // offline picker entry point (this feature's second commit) has no live
-  // peer or button map at all, so the question doesn't even arise there.
-  if (buttonWasPressed(MappedInputManager::Button::Back, companionble::ButtonId::Back)) {
-    RenderLock lock;
-    screen = listReturnScreen;
-    freeListDocBuf();  // leaving Screen::List -- see the header's audit note
-    requestUpdate();
-    return true;
-  }
-  if (buttonWasPressed(MappedInputManager::Button::Confirm, companionble::ButtonId::Confirm)) {
-    // listVisibleRows is already the window listNav.cursor() indexes into, and
-    // already carries every item's id -- so the row under the cursor is a scan
-    // of a handful of rows, not a second walk of the document.
-    const CompanionListRow* target = nullptr;
-    for (const auto& row : listVisibleRows) {
-      if (!row.isHeader && row.itemFlatIndex == static_cast<int>(listNav.cursor())) {
-        target = &row;
-        break;
+  // Which physical button performs which List action is now the browsed
+  // peer's own choice (listButtons, loaded by enterListDocument() -- see its
+  // doc comment), the same "declared, not fixed" model every other screen's
+  // ButtonRouting already uses (docs/companion-multi-app-design.md §7). There
+  // is no default: a button this peer never bound to a LocalList* routing
+  // does nothing when pressed. The press is still claimed (returns true)
+  // regardless, though -- List's declared-shape exclusivity
+  // (docs/companion-declared-shape-design.md §2-§3) means these six buttons
+  // are never meant for some other peer's general map while this screen is
+  // up, whether or not the browsed peer chose to bind them to anything.
+  for (const auto& nav : kListNavButtons) {
+    if (!buttonWasPressed(nav.role, nav.id)) continue;
+
+    switch (listRoutingFor(nav.id)) {
+      case companionble::ButtonRouting::LocalListBack: {
+        RenderLock lock;
+        screen = listReturnScreen;
+        freeListDocBuf();  // leaving Screen::List -- see the header's audit note
+        requestUpdate();
+        return true;
       }
-    }
-    // No diff (allocation failed -- see listDiff's doc comment) or nothing
-    // selectable under the cursor (an empty list): the press is still consumed,
-    // so Confirm never leaks out to some other handler from this screen.
-    if (!listDiff || target == nullptr) return true;
+      case companionble::ButtonRouting::LocalListToggleCheck: {
+        // listVisibleRows is already the window listNav.cursor() indexes into, and
+        // already carries every item's id -- so the row under the cursor is a scan
+        // of a handful of rows, not a second walk of the document.
+        const CompanionListRow* target = nullptr;
+        for (const auto& row : listVisibleRows) {
+          if (!row.isHeader && row.itemFlatIndex == static_cast<int>(listNav.cursor())) {
+            target = &row;
+            break;
+          }
+        }
+        // No diff (allocation failed -- see listDiff's doc comment) or nothing
+        // selectable under the cursor (an empty list): the press is still consumed,
+        // so it never leaks out to some other handler from this screen.
+        if (!listDiff || target == nullptr) return true;
 
-    // The resulting on-screen value is not captured: the redraw below rebuilds
-    // every row through effectiveChecked() anyway, and a second copy of the
-    // same truth is a second thing that can disagree with the diff.
-    if (!listDiff->applyToggle(target->itemId, target->documentChecked, nullptr)) {
-      // The table is full and applyToggle() mutated nothing. Saying so out loud
-      // is the point: an edit the user made and the device dropped in silence
-      // is the one failure mode this feature cannot have. Note this is reached
-      // before any RenderLock is taken -- showTransientMessage() takes its own,
-      // and the semaphore is not recursive (RenderLock.h).
-      showTransientMessage(tr(STR_COMPANION_LIST_TOO_MANY_EDITS), Screen::List);
-      return true;
-    }
-    // SD OUTSIDE THE RENDER LOCK, deliberately. The lock serialises this task
-    // against the render task, and everything the render task reads for this
-    // screen is listVisibleRows/listNav -- neither of which is touched until
-    // the locked block below. listDiff is read only by ListRowVisitor, i.e.
-    // only from inside reloadListView(), so mutating it and persisting it here
-    // races nothing; holding the lock across an SD write would instead stall
-    // the panel for the write's duration for no protection at all.
-    if (!companionpeer::writeListState(listPeerKey.c_str(), *listDiff)) {
-      // Undo rather than show a check the card did not keep. applyToggle() is
-      // its own inverse, and the second call cannot fail: it either removes
-      // the entry the first one added, or re-inserts into a slot just vacated.
-      LOG_ERR("CMA", "could not persist peer %s's list state; reverting the toggle", listPeerKey.c_str());
-      listDiff->applyToggle(target->itemId, target->documentChecked, nullptr);
-      return true;
-    }
-    // Announce only after the write succeeded, so the phone is never told to
-    // pull a state the card does not hold. A peer that is connected while the
-    // user works through the list learns each edit live instead of only at its
-    // next HELLO.
-    companionble::notifyListStateAvail(listPeerKey.c_str());
+        // The resulting on-screen value is not captured: the redraw below rebuilds
+        // every row through effectiveChecked() anyway, and a second copy of the
+        // same truth is a second thing that can disagree with the diff.
+        if (!listDiff->applyToggle(target->itemId, target->documentChecked, nullptr)) {
+          // The table is full and applyToggle() mutated nothing. Saying so out loud
+          // is the point: an edit the user made and the device dropped in silence
+          // is the one failure mode this feature cannot have. Note this is reached
+          // before any RenderLock is taken -- showTransientMessage() takes its own,
+          // and the semaphore is not recursive (RenderLock.h).
+          showTransientMessage(tr(STR_COMPANION_LIST_TOO_MANY_EDITS), Screen::List);
+          return true;
+        }
+        // SD OUTSIDE THE RENDER LOCK, deliberately. The lock serialises this task
+        // against the render task, and everything the render task reads for this
+        // screen is listVisibleRows/listNav -- neither of which is touched until
+        // the locked block below. listDiff is read only by ListRowVisitor, i.e.
+        // only from inside reloadListView(), so mutating it and persisting it here
+        // races nothing; holding the lock across an SD write would instead stall
+        // the panel for the write's duration for no protection at all.
+        if (!companionpeer::writeListState(listPeerKey.c_str(), *listDiff)) {
+          // Undo rather than show a check the card did not keep. applyToggle() is
+          // its own inverse, and the second call cannot fail: it either removes
+          // the entry the first one added, or re-inserts into a slot just vacated.
+          LOG_ERR("CMA", "could not persist peer %s's list state; reverting the toggle", listPeerKey.c_str());
+          listDiff->applyToggle(target->itemId, target->documentChecked, nullptr);
+          return true;
+        }
+        // Announce only after the write succeeded, so the phone is never told to
+        // pull a state the card does not hold. A peer that is connected while the
+        // user works through the list learns each edit live instead of only at its
+        // next HELLO.
+        companionble::notifyListStateAvail(listPeerKey.c_str());
 
-    RenderLock lock;
-    // Full re-walk rather than poking the one row: the row vector is rebuilt
-    // from the document on every other view change too, and one in-RAM parse
-    // is cheaper than a second code path that has to stay consistent with it.
-    reloadListView(/*recountTotals=*/false);
-    requestUpdate();
-    return true;
-  }
-  if (buttonWasPressed(MappedInputManager::Button::Up, companionble::ButtonId::Up)) {
-    if (listNav.moveUp()) {
-      RenderLock lock;
-      reloadListView(/*recountTotals=*/false);
-      requestUpdate();
+        RenderLock lock;
+        // Full re-walk rather than poking the one row: the row vector is rebuilt
+        // from the document on every other view change too, and one in-RAM parse
+        // is cheaper than a second code path that has to stay consistent with it.
+        reloadListView(/*recountTotals=*/false);
+        requestUpdate();
+        return true;
+      }
+      case companionble::ButtonRouting::LocalListMoveUp:
+        if (listNav.moveUp()) {
+          RenderLock lock;
+          reloadListView(/*recountTotals=*/false);
+          requestUpdate();
+        }
+        return true;
+      case companionble::ButtonRouting::LocalListMoveDown:
+        if (listNav.moveDown()) {
+          RenderLock lock;
+          reloadListView(/*recountTotals=*/false);
+          requestUpdate();
+        }
+        return true;
+      case companionble::ButtonRouting::LocalListSwitchLeft:
+        if (listNav.switchListLeft()) {
+          RenderLock lock;
+          reloadListView();
+          requestUpdate();
+        }
+        return true;
+      case companionble::ButtonRouting::LocalListSwitchRight:
+        if (listNav.switchListRight()) {
+          RenderLock lock;
+          reloadListView();
+          requestUpdate();
+        }
+        return true;
+      default:
+        // Not bound to a List action by this peer -- claimed, no-op. See the
+        // comment above on why this still returns true rather than falling
+        // through to handleMappedButton().
+        return true;
     }
-    return true;
-  }
-  if (buttonWasPressed(MappedInputManager::Button::Down, companionble::ButtonId::Down)) {
-    if (listNav.moveDown()) {
-      RenderLock lock;
-      reloadListView(/*recountTotals=*/false);
-      requestUpdate();
-    }
-    return true;
-  }
-  if (buttonWasPressed(MappedInputManager::Button::Left, companionble::ButtonId::Left)) {
-    if (listNav.switchListLeft()) {
-      RenderLock lock;
-      reloadListView();
-      requestUpdate();
-    }
-    return true;
-  }
-  if (buttonWasPressed(MappedInputManager::Button::Right, companionble::ButtonId::Right)) {
-    if (listNav.switchListRight()) {
-      RenderLock lock;
-      reloadListView();
-      requestUpdate();
-    }
-    return true;
   }
   return false;
 }
@@ -2608,14 +2676,25 @@ void CompanionModeActivity::renderList() {
   }
 
   if (!mappedInput.hasTouch()) {
-    // No app button map is consulted on this screen (see handleListNav()'s
-    // comment), so these hints are fixed strings, not labelFor() -- there is
-    // no declared label to show. Left/Right hidden entirely when there is
-    // only one list to switch between, same "hide, don't grey out"
-    // convention renderPage() uses for page-turn buttons at either end.
-    const char* leftLabel = listNav.listCount() > 1 ? tr(STR_COMPANION_LIST_PREV) : "";
-    const char* rightLabel = listNav.listCount() > 1 ? tr(STR_COMPANION_LIST_NEXT) : "";
-    const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", leftLabel, rightLabel);
+    // Hints come straight from the browsed peer's declared labels (see
+    // listLabelFor()), the same idiom Screen::Text uses for its own map --
+    // there is no fixed physical meaning left to show a fixed string for. A
+    // switch-list button's hint is hidden when there is only one list to
+    // switch between, same "hide, don't grey out" convention renderPage()
+    // uses for page-turn buttons at either end.
+    const char* backLabel = listLabelFor(companionble::ButtonId::Back);
+    const char* confirmLabel = listLabelFor(companionble::ButtonId::Confirm);
+    const char* leftLabel = listLabelFor(companionble::ButtonId::Left);
+    const char* rightLabel = listLabelFor(companionble::ButtonId::Right);
+    if (listRoutingFor(companionble::ButtonId::Left) == companionble::ButtonRouting::LocalListSwitchLeft &&
+        listNav.listCount() <= 1) {
+      leftLabel = "";
+    }
+    if (listRoutingFor(companionble::ButtonId::Right) == companionble::ButtonRouting::LocalListSwitchRight &&
+        listNav.listCount() <= 1) {
+      rightLabel = "";
+    }
+    const auto labels = mappedInput.mapLabels(backLabel, confirmLabel, leftLabel, rightLabel);
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   }
 

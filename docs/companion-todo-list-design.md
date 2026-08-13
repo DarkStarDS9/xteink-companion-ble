@@ -297,11 +297,14 @@ the 23-byte layout unchanged.
 - `Screen::List` added to `src/activities/companion/CompanionModeActivity.h:26-35`.
 - Navigation, entirely local, no protocol surface — same "screen-local, no BLE notification" class as
   the existing gallery Up/Down paging (`src/activities/companion/CompanionModeActivity.cpp:792`
-  onward) and local text pagination:
-  - Up/Down: move item cursor, paging the visible window when it runs off-screen.
-  - Left/Right: switch between lists within the document.
-  - Confirm: toggle checked on the item under cursor.
-  - Back: leave `Screen::List`, back to the icon grid.
+  onward) and local text pagination. Which physical button performs which of these is the browsed
+  peer's own choice, declared via `LOCAL_LIST_*` `ButtonRouting` values (§7 of the multi-app design)
+  in its own button map — there is no fixed or default physical binding, so a `LIST` peer that
+  declares none of them leaves every button dead on this screen. The available actions:
+  - Move cursor up / down: move the item cursor, paging the visible window when it runs off-screen.
+  - Switch list left / right: switch between lists within the document.
+  - Toggle check: toggle checked on the item under cursor.
+  - Back: leave `Screen::List`, back to wherever it was entered from.
 - A toggle writes through to `list_state.bin` immediately (small, infrequent writes — nothing like
   the per-CHUNK write rate of an image push), via the same temp-file-then-rename discipline
   `lists.bin` uses, so a mid-write failure cannot clobber previously-good edits. It records a
@@ -320,16 +323,26 @@ the 23-byte layout unchanged.
   not a protocol one.
 - What `Screen::List` draws is the document's `checked` **overridden by the diff**; the two agree by
   construction immediately after a push, since storing a document clears the diff.
-- This is the one place a button's meaning isn't declared by the peer's `ButtonRouting` map (§7 of
-  the multi-app design) — it's implicit in being on `Screen::List`, the same way gallery Up/Down and
-  text pagination are already implicit in their screens rather than routed. No new `ButtonRouting`
-  enum value needed.
+- A button's meaning here **is** declared by the peer's `ButtonRouting` map, the same as every other
+  screen — six `LOCAL_LIST_*` enum values (§7 of the multi-app design) cover move-cursor-up/down,
+  switch-list-left/right, toggle-check, and back. Unlike the gallery's Up/Down or text pagination,
+  which are implicit in their screens, a user found the previous hardcoded physical bindings
+  backwards on their reader and asked for them to be configurable per app, the same way every other
+  screen's routing already is.
 - **What makes that safe is the declared shape**, not the screen state. The gallery gets away with
   claiming Up/Down only because it takes them when the peer's own map left them unclaimed
-  (`docs/companion-multi-app-design.md:96-106`); a list needs Up/Down/Left/Right/Confirm, which is
-  too much of the device to negotiate that way. Because a `LIST` peer declared itself as one before
-  it ever reached the screen, its button map and the list's own navigation are known not to conflict
-  up front, rather than being reconciled per redraw.
+  (`docs/companion-multi-app-design.md:96-106`); List instead claims all six of its buttons
+  unconditionally once pressed (`handleListNav()`), consulting the browsed peer's own map to decide
+  what — if anything — each one does. Because a `LIST` peer declared itself as one before it ever
+  reached the screen, its button map is known to be exclusively for its own list, so it is free to
+  use `LOCAL_LIST_*` values without any collision risk against a Text/Image peer's routing.
+- The map consulted is **the browsed peer's**, not necessarily the live foreground peer's: the
+  offline icon-grid picker can open a `LIST` peer's document with no session at all, so
+  `enterListDocument()` loads that peer's button map fresh off SD
+  (`CompanionModeActivity::loadListButtonRouting()`) into a `listButtons` array kept separate from
+  `buttons` (the foreground peer's own map, used by every other screen). For a live foreground `LIST`
+  peer the two happen to name the same peer, but the lookup is still through `listButtons` — there is
+  no special-casing between the two entry points.
 
 ## 6. Sync model
 

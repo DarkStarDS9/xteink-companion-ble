@@ -68,6 +68,18 @@ const char* routingName(companionble::ButtonRouting routing) {
       return "page_next";
     case companionble::ButtonRouting::LocalSleep:
       return "sleep";
+    case companionble::ButtonRouting::LocalListMoveUp:
+      return "list_move_up";
+    case companionble::ButtonRouting::LocalListMoveDown:
+      return "list_move_down";
+    case companionble::ButtonRouting::LocalListSwitchLeft:
+      return "list_switch_left";
+    case companionble::ButtonRouting::LocalListSwitchRight:
+      return "list_switch_right";
+    case companionble::ButtonRouting::LocalListToggleCheck:
+      return "list_toggle_check";
+    case companionble::ButtonRouting::LocalListBack:
+      return "list_back";
   }
   return "?";
 }
