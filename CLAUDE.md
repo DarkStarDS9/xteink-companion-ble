@@ -188,6 +188,28 @@ be recreated by hand in a fresh clone. Note `git worktree remove` refuses outrig
 submodules (`--force` does not override), so pruning is report-only here; stale worktrees run to
 gigabytes each and need deleting by hand.
 
+**A worktree's branch is a static fork point — it does not track `companion` moving forward.**
+`companion` can (and does) gain commits after a worktree is provisioned but before that worktree's
+session actually starts doing work — the worktree just sits at whatever `companion` looked like when
+it forked, however long ago that was. This showed up for real on 2026-08-15: a worktree forked before
+`c48a7818` landed on `companion` tried to land its own peer-store changes hours later and hit a
+cherry-pick conflict against code it had never seen, in a file it had no reason to think anyone else
+had touched. `prune-worktree-bridges.sh` does not catch this — it only runs from the main checkout,
+explicitly skips locked (live-session) worktrees, and checks landed-ness, not currency.
+
+`.claude/hooks/sync-worktree-bridge.sh` is the fix: a second `SessionStart` hook that runs *from
+inside* a bridge worktree (the case the prune hook always skips), checks how far `HEAD` is behind
+`companion`, and auto-merges when it's safe to (working tree clean, merge produces no conflicts).
+When it isn't safe — dirty tree, or the merge itself conflicts — it reports the drift and leaves the
+worktree untouched rather than forcing anything, so this is not a substitute for reading the output:
+if it reports conflicts, resolve them (`git merge companion`) before relying on files it touches being
+current. **This hook only fires if it and `.claude/settings.json` are present in the worktree's own
+`.claude/` directory** — both are gitignored per-worktree same as in a fresh clone, and nothing
+copies them there automatically today. If `.claude/hooks/sync-worktree-bridge.sh` is missing from a
+worktree, copy both it and `prune-worktree-bridges.sh` plus `.claude/settings.json` from the main
+checkout before starting substantive work — or at minimum run `git rev-list --count HEAD..companion`
+by hand and merge if it's nonzero.
+
 ## Docs that are upstream's, not ours
 
 `GOVERNANCE.md`, `docs/contributing/`, and `docs/translators.md` describe upstream's community
