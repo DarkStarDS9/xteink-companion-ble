@@ -1821,8 +1821,8 @@ void CompanionModeActivity::selectGalleryPickerPeer() {
 
 // Input for the picker itself and for leaving a gallery reached through it.
 // Tried before the foreground-button dispatch in loop(), same as
-// handleGalleryNav(). IconGrid/GalleryPicker navigation (Up/Down/Confirm) is
-// firmware-owned with no button map involved at all -- those are picker
+// handleGalleryNav(). IconGrid/GalleryPicker navigation (Up/Down/Left/Right/Confirm)
+// is firmware-owned with no button map involved at all -- those are picker
 // chrome, not a peer's own screen. The one exception is the browsed gallery's
 // Back below, which -- like Up/Down inside it (handleGalleryNav()) -- now
 // consults `buttons`, the browsed peer's own declared map (most peers in the
@@ -1842,13 +1842,19 @@ bool CompanionModeActivity::handlePickerInput() {
     // non-empty (its own empty case clears the flag and falls back to the
     // idle screen instead of ever landing here)
     if (pickerPeerKeys.empty()) return false;
-    if (buttonWasPressed(MappedInputManager::Button::Up, companionble::ButtonId::Up)) {
+    // Side Up/Down and the front-labeled </> (Left/Right) are both accepted here --
+    // the button-hint row (see mapLabels() near the GalleryPicker render path) prints
+    // </> on the user-configured front Left/Right buttons, so those must actually
+    // move the cursor, not just the unlabeled side buttons.
+    if (buttonWasPressed(MappedInputManager::Button::Up, companionble::ButtonId::Up) ||
+        buttonWasPressed(MappedInputManager::Button::Left, companionble::ButtonId::Left)) {
       RenderLock lock;
       pickerCursor = pickerCursor == 0 ? pickerPeerKeys.size() - 1 : pickerCursor - 1;
       requestUpdate();
       return true;
     }
-    if (buttonWasPressed(MappedInputManager::Button::Down, companionble::ButtonId::Down)) {
+    if (buttonWasPressed(MappedInputManager::Button::Down, companionble::ButtonId::Down) ||
+        buttonWasPressed(MappedInputManager::Button::Right, companionble::ButtonId::Right)) {
       RenderLock lock;
       pickerCursor = pickerCursor + 1 >= pickerPeerKeys.size() ? 0 : pickerCursor + 1;
       requestUpdate();
@@ -2804,10 +2810,11 @@ void CompanionModeActivity::renderGalleryPicker() {
   }
 
   if (!mappedInput.hasTouch()) {
-    // handlePickerInput()'s GalleryPicker branch only ever reads Up/Down
-    // (cursor through the flat tile list) plus Confirm/Back -- no Left/Right,
-    // despite the grid layout -- so this is the same 4-slot back/confirm/prev/next
-    // idiom every other local activity uses, e.g. FileBrowserActivity.cpp.
+    // handlePickerInput()'s GalleryPicker branch reads Up/Down (side buttons)
+    // and Left/Right (front buttons, labeled below) interchangeably to move
+    // the cursor through the flat tile list, plus Confirm/Back -- the same
+    // 4-slot back/confirm/prev/next idiom every other local activity uses,
+    // e.g. FileBrowserActivity.cpp.
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_OPEN), "<", ">");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   }
