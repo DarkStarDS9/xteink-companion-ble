@@ -773,6 +773,35 @@ void forgetAllPeers() {
   LOG_INF("CPEER", "all peers forgotten");
 }
 
+size_t forgetPeersWithNamePrefix(const char* prefix) {
+  const size_t prefixLen = strlen(prefix);
+  JsonDocument doc;
+  if (!loadIndex(doc) || prefixLen == 0) return 0;
+
+  JsonArray peers = doc["peers"].as<JsonArray>();
+  size_t removed = 0;
+  // Build the surviving set separately rather than erasing while iterating --
+  // JsonArray::remove() invalidates in-flight iterators in ArduinoJson v7.
+  JsonDocument kept;
+  JsonArray keptPeers = kept["peers"].to<JsonArray>();
+  for (JsonObject entry : peers) {
+    const char* name = entry["name"] | "";
+    const char* key = entry["key"] | "";
+    if (strncmp(name, prefix, prefixLen) == 0) {
+      if (key[0] != '\0') removePeerDir(key);
+      ++removed;
+    } else {
+      keptPeers.add(entry);
+    }
+  }
+  if (removed == 0) return 0;
+
+  kept["seq"] = doc["seq"] | 0u;
+  saveIndex(kept);
+  LOG_INF("CPEER", "forgot %u peer(s) matching name prefix '%s'", static_cast<unsigned>(removed), prefix);
+  return removed;
+}
+
 bool anyEnrolled() {
   JsonDocument doc;
   if (!loadIndex(doc)) return false;

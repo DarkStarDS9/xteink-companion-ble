@@ -212,6 +212,11 @@ APP_A = uuid.UUID("2f1d7b64-9c3e-4a55-8f21-0c7b5e9a3d10").bytes
 APP_B = uuid.UUID("7ac41e08-5d62-4f1b-9e33-1b8c4d2f60a5").bytes
 APP_C = uuid.UUID("c4a91f27-38b0-4d6e-a1f9-2e5d70c8b431").bytes
 
+# Every Session this harness creates must use this as its display-name prefix.
+# CRESETTEST (src/CompanionTestConsole.cpp) only deletes peers whose stored
+# name starts with it -- keep this in sync with kTestPeerNamePrefix there.
+TEST_PEER_NAME_PREFIX = "[E2E] "
+
 DEFAULT_TAGS = [(0, "Saved"), (1, "New")]
 
 DEFAULT_MAP = [
@@ -643,7 +648,15 @@ class Console:
         time.sleep(0.35 + hold_ms / 1000.0)
 
     def reset_peers(self) -> None:
-        self.send("CRESET", expect="reset")
+        """Wipes only peers this harness created (name prefix TEST_PEER_NAME_PREFIX).
+
+        Deliberately CRESETTEST, not the full CRESET: a reader's SD card can
+        carry real, manually-paired app registrations (snap2ink, SpokenFeeds,
+        ...) alongside whatever the harness left behind, and a full CRESET
+        cannot tell those apart -- see the 2026-08-14 incident where a bare
+        CRESET run wiped every snap2ink registration on a shared test reader.
+        """
+        self.send("CRESETTEST", expect="reset")
         time.sleep(0.5)
 
     def screenshot(self, timeout: float = 35.0, attempts: int = 3) -> bytes:
@@ -1105,9 +1118,9 @@ async def run_tests(args, console: Console, results: Results) -> None:
     #
     # A is the TEXT peer and B the IMAGE peer for the whole run (see APP_A/APP_B
     # above); C only ever pushes a shapeless declaration, to be refused.
-    session_a = Session(APP_A, "Harness Text")
-    session_b = Session(APP_B, "Harness Image")
-    session_c = Session(APP_C, "Harness Shapeless")
+    session_a = Session(APP_A, TEST_PEER_NAME_PREFIX + "Harness Text")
+    session_b = Session(APP_B, TEST_PEER_NAME_PREFIX + "Harness Image")
+    session_c = Session(APP_C, TEST_PEER_NAME_PREFIX + "Harness Shapeless")
     # See "A note on write types" in this file's docstring: text over WWR so a
     # batch fits the device's 3 s commit window, the image left on Write so a
     # couple of hundred unflow-controlled writes can't drop their own chunks.
@@ -3289,7 +3302,7 @@ async def run_soak(args, console: Console, results: Results) -> None:
         disconnect_at.append(time.time())
         disconnected.set()
 
-    session = Session(APP_A, "Soak Harness")
+    session = Session(APP_A, TEST_PEER_NAME_PREFIX + "Soak Harness")
     start = time.time()
 
     async with BleakClient(device.address, disconnected_callback=on_disconnect) as client:
@@ -3375,7 +3388,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--port", required=True, help="Serial port of a firmware built with -e test")
     parser.add_argument("--only", default=None, help="Comma-separated subset of test groups to run")
-    parser.add_argument("--keep-peers", action="store_true", help="Skip the CRESET that starts from unpaired")
+    parser.add_argument(
+        "--keep-peers", action="store_true",
+        help="Skip the pre-run CRESETTEST (peers from a prior harness run are reused instead of recreated)",
+    )
     parser.add_argument(
         "--articles", type=int, default=3,
         help="[spokenfeeds] number of article pushes to run, each timed and awaited (default: 3)",
@@ -3401,9 +3417,9 @@ def main() -> None:
     print("Serial test console is live.")
 
     if not args.keep_peers:
-        print("Resetting the device to never-paired...")
+        print("Clearing this harness's peers from any prior run...")
         console.reset_peers()
-        # CRESET deletes the peer directories out from under whatever the
+        # CRESETTEST deletes the peer directories out from under whatever the
         # activity is currently showing, so a device still displaying the
         # previous run's image logs a failed reload ([RAW2BPP] cannot open
         # .../images/img_N.raw). That is the reset doing its job, not this
@@ -3423,6 +3439,13 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        # Unconditional, regardless of --keep-peers or how the run above
+        # exited: CRESETTEST only ever touches peers this run's own Sessions
+        # created (TEST_PEER_NAME_PREFIX), so it never costs real app data,
+        # and skipping it on a crash is how test peers would otherwise pile
+        # up toward the 32-peer cap and start evicting real registrations.
+        print("Cleaning up peers this run created...")
+        console.reset_peers()
         console.close()
     sys.exit(results.report())
 

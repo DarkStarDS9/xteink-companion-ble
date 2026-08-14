@@ -19,6 +19,12 @@ namespace {
 // parsing timestamps or guessing at line shapes.
 constexpr const char* kPrefix = "CT:";
 
+// Every peer companion_e2e_test.py enrolls must use a display name starting
+// with this, so CRESETTEST can tell "harness left this behind" apart from a
+// real app registration. Keep in sync with TEST_PEER_NAME_PREFIX in
+// scripts/companion_protocol.py.
+constexpr const char* kTestPeerNamePrefix = "[E2E] ";
+
 // One virtual press at a time, matching the hardware: InputManager::getHeldTime()
 // is a single global timer because only one physical button can be down at once,
 // and injection has to behave the same way or it would test a path the device
@@ -206,6 +212,16 @@ bool handleCommand(const String& command) {
     // re-tested without physically clearing the SD card between runs.
     companionpeer::forgetAllPeers();
     reply("reset ok");
+    return true;
+  }
+  if (command == "CRESETTEST") {
+    // Same idea as CRESET but scoped to peers the harness itself created --
+    // every one it enrolls is named with kTestPeerNamePrefix. Leaves real,
+    // manually-paired app registrations (snap2ink, SpokenFeeds, ...) alone,
+    // so running the e2e suite against a reader that also has real app data
+    // on its SD card no longer costs that data.
+    const size_t removed = companionpeer::forgetPeersWithNamePrefix(kTestPeerNamePrefix);
+    reply("reset ok removed=%u", static_cast<unsigned>(removed));
     return true;
   }
   if (command.startsWith("CLS")) {

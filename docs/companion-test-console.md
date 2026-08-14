@@ -76,6 +76,7 @@ so a host can pick replies out of the log stream without parsing timestamps.
 | `CMD:CLISTNAV` | `CT:listnav listIndex=… listCount=… cursor=… windowStart=… itemCount=…`, or `CT:listnav none: not on Screen::List` | Live ToDo List cursor/paging position — see below |
 | `CMD:CBTN <id> [holdMs]` | `CT:btn id=… hold=…` | Inject a button press |
 | `CMD:CRESET` | `CT:reset ok` | Delete all peer state — back to never-paired |
+| `CMD:CRESETTEST` | `CT:reset ok removed=N` | Delete only peers named with the harness's `[E2E] ` prefix |
 
 Button ids match the protocol's own: `0` BACK, `1` CONFIRM, `2` LEFT, `3` RIGHT,
 `4` UP, `5` DOWN, `6` POWER.
@@ -138,11 +139,24 @@ past the viewport); `itemCount` is the current list's item count, ignoring
 group headers — all four are `companiontodo::Nav`'s own accessors
 (`src/CompanionTodoNav.h`), reported verbatim.
 
-### `CRESET`
+### `CRESET` / `CRESETTEST`
 
-Deletes every peer directory and the index. Without it, re-testing first-contact
-enrollment means physically pulling the SD card between runs, which is the kind
-of friction that stops a test suite from being run.
+`CRESET` deletes every peer directory and the index. Without something like it,
+re-testing first-contact enrollment means physically pulling the SD card between
+runs, which is the kind of friction that stops a test suite from being run.
+
+`companion_e2e_test.py` does not use plain `CRESET` — a reader's SD card can
+carry real, manually-paired app registrations (snap2ink, SpokenFeeds, ...)
+alongside the harness's own, and `CRESET` cannot tell those apart. Every
+`Session` the harness creates is named with the `TEST_PEER_NAME_PREFIX`
+(`"[E2E] "`) prefix (`scripts/companion_e2e_test.py`), and `CRESETTEST` only
+deletes peers whose stored name starts with that — see
+`companionpeer::forgetPeersWithNamePrefix()` (`src/CompanionPeerStore.cpp`).
+The harness runs it both before a run (unless `--keep-peers`) and
+unconditionally in a `finally` block after, so a crash mid-run doesn't leave
+test peers behind to pile up toward the 32-peer cap and start evicting real
+registrations. Plain `CRESET` remains for manual use — e.g. actually wanting to
+return the device to never-paired.
 
 ## Typical session
 

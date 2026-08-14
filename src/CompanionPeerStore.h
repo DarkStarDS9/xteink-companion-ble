@@ -352,6 +352,12 @@ bool hasIcon(const char* peerKey);
 // physically clearing the SD card between runs.
 void forgetAllPeers();
 
+// Deletes only peers whose stored display name starts with `prefix`. For a
+// host harness that tags every peer it creates (see CompanionTestConsole's
+// CRESETTEST) so repeated test runs don't cost real, manually-paired app
+// registrations their SD-card state. Returns how many peers were removed.
+size_t forgetPeersWithNamePrefix(const char* prefix);
+
 // True if any peer is enrolled at all. Drives "Waiting for phone" vs the icon
 // grid on an idle device.
 bool anyEnrolled();
