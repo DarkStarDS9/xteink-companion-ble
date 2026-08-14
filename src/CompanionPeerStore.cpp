@@ -802,6 +802,22 @@ size_t forgetPeersWithNamePrefix(const char* prefix) {
   return removed;
 }
 
+bool forgetPeer(const char* peerKey) {
+  JsonDocument doc;
+  if (!loadIndex(doc)) return false;
+  JsonArray peers = doc["peers"].as<JsonArray>();
+  for (size_t i = 0; i < peers.size(); ++i) {
+    const char* key = peers[i]["key"] | "";
+    if (strcmp(key, peerKey) != 0) continue;
+    removePeerDir(peerKey);
+    peers.remove(i);
+    saveIndex(doc);
+    LOG_INF("CPEER", "peer %s forgotten", peerKey);
+    return true;
+  }
+  return false;
+}
+
 bool anyEnrolled() {
   JsonDocument doc;
   if (!loadIndex(doc)) return false;

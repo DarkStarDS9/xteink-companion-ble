@@ -77,6 +77,7 @@ so a host can pick replies out of the log stream without parsing timestamps.
 | `CMD:CBTN <id> [holdMs]` | `CT:btn id=… hold=…` | Inject a button press |
 | `CMD:CRESET` | `CT:reset ok` | Delete all peer state — back to never-paired |
 | `CMD:CRESETTEST` | `CT:reset ok removed=N` | Delete only peers named with the harness's `[E2E] ` prefix |
+| `CMD:CFORGET <key>` | `CT:forget ok key=…` or `CT:forget error: no such peer key=…` | Delete one enrolled peer by key, leaving the rest intact |
 
 Button ids match the protocol's own: `0` BACK, `1` CONFIRM, `2` LEFT, `3` RIGHT,
 `4` UP, `5` DOWN, `6` POWER.
@@ -157,6 +158,12 @@ unconditionally in a `finally` block after, so a crash mid-run doesn't leave
 test peers behind to pile up toward the 32-peer cap and start evicting real
 registrations. Plain `CRESET` remains for manual use — e.g. actually wanting to
 return the device to never-paired.
+
+### `CFORGET <key>`
+
+Deletes one peer's directory and its `peers.json` entry, by the 8-hex-char key
+`CPEERS` reports — for clearing a single stray/leftover peer (e.g. from an
+aborted harness run) without `CRESET`'s blanket wipe of every enrolled app.
 
 ## Typical session
 

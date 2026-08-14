@@ -224,6 +224,20 @@ bool handleCommand(const String& command) {
     reply("reset ok removed=%u", static_cast<unsigned>(removed));
     return true;
   }
+  if (command.startsWith("CFORGET")) {
+    // Deletes one enrolled peer by key, leaving every other peer intact --
+    // for clearing a stray/leftover peer that doesn't carry the harness's
+    // kTestPeerNamePrefix (so CRESETTEST above wouldn't touch it either).
+    String arg = command.substring(7);
+    arg.trim();
+    if (arg.isEmpty()) {
+      reply("forget error: usage CFORGET <key>");
+      return true;
+    }
+    const bool removed = companionpeer::forgetPeer(arg.c_str());
+    reply(removed ? "forget ok key=%s" : "forget error: no such peer key=%s", arg.c_str());
+    return true;
+  }
   if (command.startsWith("CLS")) {
     // Ad hoc SD directory listing for debugging the image gallery on real
     // hardware — not something a client needs, so it's not wired through the

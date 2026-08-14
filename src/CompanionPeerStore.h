@@ -358,6 +358,10 @@ void forgetAllPeers();
 // registrations their SD-card state. Returns how many peers were removed.
 size_t forgetPeersWithNamePrefix(const char* prefix);
 
+// Deletes one peer's directory and its index entry, leaving every other peer
+// untouched. Returns false if no peer with this key is enrolled.
+bool forgetPeer(const char* peerKey);
+
 // True if any peer is enrolled at all. Drives "Waiting for phone" vs the icon
 // grid on an idle device.
 bool anyEnrolled();
