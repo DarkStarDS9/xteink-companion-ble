@@ -2422,6 +2422,27 @@ async def run_tests(args, console: Console, results: Results) -> None:
                         entries == [(1, 1)],
                         f"revision {revision}, entries {entries}",
                     ):
+                        # THE SKIP-AHEAD ASSERTION. Checking Milk off also
+                        # auto-advances the cursor -- and Eggs (flat index 1)
+                        # is already checked=1 in the document, so a cursor
+                        # that only ever steps by one would land on it, right
+                        # back on an already-done row. The fix under test
+                        # skips straight to Apples (flat index 2), the next
+                        # item that is actually unchecked.
+                        nav = console.list_nav()
+                        results.check(
+                            "list-toggle: checking Milk skips the already-checked Eggs and lands on Apples",
+                            bool(nav) and nav.get("cursor") == 2,
+                            f"listnav {nav}",
+                        )
+
+                        # Back to Milk (Up doesn't skip -- only the auto-advance
+                        # on check does) so the removal assertion below is
+                        # actually exercising Milk, not whatever the cursor
+                        # happened to land on.
+                        console.press(BTN_UP)
+                        console.press(BTN_UP)
+
                         # THE REMOVAL ASSERTION. Toggling back is not "store 0" --
                         # the entry has to disappear, because the file records
                         # what differs from the document and nothing differs any
@@ -2607,8 +2628,17 @@ async def run_tests(args, console: Console, results: Results) -> None:
                     # and it leaves one behind for its own gate assertions to
                     # clear.
 
-                    # Two deviations to sync. The document was just re-pushed
-                    # clean, so the cursor is at flat index 0.
+                    # Two deviations to sync. A re-push clears the diff but
+                    # does not reset the cursor (only enterListDocument()'s
+                    # listNav.reset() does that, and re-pushing over an
+                    # already-open document never calls it -- see
+                    # reloadListView()'s call site in CompanionModeActivity.cpp),
+                    # so whatever earlier presses in this group left the cursor
+                    # on (Apples, flat index 2, after checking Milk skipped
+                    # past the already-checked Eggs) is still where it is.
+                    # Walk it back to Milk explicitly rather than assume 0.
+                    console.press(BTN_UP)
+                    console.press(BTN_UP)
                     console.press(BTN_CONFIRM)
                     console.press(BTN_DOWN)
                     console.press(BTN_CONFIRM)

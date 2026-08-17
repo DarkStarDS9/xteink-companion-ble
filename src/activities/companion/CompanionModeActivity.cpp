@@ -316,6 +316,46 @@ class ListRowVisitor : public companiontodo::Visitor {
   bool groupHeaderEmitted_ = false;
 };
 
+// Finds the flat index of the first *unchecked* item strictly after
+// `afterIndex` in the target list, walking effectiveChecked() (diff-adjusted)
+// state the same way ListRowVisitor does. Used by LocalListToggleCheck's
+// auto-advance so checking an item skips over any already-checked items
+// below it instead of landing the cursor on one -- and, when nothing after
+// `afterIndex` is unchecked (including "no items after it at all"), found()
+// stays -1 so the caller knows not to move at all rather than walking off
+// the end of a list whose remaining items are all done.
+class ListNextUncheckedVisitor : public companiontodo::Visitor {
+ public:
+  ListNextUncheckedVisitor(int targetListIndex, uint16_t afterIndex, const companiontodo::Diff* diff)
+      : targetListIndex_(targetListIndex), afterIndex_(afterIndex), diff_(diff) {}
+
+  void onListStart(uint16_t, const char*, uint8_t) override {
+    inTarget_ = (static_cast<int>(listIndex_) == targetListIndex_);
+  }
+  void onItem(uint16_t itemId, bool checked, const char*, uint8_t) override {
+    if (inTarget_ && found_ < 0 && itemIndex_ > afterIndex_) {
+      const bool effChecked = diff_ ? diff_->effectiveChecked(itemId, checked) : checked;
+      if (!effChecked) found_ = static_cast<int>(itemIndex_);
+    }
+    itemIndex_++;
+  }
+  void onListEnd(uint16_t) override {
+    listIndex_++;
+    inTarget_ = false;
+  }
+
+  int found() const { return found_; }
+
+ private:
+  int targetListIndex_;
+  uint16_t afterIndex_;
+  const companiontodo::Diff* diff_;
+  uint16_t listIndex_ = 0;
+  bool inTarget_ = false;
+  uint32_t itemIndex_ = 0;
+  int found_ = -1;
+};
+
 }  // namespace
 
 #ifdef COMPANION_TEST_CONSOLE
@@ -1592,11 +1632,23 @@ bool CompanionModeActivity::handleListNav() {
         // next HELLO.
         companionble::notifyListStateAvail(listPeerKey.c_str());
 
-        // Checking an item off moves the cursor to the next one, so working
-        // down a list is a single button held rather than a check-then-move
-        // pair; there's no move on an uncheck (no use case for it yet -- YAGNI)
-        // and none at the last item, where there's nothing to advance to.
-        const bool advanced = newChecked && listNav.moveDown();
+        // Checking an item off moves the cursor to the next *unchecked* one
+        // (skipping any already-checked items in between), so working down a
+        // list is a single button held rather than a check-then-move pair;
+        // there's no move on an uncheck (no use case for it yet -- YAGNI) and
+        // none when nothing after the cursor is left unchecked -- including
+        // the last item, and a list whose remaining items are all done.
+        bool advanced = false;
+        if (newChecked) {
+          ListNextUncheckedVisitor next(static_cast<int>(listNav.listIndex()), listNav.cursor(), listDiff.get());
+          if (companiontodo::parseDocument(listDocBuf.get(), listDocBufLen, next) ==
+                  companiontodo::ParseResult::Ok &&
+              next.found() >= 0) {
+            while (static_cast<int>(listNav.cursor()) < next.found() && listNav.moveDown()) {
+            }
+            advanced = true;
+          }
+        }
 
         RenderLock lock;
         // Full re-walk rather than poking the one row: the row vector is rebuilt
