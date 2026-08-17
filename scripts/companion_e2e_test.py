@@ -2771,12 +2771,15 @@ async def run_tests(args, console: Console, results: Results) -> None:
                             verdict == RENDER_DISPLAYED,
                             f"result {RENDER_RESULTS.get(verdict, verdict)}",
                         ):
-                            # Confirm toggles the item under the cursor, Down
-                            # advances it -- the real button seam, so this walks
-                            # the same path a user's thumb does.
+                            # Confirm toggles the item under the cursor and --
+                            # since every item here starts unchecked -- also
+                            # auto-advances to the next one on its own (the
+                            # skip-already-checked fix's plain case), so this
+                            # is the real button seam a user's thumb presses:
+                            # Confirm, Confirm, Confirm. A trailing Down here
+                            # would double-advance and skip every other item.
                             for _ in range(paged_count):
                                 console.press(BTN_CONFIRM)
-                                console.press(BTN_DOWN)
                             serial_revision, serial_entries = console.await_list_state(paged_count)
                             results.check(
                                 "list-sync: more deviations than fit one notification are staged",
