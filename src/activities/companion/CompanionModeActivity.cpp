@@ -2904,7 +2904,17 @@ void CompanionModeActivity::drawSleepIndicator() {
 // hardware testing, 2026-07-31). renderImage() also only ever bakes overlays
 // (tags) into the BW base pass, never into the LSB/MSB decodes — those carry
 // only the photo's tone data — so the indicator is drawn once, there, too.
+//
+// The List branch is simpler: renderList() is BW-only (no grayscale passes),
+// so it's enough to let it draw+push the current list screen normally, then
+// draw the indicator on top of the still-live framebuffer and push again.
 void CompanionModeActivity::renderPreSleepScreen() {
+  if (screen == Screen::List) {
+    renderList();
+    drawSleepIndicator();
+    renderer.displayBuffer();
+    return;
+  }
   if (screen == Screen::Image && !displayedImagePath.empty()) {
     ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(displayedImagePath);
     if (decoder) {

@@ -568,10 +568,12 @@ class CompanionModeActivity final : public Activity {
   // every trigger that reaches this activity (idle timeout, app-mapped sleep
   // button, and the physical power button via customDeepSleep()) — so all
   // three agree. Screen::Image keeps the photo and adds drawSleepIndicator();
-  // every other screen (including Text — see the protocol doc) falls back to
-  // the inverted grid. Does not itself sleep: callers decide how (direct
-  // powerManager.startDeepSleep(), or main.cpp's enterDeepSleep() finishing
-  // its teardown sequence after customDeepSleep() returns true).
+  // Screen::List keeps the current list view (via renderList()) and adds it
+  // the same way; every other screen (including Text — see the protocol doc)
+  // falls back to the inverted grid. Does not itself sleep: callers decide
+  // how (direct powerManager.startDeepSleep(), or main.cpp's
+  // enterDeepSleep() finishing its teardown sequence after
+  // customDeepSleep() returns true).
   void renderPreSleepScreen();
   void checkIdleTimers();
 
