@@ -17,6 +17,8 @@
 namespace {
 
 constexpr unsigned long POPUP_DURATION_MS = 1500;
+constexpr unsigned long WORD_REPEAT_START_MS = 500;
+constexpr unsigned long WORD_REPEAT_INTERVAL_MS = 500;
 
 // A token is selectable when it has an ASCII alphanumeric or a non-ASCII
 // codepoint outside U+2000-U+206F (dashes, bullets and other General
@@ -155,14 +157,20 @@ void DictionaryWordSelectActivity::performLookup() {
   if (!dictOpenAttempted) {
     dictOpenAttempted = true;
     dictOpenOk = dict.open(SETTINGS.dictionaryName);
+    // needsIndex() opens and validates the .qidx sidecar, so ask it once per
+    // open rather than once per word: the answer only changes when we build
+    // the sidecar ourselves, which is handled below.
+    dictNeedsIndex = dictOpenOk && dict.needsIndex();
   }
-  const bool indexing = dictOpenOk && dict.needsIndex();
-  popupMsg = indexing ? StrId::STR_DICT_INDEXING : StrId::STR_DICT_LOOKING_UP;
+  popupMsg = dictNeedsIndex ? StrId::STR_DICT_INDEXING : StrId::STR_DICT_LOOKING_UP;
   requestUpdateAndWait();  // paint the page + busy popup before blocking on SD
 
   bool ok = dictOpenOk;
   Dictionary::IndexResult indexResult = Dictionary::IndexResult::Ok;
-  if (ok && indexing) ok = dict.buildIndex(&indexBuildYield, nullptr, &indexResult);
+  if (ok && dictNeedsIndex) {
+    ok = dict.buildIndex(&indexBuildYield, nullptr, &indexResult);
+    dictNeedsIndex = !ok;  // a successful build leaves the sidecar fresh; a failed one retries
+  }
 
   std::string definition;
   std::string headword;
@@ -171,9 +179,10 @@ void DictionaryWordSelectActivity::performLookup() {
 
   if (found) {
     popup = Popup::None;
-    startActivityForResult(std::make_unique<DictionaryDefinitionActivity>(renderer, mappedInput, std::move(headword),
-                                                                          std::move(definition)),
-                           [this](const ActivityResult&) { requestUpdate(); });
+    startActivityForResult(
+        std::make_unique<DictionaryDefinitionActivity>(renderer, mappedInput, std::move(headword),
+                                                       std::move(definition), dict.definitionsAreHtml()),
+        [this](const ActivityResult&) { requestUpdate(); });
     return;
   }
   // Name the failure: a genuine miss is "Not found"; a word that WAS found but
@@ -229,13 +238,11 @@ void DictionaryWordSelectActivity::loop() {
     return;
   }
 
-  if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) confirmPressSeen = true;
-
   if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
     finish();
     return;
   }
-  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm) && confirmPressSeen && !words.empty()) {
+  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm) && !words.empty()) {
     performLookup();
     return;
   }
@@ -263,16 +270,25 @@ void DictionaryWordSelectActivity::loop() {
     return;
   }
 
-  if (mappedInput.wasPressed(MappedInputManager::Button::Left) && selected > 0) {
+  const bool hasNextWord = selected + 1 < static_cast<int>(words.size());
+  const unsigned long now = millis();
+  const bool repeat =
+      mappedInput.getHeldTime() >= WORD_REPEAT_START_MS && now - lastHorizontalMoveTime >= WORD_REPEAT_INTERVAL_MS;
+  const bool moveLeft = mappedInput.wasPressed(MappedInputManager::Button::ScreenLeft) ||
+                        (repeat && mappedInput.isPressed(MappedInputManager::Button::ScreenLeft));
+  const bool moveRight = mappedInput.wasPressed(MappedInputManager::Button::ScreenRight) ||
+                         (repeat && mappedInput.isPressed(MappedInputManager::Button::ScreenRight));
+  if (moveLeft && selected > 0) {
     selected--;
+    lastHorizontalMoveTime = now;
     requestUpdate();
-  } else if (mappedInput.wasPressed(MappedInputManager::Button::Right) &&
-             selected + 1 < static_cast<int>(words.size())) {
+  } else if (moveRight && hasNextWord) {
     selected++;
+    lastHorizontalMoveTime = now;
     requestUpdate();
-  } else if (mappedInput.wasPressed(MappedInputManager::Button::Up)) {
+  } else if (mappedInput.wasPressed(MappedInputManager::Button::ScreenUp)) {
     moveVertical(-1);
-  } else if (mappedInput.wasPressed(MappedInputManager::Button::Down)) {
+  } else if (mappedInput.wasPressed(MappedInputManager::Button::ScreenDown)) {
     moveVertical(1);
   }
 }
@@ -315,11 +331,10 @@ bool DictionaryWordSelectActivity::drawHighlightWithSnapshot() {
 // Front-button bar (Back/Confirm/Left/Right). Drawn last on every repaint
 // path, including the differential highlight-only path, so it always ends
 // up as the top layer even when a highlighted word's box falls under a
-// hint's screen area. No side-button hints: Up/Down row jump has no spare
-// screen area on this page (it reuses the reader's full-bleed layout), and
-// a hint box there would hide text instead of sitting in a reserved gutter.
+// hint's screen area. No side-button hints: the full-bleed reader page has no
+// spare gutter for them, so a hint box there would hide text.
 void DictionaryWordSelectActivity::drawHints() const {
-  // No selectable word on this page: Confirm/Left/Right are all no-ops
+  // No selectable word on this page: Confirm and navigation are all no-ops
   // (guarded by words.empty() in loop()/performLookup), so only Back does
   // anything and only Back is hinted.
   if (words.empty()) {
@@ -327,7 +342,8 @@ void DictionaryWordSelectActivity::drawHints() const {
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
     return;
   }
-  const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_LOOKUP), tr(STR_DIR_LEFT), tr(STR_DIR_RIGHT));
+  const auto labels = mappedInput.mapDirectionalLabels(tr(STR_BACK), tr(STR_LOOKUP), tr(STR_DIR_LEFT),
+                                                       tr(STR_DIR_RIGHT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 }
 

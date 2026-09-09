@@ -1,6 +1,6 @@
 # xteink-companion-ble — Agent Guide
 
-**Read [.skills/SKILL.md](.skills/SKILL.md) first.** It is the shared engineering guide inherited
+**Read [AGENTS.md](AGENTS.md) first.** It is the shared engineering guide inherited
 from upstream CrossPoint Reader — hardware constraints, the HAL, memory rules, ESP32-C3 pitfalls,
 build system, cache formats. All of it still applies; it is deliberately left unmodified so
 upstream's improvements keep merging cleanly.

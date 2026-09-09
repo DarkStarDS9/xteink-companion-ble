@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <string>
 
 #include "I18nKeys.h"
@@ -103,6 +104,12 @@ void CrossPointSettings::toJson(JsonDocument& doc) const {
   // Language -- managed by LanguageSelectActivity, not in SettingsList.
   // Stored as ISO code string ("EN", "DE", ...) for stability across enum reorders.
   doc["language"] = (language < getLanguageCount()) ? LANGUAGE_CODES[language] : "EN";
+
+  // A uint16_t mask, so it does not fit the uint8_t generic loop. Omitted while
+  // unconfigured, so the default keeps following the UI language.
+  if (keyboardLayouts != 0) {
+    doc["keyboardLayouts"] = keyboardLayouts;
+  }
 }
 
 bool CrossPointSettings::fromJson(JsonVariantConst doc) {
@@ -132,7 +139,13 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
         char obfKey[OBF_KEY_BUF];
         snprintf(obfKey, sizeof(obfKey), "%s_obf", info.key);
         bool ok = false;
-        const std::string decoded = obfuscation::deobfuscateFromBase64(doc[obfKey] | "", &ok);
+        bool tooLong = false;
+        const std::string decoded =
+            obfuscation::deobfuscateFromBase64(doc[obfKey] | "", info.stringMaxLen - 1, &ok, &tooLong);
+        if (tooLong) {
+          LOG_ERR("CPS", "Oversized obfuscated value for key '%s'", info.key);
+          needsResave = true;
+        }
         if (ok && !decoded.empty()) {
           copyToField(destPtr, decoded.c_str(), info.stringMaxLen);
           loaded = true;
@@ -215,6 +228,11 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
     language = static_cast<uint8_t>(I18n::languageFromCode(doc["language"].as<const char*>()));
   }
 
+  // Absent means unconfigured, which is the default.
+  if (doc["keyboardLayouts"].is<uint16_t>()) {
+    keyboardLayouts = doc["keyboardLayouts"].as<uint16_t>();
+  }
+
   if (needsResave) {
     LOG_DBG("CPS", "Resaving settings to update format");
     requestResave();
@@ -269,6 +287,8 @@ float CrossPointSettings::getReaderLineCompression() const {
         return 1.0f;
       case WIDE:
         return 1.1f;
+      case EXTRA_WIDE:
+        return 1.2f;
     }
   }
 
@@ -283,6 +303,8 @@ float CrossPointSettings::getReaderLineCompression() const {
           return 1.0f;
         case WIDE:
           return 1.1f;
+        case EXTRA_WIDE:
+          return 1.2f;
       }
     case NOTOSANS:
       switch (lineSpacing) {
@@ -293,6 +315,8 @@ float CrossPointSettings::getReaderLineCompression() const {
           return 0.95f;
         case WIDE:
           return 1.0f;
+        case EXTRA_WIDE:
+          return 1.05f;
       }
   }
 }
@@ -317,6 +341,10 @@ int CrossPointSettings::getRefreshFrequency() const {
       return 15;
     case REFRESH_30:
       return 30;
+    case REFRESH_NEVER:
+      // Effectively disables the periodic full refresh; the page counter
+      // counts down from here and never reaches the threshold in practice.
+      return std::numeric_limits<int>::max();
   }
 }
 

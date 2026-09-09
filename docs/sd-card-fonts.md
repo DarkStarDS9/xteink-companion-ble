@@ -10,7 +10,7 @@ There are three ways to install fonts:
 ### Option 1: Download from device (recommended)
 
 1. Connect your CrossPoint reader to Wi-Fi
-2. Go to **Settings > System > Manage Fonts**
+2. Go to **Settings > Reader > Manage Fonts**
 3. Browse available font families and tap to download
 4. Downloaded fonts appear immediately in **Settings > Reader > Font Family**
 
@@ -149,10 +149,12 @@ To convert your own TrueType/OpenType fonts:
 | `greek` | Greek + Extended Greek |
 | `cyrillic` | Cyrillic + Supplement |
 | `hebrew` | Hebrew + Alphabetic Presentation Forms |
+| `arabic` | Arabic + Supplement + Extended-A + Presentation Forms A/B (RTL, contextual shaping) |
 | `georgian` | Georgian + Georgian Supplement |
 | `armenian` | Armenian |
 | `ethiopic` | Ethiopic + Extended |
 | `vietnamese` | Vietnamese subset (ơ/ư and combining marks) |
+| `ipa-chars` | IPA Extensions + Spacing Modifier Letters (phonetic transcription) |
 | `punctuation` | General punctuation (U+2000–U+206F) |
 | `cjk` | CJK Unified Ideographs + Hiragana + Katakana + Fullwidth |
 | `hangul` | Korean Hangul syllables + Jamo + Compatibility Jamo |
