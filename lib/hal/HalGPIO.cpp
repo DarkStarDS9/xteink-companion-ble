@@ -123,6 +123,16 @@ void HalGPIO::begin() {
   // checks the OEM hw_calib/screenType value first, then falls back to its
   // two-pass display-bus probe. X3's facade keys panel selection off the sibling
   // board profile, so preserve a detected UC8279 through setDisplayX3().
+  //
+  // Known benign noise (observed 2026-09-09, freeink-sdk pin 7f6bd0f4): this
+  // call logs a handful of `Wire.cpp` "could not acquire lock" / "NULL TX
+  // buffer pointer" errors right after the MTP dump. detectDeviceTypeWithFingerprint()
+  // above already called Wire.end() at the close of its own I2C probe
+  // (X3GPIO::runX3ProbePass), so freeink-sdk's MTP read here runs with I2C
+  // not yet re-begun. Harmless -- IMU init just below re-begins Wire and the
+  // display-controller promotion itself completes correctly -- but noisy in
+  // boot logs. Not something we can fix locally without patching the
+  // freeink-sdk submodule; worth an upstream report if it gets annoying.
   freeink::applyXteinkDisplayController();
   if (deviceIsX3() && BoardConfig::ACTIVE.displayController == BoardConfig::DisplayController::UC8279) {
     BoardConfig::selectDevice(BoardConfig::Board::XteinkX3Uc8279);
